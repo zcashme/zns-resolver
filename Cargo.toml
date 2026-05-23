@@ -1,0 +1,55 @@
+[package]
+name = "zns-resolver"
+description = "ZcashName (ZNS) resolver: a seer-sync consumer that verifies ZNS bindings and maintains a name → UA index."
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zechariah/zns"
+homepage = "https://zns.xyz"
+readme = "README.md"
+categories = ["cryptography::cryptocurrencies", "database"]
+keywords = ["zcash", "zns", "name-service", "resolver"]
+publish = false
+
+[dependencies]
+# The reusable sync library
+seer-sync = { path = "../seer-sync" }
+
+# ZNS verifier kernel
+zns-verify = { path = "../zns-verify" }
+
+# Orchard (for Note + commitment_with_randomness used in binding verification)
+orchard = { path = "../orchard", default-features = false, features = ["unsafe-zns"] }
+
+# librustzcash bits we touch directly
+zcash_protocol = { path = "../librustzcash/components/zcash_protocol", default-features = false, features = ["std"] }
+zcash_keys = { path = "../librustzcash/zcash_keys", default-features = false, features = ["orchard"] }
+
+# Crypto bits
+pasta_curves = "0.5"
+group = "0.13"
+
+# Persistence
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Tooling
+anyhow = "1"
+thiserror = "1"
+hex = "0.4"
+rand = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[patch.crates-io]
+orchard = { path = "../orchard" }
+
+[[bin]]
+name = "zns-resolve"
+path = "src/bin/zns-resolve.rs"
