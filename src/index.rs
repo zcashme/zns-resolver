@@ -23,16 +23,33 @@ pub struct SqliteIndex {
     conn: Connection,
 }
 
+/// A public registration record — the RPC's view of a name.
+#[derive(Debug, Clone)]
+pub struct Registration {
+    /// The name.
+    pub name: String,
+    /// The UA bound to it (empty once released).
+    pub ua: String,
+    /// The txid of the Name Note that set the current state.
+    pub txid: [u8; 32],
+    /// The block height of that Name Note.
+    pub height: u32,
+    /// The kind of the latest action.
+    pub last_action: Action,
+}
+
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS names (
     name        TEXT NOT NULL PRIMARY KEY,
     ua          TEXT NOT NULL,
     rcm         BLOB NOT NULL,
     cmx         BLOB NOT NULL,
+    txid        BLOB NOT NULL,
     height      INTEGER NOT NULL,
     last_action TEXT NOT NULL CHECK (last_action IN ('claim','update','release'))
 );
 CREATE INDEX IF NOT EXISTS names_height_idx ON names(height);
+CREATE INDEX IF NOT EXISTS names_ua_idx ON names(ua);
 
 CREATE TABLE IF NOT EXISTS sync_state (
     id     INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
@@ -60,6 +77,44 @@ impl SqliteIndex {
     /// Look up the current entry for `name`, if any.
     pub fn lookup(&self, name: &str) -> Result<Option<NameChainEntry>> {
         lookup(&self.conn, name).map_err(Into::into)
+    }
+
+    /// The public registration record for `name`, if any.
+    pub fn resolve_by_name(&self, name: &str) -> Result<Option<Registration>> {
+        self.conn
+            .query_row(
+                "SELECT name, ua, txid, height, last_action FROM names WHERE name = ?1",
+                params![name],
+                row_to_registration,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Registrations currently bound to `ua` (reverse lookup), paginated.
+    pub fn registrations_by_ua(&self, ua: &str, limit: u32, offset: u32) -> Result<Vec<Registration>> {
+        self.query_registrations(
+            "SELECT name, ua, txid, height, last_action FROM names
+             WHERE ua = ?1 ORDER BY name LIMIT ?2 OFFSET ?3",
+            params![ua, limit, offset],
+        )
+    }
+
+    /// All registrations, paginated.
+    pub fn list_registrations(&self, limit: u32, offset: u32) -> Result<Vec<Registration>> {
+        self.query_registrations(
+            "SELECT name, ua, txid, height, last_action FROM names
+             ORDER BY name LIMIT ?1 OFFSET ?2",
+            params![limit, offset],
+        )
+    }
+
+    fn query_registrations(&self, sql: &str, p: impl rusqlite::Params) -> Result<Vec<Registration>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(p, row_to_registration)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// The highest applied block height, or `None` if never synced.
@@ -136,16 +191,18 @@ impl Account for SqliteIndex {
             };
 
             tx.execute(
-                "INSERT INTO names (name, ua, rcm, cmx, height, last_action)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO names (name, ua, rcm, cmx, txid, height, last_action)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(name) DO UPDATE SET
                      ua = excluded.ua, rcm = excluded.rcm, cmx = excluded.cmx,
-                     height = excluded.height, last_action = excluded.last_action",
+                     txid = excluded.txid, height = excluded.height,
+                     last_action = excluded.last_action",
                 params![
                     parsed.name,
                     parsed.ua,
                     rcm.as_slice(),
                     cmx.as_slice(),
+                    n.txid.as_slice(),
                     u32::from(n.height) as i64,
                     action_str(parsed.action),
                 ],
@@ -184,6 +241,17 @@ fn row_to_entry(r: &Row) -> rusqlite::Result<NameChainEntry> {
         ua: r.get(1)?,
         rcm: rcm.try_into().map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?,
         last_action: parse_action(&r.get::<_, String>(3)?)?,
+    })
+}
+
+fn row_to_registration(r: &Row) -> rusqlite::Result<Registration> {
+    let txid: Vec<u8> = r.get(2)?;
+    Ok(Registration {
+        name: r.get(0)?,
+        ua: r.get(1)?,
+        txid: txid.try_into().map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?,
+        height: r.get::<_, i64>(3)? as u32,
+        last_action: parse_action(&r.get::<_, String>(4)?)?,
     })
 }
 

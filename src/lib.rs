@@ -6,14 +6,16 @@
 //! narrow SQLite index keyed by name.
 //!
 //! Modules:
-//!  - [`verify`] — ZNS binding verification + chain advancement rules.
+//!  - [`verify`] — ZNS binding verification + memo parsing.
 //!  - [`index`]  — SQLite name index and the `seer-sync` `Account` impl that
 //!    drives it (verify-on-`apply`, reorg via `rewind`).
+//!  - [`http`]   — jsonrpsee JSON-RPC API (`resolve`, `status`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
+pub mod http;
 pub mod index;
 pub mod verify;
 

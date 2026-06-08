@@ -36,12 +36,18 @@ group = "0.13"
 # Persistence
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# JSON-RPC API — matches the live ZNS indexer + zcashname-sdk contract so this
+# resolver is a drop-in for the resolution methods.
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Tooling
 anyhow = "1"
 thiserror = "1"
 hex = "0.4"
 rand = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
