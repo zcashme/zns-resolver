@@ -13,18 +13,21 @@ keywords = ["zcash", "zns", "name-service", "resolver"]
 publish = false
 
 [dependencies]
-# The reusable sync library
-seer-sync = { path = "../seer-sync" }
+# The reusable sync library — pinned to the zns-observe worktree, which carries
+# the relaxed orchard decrypt (skips the ZIP-212 cmx check) that Name Notes need.
+# master seer-sync stays a clean, commitment-checked general lib.
+seer-sync = { path = "../seer-sync-zns-observe" }
 
 # ZNS verifier kernel
 zns-verify = { path = "../zns-verify" }
 
-# Orchard (for Note + commitment_with_randomness used in binding verification)
-orchard = { path = "../orchard", default-features = false, features = ["unsafe-zns"] }
+# Orchard (for Note + commitment_with_randomness used in binding verification).
+# ZNS fork that exposes the `unsafe-zns` feature.
+orchard = { path = "../zns-orchard", default-features = false, features = ["unsafe-zns"] }
 
-# librustzcash bits we touch directly
-zcash_protocol = { path = "../librustzcash/components/zcash_protocol", default-features = false, features = ["std"] }
-zcash_keys = { path = "../librustzcash/zcash_keys", default-features = false, features = ["orchard"] }
+# librustzcash bits we touch directly (from crates.io)
+zcash_protocol = { version = "0.8", default-features = false, features = ["std"] }
+zcash_keys = { version = "0.13", default-features = false, features = ["orchard"] }
 
 # Crypto bits
 pasta_curves = "0.5"
@@ -48,7 +51,7 @@ clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 
 [patch.crates-io]
-orchard = { path = "../orchard" }
+orchard = { path = "../zns-orchard" }
 
 [[bin]]
 name = "zns-resolve"

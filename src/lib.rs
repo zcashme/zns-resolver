@@ -7,14 +7,13 @@
 //!
 //! Modules:
 //!  - [`verify`] — ZNS binding verification + chain advancement rules.
-//!  - [`callback`] — the `ScanCallback` impl that runs verification per decrypt.
-//!  - [`index`]  — narrow 3-table SQLite index with per-block transactions.
+//!  - [`index`]  — SQLite name index and the `seer-sync` `Account` impl that
+//!    drives it (verify-on-`apply`, reorg via `rewind`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
-pub mod callback;
 pub mod index;
 pub mod verify;
 
