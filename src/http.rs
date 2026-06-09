@@ -14,7 +14,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::index::{Registration, SqliteIndex};
+use crate::index::{Event, Registration, SqliteIndex};
 use zns_verify::Action;
 
 // ── Response shapes (subset of the indexer's, resolution-only) ───────────────
@@ -57,13 +57,31 @@ pub struct ListingsResult {
     pub total: u64,
 }
 
-/// Event-log result (always empty here).
+/// One event-log entry (the indexer API's `Event` shape).
+#[derive(Debug, Clone, Serialize)]
+struct EventEntry {
+    id: i64,
+    name: String,
+    action: String,
+    txid: String,
+    height: u64,
+    /// The UA involved; `null` for RELEASE (no user-visible address).
+    ua: Option<String>,
+    // ZcashName has no marketplace or admin signatures — these stay null/zero,
+    // kept for zcashname-sdk shape compat.
+    price: Option<u64>,
+    nonce: u64,
+    signature: Option<String>,
+    pubkey: Option<String>,
+}
+
+/// Event-log result.
 #[derive(Debug, Clone, Serialize)]
 pub struct EventsResult {
-    /// The events (empty).
-    pub events: Vec<Value>,
-    /// Total count (zero).
-    pub total: u64,
+    /// The matching page of events, newest first.
+    events: Vec<EventEntry>,
+    /// Total matches before pagination.
+    total: u64,
 }
 
 // ── RPC trait ────────────────────────────────────────────────────────────────
@@ -92,7 +110,8 @@ pub trait ZnsApi {
     #[method(name = "listings", blocking)]
     fn listings(&self, limit: Option<u64>, offset: Option<u64>) -> RpcResult<ListingsResult>;
 
-    /// Action event log — always empty for this resolver.
+    /// The action event log (newest first), with optional `name`, `action`
+    /// (e.g. `"CLAIM"`), and strictly-greater-than `since_height` filters.
     #[method(name = "events", blocking)]
     fn events(
         &self,
@@ -156,13 +175,28 @@ impl ZnsApiServer for RpcContext {
 
     fn events(
         &self,
-        _name: Option<String>,
-        _action: Option<String>,
-        _since_height: Option<u64>,
-        _limit: Option<u64>,
-        _offset: Option<u64>,
+        name: Option<String>,
+        action: Option<String>,
+        since_height: Option<u64>,
+        limit: Option<u64>,
+        offset: Option<u64>,
     ) -> RpcResult<EventsResult> {
-        Ok(EventsResult { events: Vec::new(), total: 0 })
+        // An action filter this resolver can never log (LIST, BUY, SETPRICE —
+        // ZcashName has no marketplace) legitimately matches zero events.
+        let action = match action.as_deref().map(parse_action_filter) {
+            Some(None) => return Ok(EventsResult { events: Vec::new(), total: 0 }),
+            Some(some) => some,
+            None => None,
+        };
+        let idx = open(&self.db)?;
+        let limit = limit.unwrap_or(50).min(500) as u32;
+        let offset = offset.unwrap_or(0) as u32;
+        let since = since_height.map(|h| h.min(u32::MAX as u64) as u32);
+
+        let (events, total) = idx
+            .events(name.as_deref(), action, since, limit, offset)
+            .map_err(internal)?;
+        Ok(EventsResult { events: events.into_iter().map(event_entry).collect(), total })
     }
 }
 
@@ -194,11 +228,38 @@ fn entries(regs: Vec<Registration>) -> Value {
     serde_json::to_value(regs.into_iter().map(entry).collect::<Vec<_>>()).unwrap()
 }
 
+fn event_entry(e: Event) -> EventEntry {
+    EventEntry {
+        id: e.id,
+        name: e.name,
+        action: action_name(e.action).to_string(),
+        txid: hex::encode(e.txid),
+        height: e.height as u64,
+        ua: (!e.ua.is_empty()).then_some(e.ua),
+        price: None,
+        nonce: 0,
+        signature: None,
+        pubkey: None,
+    }
+}
+
+/// Action names on the wire are uppercase (`"CLAIM"`), per the indexer API.
 fn action_name(a: Action) -> &'static str {
     match a {
-        Action::Claim => "claim",
-        Action::Update => "update",
-        Action::Release => "release",
+        Action::Claim => "CLAIM",
+        Action::Update => "UPDATE",
+        Action::Release => "RELEASE",
+    }
+}
+
+/// Parse a client's `action` filter (case-insensitive). `None` means the verb
+/// can never appear in this resolver's log, so the filter matches nothing.
+fn parse_action_filter(s: &str) -> Option<Action> {
+    match s.to_ascii_uppercase().as_str() {
+        "CLAIM" => Some(Action::Claim),
+        "UPDATE" => Some(Action::Update),
+        "RELEASE" => Some(Action::Release),
+        _ => None,
     }
 }
 

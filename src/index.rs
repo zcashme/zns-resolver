@@ -68,6 +68,25 @@ pub struct Registration {
     pub last_action: Action,
 }
 
+/// One row of the public event log — an applied action, as served by the
+/// `events` RPC. The append-only `actions` table *is* the event log; this is
+/// just its row shape.
+#[derive(Debug, Clone)]
+pub struct Event {
+    /// Stable log id (the row's insertion order — chain order).
+    pub id: i64,
+    /// The name acted on.
+    pub name: String,
+    /// The action kind.
+    pub action: Action,
+    /// The UA involved (empty for RELEASE).
+    pub ua: String,
+    /// The transaction that mined the action.
+    pub txid: [u8; 32],
+    /// The block height it was mined at.
+    pub height: u32,
+}
+
 /// How long a connection waits out a competing writer before failing. The RPC
 /// path opens read-only against the sync task's WAL writer; 5s comfortably
 /// covers a batch commit.
@@ -187,6 +206,55 @@ impl SqliteIndex {
     pub fn name_count(&self) -> Result<u64> {
         let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM current_names", [], |r| r.get(0))?;
         Ok(n as u64)
+    }
+
+    /// A filtered, newest-first page of the action log, plus the total number
+    /// of matches (pre-pagination). `since_height` is strictly greater-than,
+    /// per the indexer API contract.
+    pub fn events(
+        &self,
+        name: Option<&str>,
+        action: Option<Action>,
+        since_height: Option<u32>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<Event>, u64)> {
+        const WHERE: &str = "WHERE (?1 IS NULL OR name = ?1)
+                               AND (?2 IS NULL OR action = ?2)
+                               AND (?3 IS NULL OR height > ?3)";
+        let p = params![
+            name,
+            action.map(action_str),
+            since_height.map(|h| h as i64),
+            limit,
+            offset
+        ];
+
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM actions {WHERE}"),
+            &p[..3],
+            |r| r.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT rowid, name, action, ua, txid, height FROM actions {WHERE}
+             ORDER BY height DESC, rowid DESC LIMIT ?4 OFFSET ?5"
+        ))?;
+        let events = stmt
+            .query_map(p, |r| {
+                let txid: Vec<u8> = r.get(4)?;
+                Ok(Event {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    action: parse_action(&r.get::<_, String>(2)?)?,
+                    ua: r.get(3)?,
+                    txid: txid
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, 0))?,
+                    height: r.get::<_, i64>(5)? as u32,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((events, total as u64))
     }
 }
 
@@ -486,6 +554,39 @@ mod tests {
         let reg = idx.resolve_by_name("alice").unwrap().unwrap();
         assert_eq!(reg.ua, "u1c");
         assert_eq!(reg.last_action, Action::Claim);
+    }
+
+    #[test]
+    fn events_filters_and_paginates_newest_first() {
+        let idx = SqliteIndex::open_in_memory().unwrap();
+        seed(&idx, "alice", "u1a", [1u8; 32], 100, Action::Claim);
+        seed(&idx, "bob", "u1b", [2u8; 32], 150, Action::Claim);
+        seed(&idx, "alice", "u1c", [3u8; 32], 200, Action::Update);
+
+        // Unfiltered: newest first, total = all rows.
+        let (all, total) = idx.events(None, None, None, 50, 0).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(all.iter().map(|e| e.height).collect::<Vec<_>>(), vec![200, 150, 100]);
+
+        // Name filter.
+        let (alice, total) = idx.events(Some("alice"), None, None, 50, 0).unwrap();
+        assert_eq!(total, 2);
+        assert!(alice.iter().all(|e| e.name == "alice"));
+
+        // Action filter.
+        let (claims, total) = idx.events(None, Some(Action::Claim), None, 50, 0).unwrap();
+        assert_eq!(total, 2);
+        assert!(claims.iter().all(|e| e.action == Action::Claim));
+
+        // `since_height` is strictly greater-than.
+        let (since, _) = idx.events(None, None, Some(150), 50, 0).unwrap();
+        assert_eq!(since.iter().map(|e| e.height).collect::<Vec<_>>(), vec![200]);
+
+        // Pagination: `total` is pre-pagination, page picks the middle row.
+        let (page, total) = idx.events(None, None, None, 1, 1).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].height, 150);
     }
 
     // ---- the UA-namespace guard ----
