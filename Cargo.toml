@@ -13,28 +13,34 @@ keywords = ["zcash", "zns", "name-service", "resolver"]
 publish = false
 
 [dependencies]
-# The reusable sync library — pinned to the zns-observe worktree, which carries
-# the relaxed orchard decrypt (skips the ZIP-212 cmx check) that Name Notes need.
-# master seer-sync stays a clean, commitment-checked general lib.
-seer-sync = { path = "../seer-sync-zns-observe", features = ["commitment-tree"] }
+# The reusable sync library — stock, commitment-checked, ZNS-blind. We use it
+# as a toolkit (block stream, action parsing), not via its `run`/`Account`
+# engine: the resolver drives its own scan loop (see `observe`) so the relaxed
+# decrypt lives entirely in `zns-verify`, never in seer-sync.
+seer-sync = { path = "../seer-sync" }
 
-# ZNS verifier kernel
-zns-verify = { path = "../zns-verify" }
+# ZNS kernel: `verify` (binding check) + `decrypt` (relaxed Orchard trial
+# decrypt that surfaces Name Notes the standard ZIP-212 check would discard).
+zns-verify = { path = "../zns-verify", features = ["decrypt"] }
 
 # Orchard (for the Note type + the `zns_commitment_keys` accessor used in
-# binding verification). ZNS fork that exposes the `unsafe-zns` feature.
+# binding verification). ZNS fork that exposes the `unsafe-zns` feature —
+# "unsafe" here means protocol-unsafe (it exposes note-commitment internals
+# like `g_d`/`pk_d` that stock orchard deliberately hides), not memory-unsafe;
+# this crate stays `#![forbid(unsafe_code)]`.
 orchard = { path = "../zns-orchard", default-features = false, features = ["unsafe-zns"] }
 
 # librustzcash bits we touch directly (from crates.io)
 zcash_protocol = { version = "0.9", default-features = false, features = ["std"] }
 zcash_keys = { version = "0.14", default-features = false, features = ["orchard"] }
+# Full-transaction parsing for memo recovery (the memo lives in the full
+# ciphertext that compact blocks truncate).
+zcash_primitives = { version = "0.28", default-features = false }
+futures = "0.3"
 
 # Crypto bits
 pasta_curves = "0.5"
 group = "0.13"
-
-shardtree = "0.6"
-incrementalmerkletree = "0.8"
 
 # Persistence
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -47,17 +53,12 @@ serde_json = "1"
 
 # Tooling
 anyhow = "1"
-thiserror = "1"
 hex = "0.4"
-rand = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [patch.crates-io]
 orchard = { path = "../zns-orchard" }

@@ -106,8 +106,9 @@ pub trait ZnsApi {
 
 /// Per-call context: enough to open the read-only index.
 pub struct RpcContext {
-    /// Path to the resolver's SQLite index (handlers open it per call; WAL
-    /// allows concurrent readers alongside the sync task's writer).
+    /// Path to the resolver's SQLite index. Handlers open it read-only per
+    /// call (no DDL, busy-timeout set); WAL allows these readers to run
+    /// alongside the sync task's writer.
     pub db: PathBuf,
     /// addr_reg's UIVK, surfaced in `status` for clients.
     pub uivk: String,
@@ -202,7 +203,7 @@ fn action_name(a: Action) -> &'static str {
 }
 
 fn open(db: &Path) -> RpcResult<SqliteIndex> {
-    SqliteIndex::open(db).map_err(internal)
+    SqliteIndex::open_read_only(db).map_err(internal)
 }
 
 fn internal(e: impl std::fmt::Display) -> ErrorObjectOwned {

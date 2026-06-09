@@ -18,7 +18,10 @@ use orchard::note::{RandomSeed, Rho};
 use orchard::value::NoteValue;
 use orchard::Note;
 use pasta_curves::pallas;
+use seer_sync::BlockHeight;
+use zcash_protocol::memo::MemoBytes;
 
+use zns_resolver::index::{Cursor, NameNote, SqliteIndex};
 use zns_resolver::verify::verify_binding;
 use zns_resolver::ZERO_PREV_RCM;
 use zns_verify::{note_commitment_cmx, zns_psi_rcm, Action};
@@ -64,6 +67,47 @@ fn genuine_name_note_verifies() {
         verify_binding(&note, cmx, action, name, ua, &prev),
         Some(expected_rcm.to_repr()),
     );
+}
+
+/// A CLAIM and its UPDATE landing in the *same* scan batch must apply in chain
+/// order: `apply_notes` folds sequentially against each name's tip, so the
+/// UPDATE only fits once the CLAIM is recorded. (Regression guard for the
+/// observer bug where `recover_notes` regrouped a batch by txid — here the
+/// UPDATE's txid sorts *before* the CLAIM's, which under txid ordering would
+/// silently and permanently drop the UPDATE.)
+#[test]
+fn same_batch_claim_then_update_applies_in_chain_order() {
+    let idx = SqliteIndex::open_in_memory().unwrap();
+    let note = name_note();
+
+    let claim_cmx = genuine_cmx(&note, Action::Claim, "alice", "u1old", &ZERO_PREV_RCM);
+    let (_, claim_rcm) =
+        zns_psi_rcm(Action::Claim.as_bytes(), b"alice", b"u1old", &ZERO_PREV_RCM);
+    let prev = claim_rcm.to_repr();
+    let update_cmx = genuine_cmx(&note, Action::Update, "alice", "u1new", &prev);
+
+    let memo = |s: &str| MemoBytes::from_bytes(s.as_bytes()).unwrap();
+    let batch = [
+        NameNote {
+            note,
+            cmx: claim_cmx,
+            memo: memo("ZNS:claim:alice:u1old"),
+            txid: [0xFF; 32], // sorts after the UPDATE's txid
+            height: 100,
+        },
+        NameNote {
+            note,
+            cmx: update_cmx,
+            memo: memo("ZNS:update:alice:u1new"),
+            txid: [0x01; 32],
+            height: 105,
+        },
+    ];
+    idx.apply_notes(Cursor { height: BlockHeight::from_u32(105), hash: None }, &batch).unwrap();
+
+    let reg = idx.resolve_by_name("alice").unwrap().expect("claim must be indexed");
+    assert_eq!(reg.ua, "u1new", "same-batch UPDATE must apply on top of its CLAIM");
+    assert_eq!(reg.last_action, Action::Update);
 }
 
 #[test]

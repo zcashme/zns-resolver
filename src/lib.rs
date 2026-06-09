@@ -1,17 +1,18 @@
 //! ZcashName (ZNS) resolver.
 //!
-//! Thin consumer of [`seer-sync`](https://crates.io/crates/seer-sync) that
-//! plugs a ZNS-specific [`ScanCallback`](seer_sync::scan::ScanCallback)
-//! into the generic view-key sync engine, and persists the results in a
-//! narrow SQLite index keyed by name.
+//! Drives its own chain-observer loop over [`seer-sync`](https://crates.io/crates/seer-sync)'s
+//! block stream — relaxed-decrypting Orchard actions with the ZNS kernel,
+//! verifying each Name Note's binding, and folding the results into a narrow
+//! SQLite index keyed by name. seer-sync is used as a toolkit (block stream,
+//! action parsing), never via its `run`/`Account` engine, so the relaxed
+//! decrypt stays in `zns-verify` and seer-sync stays ZNS-blind.
 //!
 //! Modules:
-//!  - [`verify`] — ZNS binding verification + memo parsing.
-//!  - [`index`]  — SQLite name index and the `seer-sync` `Account` impl that
-//!    drives it (verify-on-`apply`, reorg via `rewind`). The Orchard
-//!    note-commitment tree (for inclusion witnesses) is maintained here too, via
-//!    seer-sync's `commitment_tree` store over the same connection.
-//!  - [`http`]   — jsonrpsee JSON-RPC API (`resolve`, `status`).
+//!  - [`verify`]  — ZNS binding verification + memo parsing.
+//!  - [`observe`] — the chain-observer scan loop: stream → relaxed decrypt →
+//!    memo recovery → verify → index, with reorg rollback.
+//!  - [`index`]   — SQLite name index (verify-on-apply, reorg via `rewind`).
+//!  - [`http`]    — jsonrpsee JSON-RPC API (`resolve`, `status`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -19,6 +20,7 @@
 
 pub mod http;
 pub mod index;
+pub mod observe;
 pub mod verify;
 
 pub use zns_verify::{Action, ZERO_PREV_RCM};

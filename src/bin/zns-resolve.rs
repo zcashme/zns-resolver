@@ -1,8 +1,9 @@
-//! Reference resolver binary: a seer-sync `Account` that verifies ZNS bindings
-//! and maintains a name → UA index.
+//! Reference resolver binary: drives the chain-observer loop (`observe`),
+//! verifying ZNS bindings and maintaining a name → UA index.
 //!
 //! Subcommands:
 //!   sync     scan to the chain tip with addr_reg's UIVK, applying ZNS actions
+//!   serve    follow the tip and serve the JSON-RPC API
 //!   lookup   query the local index by name
 //!   status   print current index state
 
@@ -10,9 +11,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use seer_sync::sync::{chain, run};
-use seer_sync::{Network, ViewKey};
+use orchard::keys::PreparedIncomingViewingKey;
+use seer_sync::sync::chain;
+use seer_sync::Network;
 use zns_resolver::http::{serve, RpcContext};
+use zns_resolver::observe::{orchard_ivk, sync_to_tip};
 use zns_resolver::{index::SqliteIndex, MAINNET_NU5_HEIGHT, TESTNET_NU5_HEIGHT};
 
 const DEFAULT_LIGHTWALLETD: &str = "https://testnet.zec.rocks:443";
@@ -94,11 +97,15 @@ async fn cmd_serve(
     birthday: Option<u32>,
     addr: &str,
 ) -> Result<()> {
-    let key = ViewKey::decode(network, uivk)?;
+    let ivk = orchard_ivk(network, uivk)?;
     let birthday = birthday.unwrap_or(match network {
         Network::MainNetwork => MAINNET_NU5_HEIGHT,
         _ => TESTNET_NU5_HEIGHT,
     });
+
+    // Create the DB + schema before serving: RPC handlers open it read-only,
+    // so the file must exist even if the first sync pass hasn't run yet.
+    drop(SqliteIndex::open(&cli.db)?);
 
     println!("[serve] following tip via {} every {SYNC_INTERVAL_SECS}s", cli.lightwalletd);
 
@@ -109,7 +116,7 @@ async fn cmd_serve(
     // sync pass runs.
     let sync = async {
         loop {
-            if let Err(e) = sync_pass(&cli.db, &cli.lightwalletd, &key, network, birthday).await {
+            if let Err(e) = sync_pass(&cli.db, &cli.lightwalletd, network, &ivk, birthday).await {
                 tracing::warn!("sync pass failed: {e}");
             }
             tokio::time::sleep(std::time::Duration::from_secs(SYNC_INTERVAL_SECS)).await;
@@ -126,19 +133,19 @@ async fn cmd_serve(
 async fn sync_pass(
     db: &Path,
     lwd: &str,
-    key: &ViewKey,
     network: &Network,
+    ivk: &PreparedIncomingViewingKey,
     birthday: u32,
 ) -> Result<()> {
     let index = SqliteIndex::open(db)?;
     let client = chain::connect(lwd).await?;
-    run(client, key, network, birthday, &index).await?;
+    sync_to_tip(&index, client, network, ivk, birthday).await?;
     Ok(())
 }
 
 async fn cmd_sync(cli: &Cli, network: &Network, uivk: &str, birthday: Option<u32>) -> Result<()> {
     let index = SqliteIndex::open(&cli.db)?;
-    let key = ViewKey::decode(network, uivk)?;
+    let ivk = orchard_ivk(network, uivk)?;
     let birthday = birthday.unwrap_or(match network {
         Network::MainNetwork => MAINNET_NU5_HEIGHT,
         _ => TESTNET_NU5_HEIGHT,
@@ -146,7 +153,7 @@ async fn cmd_sync(cli: &Cli, network: &Network, uivk: &str, birthday: Option<u32
     println!("[sync] scanning to tip via {} (birthday {birthday})", cli.lightwalletd);
 
     let client = chain::connect(&cli.lightwalletd).await?;
-    run(client, &key, network, birthday, &index).await?;
+    sync_to_tip(&index, client, network, &ivk, birthday).await?;
 
     println!(
         "[sync] done. height={} names={}",
