@@ -16,22 +16,25 @@ publish = false
 # The reusable sync library — pinned to the zns-observe worktree, which carries
 # the relaxed orchard decrypt (skips the ZIP-212 cmx check) that Name Notes need.
 # master seer-sync stays a clean, commitment-checked general lib.
-seer-sync = { path = "../seer-sync-zns-observe" }
+seer-sync = { path = "../seer-sync-zns-observe", features = ["commitment-tree"] }
 
 # ZNS verifier kernel
 zns-verify = { path = "../zns-verify" }
 
-# Orchard (for Note + commitment_with_randomness used in binding verification).
-# ZNS fork that exposes the `unsafe-zns` feature.
+# Orchard (for the Note type + the `zns_commitment_keys` accessor used in
+# binding verification). ZNS fork that exposes the `unsafe-zns` feature.
 orchard = { path = "../zns-orchard", default-features = false, features = ["unsafe-zns"] }
 
 # librustzcash bits we touch directly (from crates.io)
-zcash_protocol = { version = "0.8", default-features = false, features = ["std"] }
-zcash_keys = { version = "0.13", default-features = false, features = ["orchard"] }
+zcash_protocol = { version = "0.9", default-features = false, features = ["std"] }
+zcash_keys = { version = "0.14", default-features = false, features = ["orchard"] }
 
 # Crypto bits
 pasta_curves = "0.5"
 group = "0.13"
+
+shardtree = "0.6"
+incrementalmerkletree = "0.8"
 
 # Persistence
 rusqlite = { version = "0.32", features = ["bundled"] }

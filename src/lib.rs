@@ -8,7 +8,9 @@
 //! Modules:
 //!  - [`verify`] — ZNS binding verification + memo parsing.
 //!  - [`index`]  — SQLite name index and the `seer-sync` `Account` impl that
-//!    drives it (verify-on-`apply`, reorg via `rewind`).
+//!    drives it (verify-on-`apply`, reorg via `rewind`). The Orchard
+//!    note-commitment tree (for inclusion witnesses) is maintained here too, via
+//!    seer-sync's `commitment_tree` store over the same connection.
 //!  - [`http`]   — jsonrpsee JSON-RPC API (`resolve`, `status`).
 
 #![forbid(unsafe_code)]

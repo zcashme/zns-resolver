@@ -1,22 +1,34 @@
 //! SQLite name index + the `seer-sync` [`Account`] impl that drives it.
 //!
-//! Two tables:
-//!  - `names`      — current state per name (the lookup answer).
+//! The blockchain is the state machine; this index is a materialized view of it:
+//!  - `actions`    — append-only log, one row per applied Name Note. The
+//!    canonical per-name history. The `current_names` view folds it to the
+//!    latest non-released action per name (the resolution answer).
 //!  - `sync_state` — last applied `(height, hash)`; the resume cursor.
 //!
-//! Reorgs are seer-sync's job: it calls [`Account::rewind`], which drops names
-//! above the fork. There is no local reorg buffer.
+//! Reorgs are seer-sync's job: it calls [`Account::rewind`], which deletes
+//! actions above the fork. Because the log retains history, the prior action
+//! for each affected name is still present, so the view re-folds correctly at
+//! any rewind depth — no separate reorg buffer is needed.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use incrementalmerkletree::{Position, Retention};
+use orchard::tree::MerkleHashOrchard;
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use seer_sync::sync::scan::{Note as ScannedNote, Pool, ShieldedNote, Spend};
+use seer_sync::db::commitment_tree;
+use seer_sync::sync::scan::{Commitment, Note as ScannedNote, Pool, ShieldedNote, Spend};
 use seer_sync::sync::{Account, AccountError, Cursor};
 use seer_sync::BlockHeight;
 
 use crate::verify::{self, NameChainEntry};
 use zns_verify::{Action, ZERO_PREV_RCM};
+
+/// Tree checkpoints retained for reorg rollback — comfortably beyond seer-sync's
+/// exponential rewind backoff.
+const MAX_CHECKPOINTS: usize = 100;
 
 /// The SQLite-backed ZNS name index.
 pub struct SqliteIndex {
@@ -28,7 +40,7 @@ pub struct SqliteIndex {
 pub struct Registration {
     /// The name.
     pub name: String,
-    /// The UA bound to it (empty once released).
+    /// The UA bound to it.
     pub ua: String,
     /// The txid of the Name Note that set the current state.
     pub txid: [u8; 32],
@@ -39,17 +51,27 @@ pub struct Registration {
 }
 
 const SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS names (
-    name        TEXT NOT NULL PRIMARY KEY,
-    ua          TEXT NOT NULL,
-    rcm         BLOB NOT NULL,
-    cmx         BLOB NOT NULL,
-    txid        BLOB NOT NULL,
-    height      INTEGER NOT NULL,
-    last_action TEXT NOT NULL CHECK (last_action IN ('claim','update','release'))
+CREATE TABLE IF NOT EXISTS actions (
+    name    TEXT NOT NULL,
+    height  INTEGER NOT NULL,
+    action  TEXT NOT NULL CHECK (action IN ('claim','update','release')),
+    ua      TEXT NOT NULL,
+    rcm     BLOB NOT NULL,
+    cmx     BLOB NOT NULL,
+    txid    BLOB NOT NULL
 );
-CREATE INDEX IF NOT EXISTS names_height_idx ON names(height);
-CREATE INDEX IF NOT EXISTS names_ua_idx ON names(ua);
+CREATE INDEX IF NOT EXISTS actions_name_height_idx ON actions(name, height);
+
+-- The fold: the latest action per name (rowid breaks same-height ties by
+-- insertion order), with released names excluded — a released name is free, so
+-- it is not a current registration. `rewind` deletes from `actions`, so this
+-- view always reflects the canonical chain at the synced height.
+CREATE VIEW IF NOT EXISTS current_names AS
+SELECT name, ua, rcm, cmx, txid, height, last_action FROM (
+    SELECT name, ua, rcm, cmx, txid, height, action AS last_action,
+           ROW_NUMBER() OVER (PARTITION BY name ORDER BY height DESC, rowid DESC) AS rn
+    FROM actions
+) WHERE rn = 1 AND last_action != 'release';
 
 CREATE TABLE IF NOT EXISTS sync_state (
     id     INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
@@ -64,6 +86,7 @@ impl SqliteIndex {
         let conn = Connection::open(path).context("opening sqlite db")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA_SQL).context("applying schema")?;
+        commitment_tree::init_tables(&conn).context("creating commitment-tree tables")?;
         Ok(Self { conn })
     }
 
@@ -71,6 +94,7 @@ impl SqliteIndex {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA_SQL)?;
+        commitment_tree::init_tables(&conn)?;
         Ok(Self { conn })
     }
 
@@ -83,7 +107,7 @@ impl SqliteIndex {
     pub fn resolve_by_name(&self, name: &str) -> Result<Option<Registration>> {
         self.conn
             .query_row(
-                "SELECT name, ua, txid, height, last_action FROM names WHERE name = ?1",
+                "SELECT name, ua, txid, height, last_action FROM current_names WHERE name = ?1",
                 params![name],
                 row_to_registration,
             )
@@ -94,7 +118,7 @@ impl SqliteIndex {
     /// Registrations currently bound to `ua` (reverse lookup), paginated.
     pub fn registrations_by_ua(&self, ua: &str, limit: u32, offset: u32) -> Result<Vec<Registration>> {
         self.query_registrations(
-            "SELECT name, ua, txid, height, last_action FROM names
+            "SELECT name, ua, txid, height, last_action FROM current_names
              WHERE ua = ?1 ORDER BY name LIMIT ?2 OFFSET ?3",
             params![ua, limit, offset],
         )
@@ -103,7 +127,7 @@ impl SqliteIndex {
     /// All registrations, paginated.
     pub fn list_registrations(&self, limit: u32, offset: u32) -> Result<Vec<Registration>> {
         self.query_registrations(
-            "SELECT name, ua, txid, height, last_action FROM names
+            "SELECT name, ua, txid, height, last_action FROM current_names
              ORDER BY name LIMIT ?1 OFFSET ?2",
             params![limit, offset],
         )
@@ -124,7 +148,7 @@ impl SqliteIndex {
 
     /// Number of names currently in the index.
     pub fn name_count(&self) -> Result<u64> {
-        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM current_names", [], |r| r.get(0))?;
         Ok(n as u64)
     }
 }
@@ -145,10 +169,49 @@ impl Account for SqliteIndex {
     }
 
     fn rewind(&self, to: BlockHeight) -> Result<(), AccountError> {
-        let h = u32::from(to) as i64;
-        self.conn
-            .execute("DELETE FROM names WHERE height > ?1", params![h])?;
-        set_sync_state(&self.conn, h, None)?;
+        let to_h = u32::from(to);
+        let tx = self.conn.unchecked_transaction()?;
+
+        // The commitment tree must roll back in lockstep, but it can only
+        // truncate to one of its per-batch checkpoints. Find the latest
+        // checkpoint at or below the fork and rewind *both* the tree and the
+        // actions log to that height — possibly a little below `to`, but the two
+        // stay consistent (seer-sync simply re-scans forward from here).
+        let checkpoint_at_or_below: Option<u32> = tx
+            .query_row(
+                "SELECT MAX(checkpoint_id) FROM orchard_tree_checkpoints WHERE checkpoint_id <= ?1",
+                params![to_h],
+                |r| r.get::<_, Option<u32>>(0),
+            )
+            .optional()?
+            .flatten();
+
+        let effective = match checkpoint_at_or_below {
+            Some(c) => {
+                let mut tree = commitment_tree::orchard_tree(&tx, MAX_CHECKPOINTS)?;
+                tree.truncate_to_checkpoint(&BlockHeight::from_u32(c))?;
+                drop(tree);
+                c
+            }
+            None => {
+                // No checkpoint at/below the fork: any tree state is entirely
+                // above it, so reset the tree (it rebuilds on re-scan).
+                tx.execute_batch(
+                    "DELETE FROM orchard_tree_checkpoint_marks_removed;
+                     DELETE FROM orchard_tree_checkpoints;
+                     DELETE FROM orchard_tree_shards;
+                     DELETE FROM orchard_tree_cap;",
+                )?;
+                to_h
+            }
+        };
+
+        // Drop every action above the effective fork. The prior action for each
+        // affected name is below it and untouched, so `current_names` re-folds to
+        // the correct pre-reorg state.
+        tx.execute("DELETE FROM actions WHERE height > ?1", params![effective as i64])?;
+        set_sync_state(&tx, effective as i64, None)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -165,21 +228,18 @@ impl Account for SqliteIndex {
             let (Some(cmx), Some(memo)) = (n.cmx, n.memo.as_ref()) else { continue };
             let Some(parsed) = verify::parse_memo(memo.as_slice()) else { continue };
 
-            // prev_rcm is this name's reconstructed tip (not the memo). The
-            // action must fit the chain: CLAIM only on an unseen name,
-            // UPDATE/RELEASE only on a known one.
-            let prev = lookup(&tx, &parsed.name)?;
-            let prev_rcm = match (parsed.action, &prev) {
-                (Action::Claim, None) => ZERO_PREV_RCM,
-                (Action::Update | Action::Release, Some(p)) => p.rcm,
-                _ => {
-                    tracing::debug!(
-                        "ZNS {:?} for {:?} does not fit chain state",
-                        parsed.action,
-                        parsed.name
-                    );
-                    continue;
-                }
+            // The action must fit the name's history. `prev_rcm` is the current
+            // tip's rcm — reconstructed from the log, *not* the memo. The fold
+            // rule (CLAIM starts a fresh chain on an unseen or released name;
+            // UPDATE/RELEASE extend a live tip) drops anything ill-fitting.
+            let tip = lookup(&tx, &parsed.name)?;
+            let Some(prev_rcm) = prev_rcm_for(tip.as_ref(), parsed.action) else {
+                tracing::debug!(
+                    "ZNS {:?} for {:?} does not fit chain state",
+                    parsed.action,
+                    parsed.name
+                );
+                continue;
             };
 
             // A cmx match proves the binding *and* that it extends `prev_rcm`.
@@ -190,25 +250,69 @@ impl Account for SqliteIndex {
                 continue;
             };
 
-            tx.execute(
-                "INSERT INTO names (name, ua, rcm, cmx, txid, height, last_action)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(name) DO UPDATE SET
-                     ua = excluded.ua, rcm = excluded.rcm, cmx = excluded.cmx,
-                     txid = excluded.txid, height = excluded.height,
-                     last_action = excluded.last_action",
-                params![
-                    parsed.name,
-                    parsed.ua,
-                    rcm.as_slice(),
-                    cmx.as_slice(),
-                    n.txid.as_slice(),
-                    u32::from(n.height) as i64,
-                    action_str(parsed.action),
-                ],
+            record_action(
+                &tx,
+                &parsed.name,
+                &parsed.ua,
+                &rcm,
+                &cmx,
+                &n.txid,
+                u32::from(n.height),
+                parsed.action,
             )?;
         }
         set_sync_state(&tx, u32::from(at.height) as i64, at.hash.as_ref().map(|h| h.as_slice()))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn wants_commitments(&self) -> bool {
+        true
+    }
+
+    fn apply_commitments(&self, at: Cursor, commitments: &[Commitment]) -> Result<(), AccountError> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Positions to retain witnesses for: every Name Note `cmx` this index has
+        // recorded. `apply` runs before this in the same batch, so the batch's
+        // new Name Notes are already present. The set is small (a name service),
+        // so loading it whole is cheap. NOTE: tree update and `apply` are
+        // separate transactions; a crash between them can leave the tree one
+        // batch behind. That is fail-safe — a stale/short tree yields a witness
+        // whose root won't match the anchor, so the producer's self-check drops
+        // it rather than serving a wrong proof.
+        let marked: HashSet<[u8; 32]> = {
+            let mut stmt = tx.prepare("SELECT cmx FROM actions")?;
+            let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+            let mut set = HashSet::new();
+            for cmx in rows {
+                if let Ok(bytes) = <[u8; 32]>::try_from(cmx?.as_slice()) {
+                    set.insert(bytes);
+                }
+            }
+            set
+        };
+
+        let mut tree = commitment_tree::orchard_tree(&tx, MAX_CHECKPOINTS)?;
+        if let Some(first) = commitments.first() {
+            let mut leaves = Vec::with_capacity(commitments.len());
+            for c in commitments {
+                let leaf = MerkleHashOrchard::from_bytes(&c.cmx)
+                    .into_option()
+                    .ok_or("non-canonical cmx in commitment firehose")?;
+                let retention = if marked.contains(&c.cmx) {
+                    Retention::Marked
+                } else {
+                    Retention::Ephemeral
+                };
+                leaves.push((leaf, retention));
+            }
+            tree.batch_insert(Position::from(first.position), leaves.into_iter())?;
+        }
+        // Checkpoint every batch height so `rewind` always has a target.
+        tree.checkpoint(at.height)?;
+        drop(tree);
+
         tx.commit()?;
         Ok(())
     }
@@ -216,13 +320,60 @@ impl Account for SqliteIndex {
 
 // ---------- internals (operate on a Connection; Transaction derefs to it) ----------
 
+/// The name's current chain tip — its latest action, *including* a `release`
+/// (which the resolution view hides, but the fold rule needs to see).
 fn lookup(conn: &Connection, name: &str) -> rusqlite::Result<Option<NameChainEntry>> {
     conn.query_row(
-        "SELECT name, ua, rcm, last_action FROM names WHERE name = ?",
+        "SELECT name, ua, rcm, action FROM actions
+         WHERE name = ?1 ORDER BY height DESC, rowid DESC LIMIT 1",
         params![name],
         row_to_entry,
     )
     .optional()
+}
+
+/// Append a verified action to the log.
+#[allow(clippy::too_many_arguments)]
+fn record_action(
+    conn: &Connection,
+    name: &str,
+    ua: &str,
+    rcm: &[u8; 32],
+    cmx: &[u8; 32],
+    txid: &[u8; 32],
+    height: u32,
+    action: Action,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO actions (name, height, action, ua, rcm, cmx, txid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            name,
+            height as i64,
+            action_str(action),
+            ua,
+            rcm.as_slice(),
+            cmx.as_slice(),
+            txid.as_slice(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The `prev_rcm` an `action` must extend given the name's current `tip`, or
+/// `None` if the action does not fit the chain. This is the protocol's
+/// transition rule as a pure fold over the tip:
+///  - CLAIM starts a fresh chain (zero genesis) on an unseen *or* released name.
+///  - UPDATE/RELEASE extend a live (non-released) tip, chaining off its `rcm`.
+fn prev_rcm_for(tip: Option<&NameChainEntry>, action: Action) -> Option<[u8; 32]> {
+    match (action, tip) {
+        (Action::Claim, None) => Some(ZERO_PREV_RCM),
+        (Action::Claim, Some(t)) if t.last_action == Action::Release => Some(ZERO_PREV_RCM),
+        (Action::Update | Action::Release, Some(t)) if t.last_action != Action::Release => {
+            Some(t.rcm)
+        }
+        _ => None,
+    }
 }
 
 fn set_sync_state(conn: &Connection, height: i64, hash: Option<&[u8]>) -> rusqlite::Result<()> {
@@ -282,5 +433,141 @@ mod tests {
         assert_eq!(idx.last_scanned_height().unwrap(), None);
         assert_eq!(idx.name_count().unwrap(), 0);
         assert!(idx.checkpoint().is_none());
+    }
+
+    fn entry(action: Action, rcm: [u8; 32]) -> NameChainEntry {
+        NameChainEntry { name: "alice".into(), ua: "u1".into(), rcm, last_action: action }
+    }
+
+    // ---- the fold rule (#prev_rcm_for): pure, no crypto, no DB ----
+
+    #[test]
+    fn fold_claim_fits_unseen_or_released_name() {
+        // Fresh name: CLAIM extends the zero genesis.
+        assert_eq!(prev_rcm_for(None, Action::Claim), Some(ZERO_PREV_RCM));
+        // Released name is free: a new CLAIM is allowed, again from genesis.
+        let released = entry(Action::Release, [9u8; 32]);
+        assert_eq!(prev_rcm_for(Some(&released), Action::Claim), Some(ZERO_PREV_RCM));
+        // Live name: a second CLAIM does not fit.
+        let live = entry(Action::Claim, [1u8; 32]);
+        assert_eq!(prev_rcm_for(Some(&live), Action::Claim), None);
+    }
+
+    #[test]
+    fn fold_update_release_need_a_live_tip() {
+        let live = entry(Action::Claim, [7u8; 32]);
+        assert_eq!(prev_rcm_for(Some(&live), Action::Update), Some([7u8; 32]));
+        assert_eq!(prev_rcm_for(Some(&live), Action::Release), Some([7u8; 32]));
+        // No tip, or a released tip: nothing to extend.
+        assert_eq!(prev_rcm_for(None, Action::Update), None);
+        let released = entry(Action::Release, [7u8; 32]);
+        assert_eq!(prev_rcm_for(Some(&released), Action::Update), None);
+    }
+
+    // ---- the view + rewind, driven by the append half (no crypto) ----
+
+    fn seed(idx: &SqliteIndex, name: &str, ua: &str, rcm: [u8; 32], height: u32, action: Action) {
+        record_action(&idx.conn, name, ua, &rcm, &[0u8; 32], &[0u8; 32], height, action).unwrap();
+    }
+
+    #[test]
+    fn rewind_restores_prior_action_below_the_fork() {
+        let idx = SqliteIndex::open_in_memory().unwrap();
+        seed(&idx, "alice", "u1a", [1u8; 32], 100, Action::Claim);
+        seed(&idx, "alice", "u1b", [2u8; 32], 200, Action::Update);
+        assert_eq!(idx.resolve_by_name("alice").unwrap().unwrap().ua, "u1b");
+
+        // Reorg to 150 drops the UPDATE@200; the CLAIM@100 below the fork
+        // survives, so the name reverts to its prior state rather than vanishing.
+        idx.rewind(BlockHeight::from_u32(150)).unwrap();
+        let reg = idx.resolve_by_name("alice").unwrap().expect("name must survive the reorg");
+        assert_eq!(reg.ua, "u1a");
+        assert_eq!(reg.last_action, Action::Claim);
+    }
+
+    #[test]
+    fn released_name_can_be_reclaimed() {
+        let idx = SqliteIndex::open_in_memory().unwrap();
+        seed(&idx, "alice", "u1a", [1u8; 32], 100, Action::Claim);
+        seed(&idx, "alice", "", [2u8; 32], 200, Action::Release);
+
+        // Released → not a current registration.
+        assert!(idx.resolve_by_name("alice").unwrap().is_none());
+        assert_eq!(idx.name_count().unwrap(), 0);
+        // ...but the tip is still visible to the fold, which treats it as free.
+        assert_eq!(
+            prev_rcm_for(idx.lookup("alice").unwrap().as_ref(), Action::Claim),
+            Some(ZERO_PREV_RCM),
+        );
+
+        seed(&idx, "alice", "u1c", [3u8; 32], 300, Action::Claim);
+        let reg = idx.resolve_by_name("alice").unwrap().unwrap();
+        assert_eq!(reg.ua, "u1c");
+        assert_eq!(reg.last_action, Action::Claim);
+    }
+
+    // ---- commitment-tree wiring: firehose → marked Name Note witnessed ----
+
+    #[test]
+    fn apply_commitments_marks_indexed_name_notes() {
+        let idx = SqliteIndex::open_in_memory().unwrap();
+        // A canonical cmx for a Name Note that `apply` would have recorded.
+        let name_cmx = [3u8; 32];
+        seed_cmx(&idx, "alice", name_cmx, 100, Action::Claim);
+
+        // The batch's firehose: 4 commitments, position 2 is the Name Note.
+        let commitments: Vec<Commitment> = (0u64..4)
+            .map(|i| Commitment {
+                position: i,
+                cmx: if i == 2 { name_cmx } else { [(i as u8) + 10; 32] },
+            })
+            .collect();
+        idx.apply_commitments(Cursor { height: BlockHeight::from_u32(100), hash: None }, &commitments)
+            .unwrap();
+
+        // The marked Name Note position is witnessable; an unmarked one is pruned.
+        let tx = idx.conn.unchecked_transaction().unwrap();
+        let tree = commitment_tree::orchard_tree(&tx, MAX_CHECKPOINTS).unwrap();
+        let h = BlockHeight::from_u32(100);
+        assert!(tree.witness_at_checkpoint_id(Position::from(2), &h).unwrap().is_some());
+        assert!(tree.witness_at_checkpoint_id(Position::from(1), &h).is_err());
+    }
+
+    fn seed_cmx(idx: &SqliteIndex, name: &str, cmx: [u8; 32], height: u32, action: Action) {
+        record_action(&idx.conn, name, "u1", &[1u8; 32], &cmx, &[0u8; 32], height, action).unwrap();
+    }
+
+    #[test]
+    fn rewind_truncates_tree_in_lockstep() {
+        let idx = SqliteIndex::open_in_memory().unwrap();
+        let name_cmx = [3u8; 32];
+        seed_cmx(&idx, "alice", name_cmx, 100, Action::Claim);
+
+        // Batch @100: the Name Note at position 1. Batch @200: another leaf.
+        idx.apply_commitments(
+            Cursor { height: BlockHeight::from_u32(100), hash: None },
+            &[
+                Commitment { position: 0, cmx: [10u8; 32] },
+                Commitment { position: 1, cmx: name_cmx },
+            ],
+        )
+        .unwrap();
+        idx.apply_commitments(
+            Cursor { height: BlockHeight::from_u32(200), hash: None },
+            &[Commitment { position: 2, cmx: [12u8; 32] }],
+        )
+        .unwrap();
+
+        // Reorg to 150 → rolls the tree back to the checkpoint @100.
+        idx.rewind(BlockHeight::from_u32(150)).unwrap();
+
+        let tx = idx.conn.unchecked_transaction().unwrap();
+        let tree = commitment_tree::orchard_tree(&tx, MAX_CHECKPOINTS).unwrap();
+        // Checkpoint @100 still witnesses the Name Note; @200 is gone.
+        assert!(tree
+            .witness_at_checkpoint_id(Position::from(1), &BlockHeight::from_u32(100))
+            .unwrap()
+            .is_some());
+        assert!(tree.root_at_checkpoint_id(&BlockHeight::from_u32(200)).unwrap().is_none());
     }
 }
