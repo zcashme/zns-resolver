@@ -20,8 +20,9 @@ use std::collections::HashMap;
 use anyhow::Result;
 use futures::StreamExt;
 use orchard::keys::PreparedIncomingViewingKey;
-use seer_sync::sync::chain::{self, ChainError, LwdClient, DEFAULT_CHUNK_OUTPUTS};
-use seer_sync::{parse_orchard, BlockHash, BlockHeight, CompactBlock, TxId};
+use seer_sync::chain::{self, ChainError, LwdClient, DEFAULT_CHUNK_OUTPUTS};
+use seer_sync::proto::CompactBlock;
+use seer_sync::{parse_orchard, BlockHash, BlockHeight, TxId};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BranchId, Parameters};
 

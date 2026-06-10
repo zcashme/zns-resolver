@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchard::keys::PreparedIncomingViewingKey;
-use seer_sync::sync::chain;
+use seer_sync::chain;
 use zns_resolver::http::{serve, RpcContext};
 use zns_resolver::index::SqliteIndex;
 use zns_resolver::net::Net;
