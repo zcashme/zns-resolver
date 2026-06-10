@@ -8,11 +8,14 @@
 //! decrypt stays in `zns-verify` and seer-sync stays ZNS-blind.
 //!
 //! Modules:
-//!  - [`verify`]  — ZNS binding verification + memo parsing.
+//!  - [`verify`]  — ZNS binding verification (memo grammar lives in the
+//!    kernel, `zns_verify::memo`).
 //!  - [`observe`] — the chain-observer scan loop: stream → relaxed decrypt →
 //!    memo recovery → verify → index, with reorg rollback.
 //!  - [`index`]   — SQLite name index (verify-on-apply, reorg via `rewind`).
-//!  - [`http`]    — jsonrpsee JSON-RPC API (`resolve`, `status`).
+//!  - [`proof`]   — proof-material acquisition: validator RPC + Merkle
+//!    branch construction (`PROOFS.md`).
+//!  - [`http`]    — jsonrpsee JSON-RPC API (`resolve`, `chain`, `status`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -20,7 +23,9 @@
 
 pub mod http;
 pub mod index;
+pub mod net;
 pub mod observe;
+pub mod proof;
 pub mod verify;
 
 pub use zns_verify::{Action, ZERO_PREV_RCM};

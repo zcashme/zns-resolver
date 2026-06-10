@@ -62,6 +62,8 @@ fn seed_index(db: &std::path::Path) {
             memo: memo("ZNS:claim:alice:u1old"),
             txid: [0xAA; 32],
             height: 100,
+            action_index: 0,
+            tx_bytes: vec![],
         },
         NameNote {
             note,
@@ -69,6 +71,8 @@ fn seed_index(db: &std::path::Path) {
             memo: memo("ZNS:update:alice:u1new"),
             txid: [0xBB; 32],
             height: 105,
+            action_index: 0,
+            tx_bytes: vec![],
         },
     ];
     idx.apply_notes(Cursor { height: BlockHeight::from_u32(105), hash: None }, &batch).unwrap();

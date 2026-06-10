@@ -20,8 +20,10 @@ publish = false
 seer-sync = { path = "../seer-sync" }
 
 # ZNS kernel: `verify` (binding check) + `decrypt` (relaxed Orchard trial
-# decrypt that surfaces Name Notes the standard ZIP-212 check would discard).
-zns-verify = { path = "../zns-verify", features = ["decrypt"] }
+# decrypt that surfaces Name Notes the standard ZIP-212 check would discard) +
+# `proof` (the wallet-side walk; the resolver's branch builder is cross-tested
+# against its Merkle fold).
+zns-verify = { path = "../zns-verify", features = ["decrypt", "proof"] }
 
 # Orchard (for the Note type + the `zns_commitment_keys` accessor used in
 # binding verification). ZNS fork that exposes the `unsafe-zns` feature —
@@ -31,7 +33,9 @@ zns-verify = { path = "../zns-verify", features = ["decrypt"] }
 orchard = { path = "../zns-orchard", default-features = false, features = ["unsafe-zns"] }
 
 # librustzcash bits we touch directly (from crates.io)
-zcash_protocol = { version = "0.9", default-features = false, features = ["std"] }
+# `local-consensus` provides `LocalNetwork`, the Parameters impl behind the
+# `--regtest` flag (see `net`).
+zcash_protocol = { version = "0.9", default-features = false, features = ["std", "local-consensus"] }
 zcash_keys = { version = "0.14", default-features = false, features = ["orchard"] }
 # Full-transaction parsing for memo recovery (the memo lives in the full
 # ciphertext that compact blocks truncate).
@@ -46,8 +50,11 @@ group = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # JSON-RPC API — matches the live ZNS indexer + zcashname-sdk contract so this
-# resolver is a drop-in for the resolution methods.
-jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+# resolver is a drop-in for the resolution methods. The http-client half talks
+# to the validator RPC (zebrad/zcashd) for proof material.
+jsonrpsee = { version = "0.26", features = ["server", "macros", "http-client"] }
+# Merkle branch construction (sha256d) for proof material.
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

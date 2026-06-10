@@ -21,21 +21,26 @@ use anyhow::Result;
 use futures::StreamExt;
 use orchard::keys::PreparedIncomingViewingKey;
 use seer_sync::sync::chain::{self, ChainError, LwdClient, DEFAULT_CHUNK_OUTPUTS};
-use seer_sync::{parse_orchard, CompactBlock};
-use seer_sync::BlockHeight;
+use seer_sync::{parse_orchard, BlockHash, BlockHeight, CompactBlock, TxId};
 use zcash_primitives::transaction::Transaction;
-use zcash_protocol::consensus::{BranchId, Network};
+use zcash_protocol::consensus::{BranchId, Parameters};
 
-use crate::index::{Cursor, NameNote, SqliteIndex};
+use crate::index::{Cursor, NameNote, Recorded, SqliteIndex};
+use crate::proof::{merkle_branch, ValidatorClient};
 
 /// Scan from the index's checkpoint (or `birthday` if empty) to the chain tip,
 /// applying every verified Name Note found.
+///
+/// With a `validator` client, every recorded action's proof context (header +
+/// Merkle branch, `PROOFS.md §6`) is materialized right after its batch
+/// applies; without one, the resolver still indexes but serves bare answers.
 pub async fn sync_to_tip(
     index: &SqliteIndex,
     client: LwdClient,
-    network: &Network,
+    network: &impl Parameters,
     ivk: &PreparedIncomingViewingKey,
     birthday: u32,
+    validator: Option<&ValidatorClient>,
 ) -> Result<()> {
     let mut fetch_client = client.clone();
     let tip = chain::tip_height(&mut fetch_client).await?;
@@ -50,7 +55,8 @@ pub async fn sync_to_tip(
             return Ok(());
         }
 
-        let mut stream = chain::blocks(client.clone(), start, tip, DEFAULT_CHUNK_OUTPUTS, seam);
+        let mut stream =
+            chain::blocks(client.clone(), start, tip, DEFAULT_CHUNK_OUTPUTS, seam.map(BlockHash));
         loop {
             match stream.next().await {
                 None => return Ok(()),
@@ -65,7 +71,10 @@ pub async fn sync_to_tip(
 
                     let candidates = scan_name_notes(&batch, ivk);
                     let notes = recover_notes(&mut fetch_client, network, ivk, candidates).await?;
-                    index.apply_notes(at, &notes)?;
+                    let recorded = index.apply_notes(at, &notes)?;
+                    if let Some(validator) = validator {
+                        materialize_proofs(index, validator, &notes, &recorded).await?;
+                    }
                     rewind_by = 1;
                 }
                 Some(Err(ChainError::Reorg(at))) => {
@@ -116,42 +125,97 @@ fn scan_name_notes(blocks: &[CompactBlock], ivk: &PreparedIncomingViewingKey) ->
 /// who wins a same-batch claim race.
 async fn recover_notes(
     client: &mut LwdClient,
-    network: &Network,
+    network: &impl Parameters,
     ivk: &PreparedIncomingViewingKey,
     candidates: Vec<Candidate>,
 ) -> Result<Vec<NameNote>> {
     // Each full transaction is fetched and parsed once; `None` caches a parse
-    // failure so it isn't refetched for its remaining candidates.
-    let mut fetched: HashMap<[u8; 32], Option<(Transaction, u32)>> = HashMap::new();
+    // failure so it isn't refetched for its remaining candidates. The raw
+    // bytes ride along: they are the proof bundle's `tx` (`PROOFS.md §2`).
+    type Fetched = Option<(Transaction, u32, Vec<u8>)>;
+    let mut fetched: HashMap<[u8; 32], Fetched> = HashMap::new();
 
     let mut out = Vec::new();
     for c in candidates {
         if let std::collections::hash_map::Entry::Vacant(e) = fetched.entry(c.txid) {
-            let raw = chain::fetch_raw_transaction(client, &c.txid).await?;
+            let raw = chain::fetch_raw_transaction(client, &TxId::from_bytes(c.txid)).await?;
             let height = raw.height as u32;
             let parsed = Transaction::read(
                 &raw.data[..],
                 BranchId::for_height(network, BlockHeight::from_u32(height)),
             )
             .ok()
-            .map(|tx| (tx, height));
+            .map(|tx| (tx, height, raw.data));
             e.insert(parsed);
         }
-        let Some((tx, height)) = fetched.get(&c.txid).and_then(|o| o.as_ref()) else { continue };
+        let Some((tx, height, raw)) = fetched.get(&c.txid).and_then(|o| o.as_ref()) else {
+            continue;
+        };
         let Some(bundle) = tx.orchard_bundle() else { continue };
         let Some(action) = bundle.actions().get(c.action_index) else { continue };
         let Some((note, _recipient, memo)) = zns_verify::decrypt::try_decrypt_orchard(action, ivk)
         else {
             continue;
         };
-        out.push(NameNote { note, cmx: action.cmx().to_bytes(), memo, txid: c.txid, height: *height });
+        out.push(NameNote {
+            note,
+            cmx: action.cmx().to_bytes(),
+            memo,
+            txid: c.txid,
+            height: *height,
+            action_index: c.action_index,
+            tx_bytes: raw.clone(),
+        });
     }
     Ok(out)
 }
 
+/// Materialize the proof context for each recorded action: per block, the
+/// header + txid list from the validator RPC, then the Merkle branch for each
+/// Name Note transaction. Idempotent — already-materialized txids are
+/// skipped by the `INSERT OR IGNORE`.
+async fn materialize_proofs(
+    index: &SqliteIndex,
+    validator: &ValidatorClient,
+    notes: &[NameNote],
+    recorded: &[Recorded],
+) -> Result<()> {
+    // One validator round-trip pair per distinct block.
+    let mut heights: Vec<u32> = recorded.iter().map(|r| r.height).collect();
+    heights.sort_unstable();
+    heights.dedup();
+
+    for height in heights {
+        let ctx = validator.block_context(height).await?;
+        for r in recorded.iter().filter(|r| r.height == height) {
+            let Some(pos) = ctx.txids.iter().position(|t| *t == r.txid) else {
+                anyhow::bail!(
+                    "validator block {height} does not contain Name Note tx {}",
+                    hex::encode(r.txid)
+                );
+            };
+            let branch = merkle_branch(&ctx.txids, pos);
+            let tx_bytes = notes
+                .iter()
+                .find(|n| n.txid == r.txid)
+                .map(|n| n.tx_bytes.as_slice())
+                .expect("recorded action came from this batch's notes");
+            index.insert_proof_material(
+                &r.txid,
+                height,
+                tx_bytes,
+                &ctx.header,
+                &branch,
+                pos as u32,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Derive the external Orchard incoming viewing key from a unified viewing key
 /// encoding (`uivk1…` or a UFVK). Name Notes are encrypted to this key.
-pub fn orchard_ivk(network: &Network, encoding: &str) -> Result<PreparedIncomingViewingKey> {
+pub fn orchard_ivk(network: &impl Parameters, encoding: &str) -> Result<PreparedIncomingViewingKey> {
     use orchard::keys::Scope;
     use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedIncomingViewingKey};
 

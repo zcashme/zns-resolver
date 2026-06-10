@@ -13,10 +13,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchard::keys::PreparedIncomingViewingKey;
 use seer_sync::sync::chain;
-use seer_sync::Network;
 use zns_resolver::http::{serve, RpcContext};
+use zns_resolver::index::SqliteIndex;
+use zns_resolver::net::Net;
 use zns_resolver::observe::{orchard_ivk, sync_to_tip};
-use zns_resolver::{index::SqliteIndex, MAINNET_NU5_HEIGHT, TESTNET_NU5_HEIGHT};
+use zns_resolver::proof::ValidatorClient;
 
 const DEFAULT_LIGHTWALLETD: &str = "https://testnet.zec.rocks:443";
 const DEFAULT_DB_PATH: &str = "zns-resolver.sqlite";
@@ -33,6 +34,16 @@ struct Cli {
     /// Use mainnet instead of testnet (affects key decoding + default birthday).
     #[arg(long, global = true)]
     mainnet: bool,
+    /// Follow the local NU6.2 regtest chain (`zebra-regtest/zebrad.toml`
+    /// activation heights; `uivkregtest1…` keys; birthday defaults to 1).
+    #[arg(long, global = true, conflicts_with = "mainnet")]
+    regtest: bool,
+    /// Validator JSON-RPC endpoint (zebrad/zcashd, e.g. http://127.0.0.1:8232).
+    /// Required for serving proofs: headers + Merkle branches come from here.
+    /// Without it the resolver indexes normally but `with_proof`/`chain`
+    /// requests fail with "proof material unavailable".
+    #[arg(long, global = true)]
+    validator_rpc: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -79,7 +90,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let network = if cli.mainnet { Network::MainNetwork } else { Network::TestNetwork };
+    let network = match (cli.mainnet, cli.regtest) {
+        (true, true) => anyhow::bail!("--mainnet and --regtest are mutually exclusive"),
+        (true, false) => Net::Main,
+        (false, true) => Net::Regtest,
+        (false, false) => Net::Test,
+    };
     match &cli.cmd {
         Cmd::Sync { uivk, birthday } => cmd_sync(&cli, &network, uivk, *birthday).await,
         Cmd::Serve { uivk, birthday, addr } => {
@@ -92,16 +108,13 @@ async fn main() -> Result<()> {
 
 async fn cmd_serve(
     cli: &Cli,
-    network: &Network,
+    network: &Net,
     uivk: &str,
     birthday: Option<u32>,
     addr: &str,
 ) -> Result<()> {
     let ivk = orchard_ivk(network, uivk)?;
-    let birthday = birthday.unwrap_or(match network {
-        Network::MainNetwork => MAINNET_NU5_HEIGHT,
-        _ => TESTNET_NU5_HEIGHT,
-    });
+    let birthday = birthday.unwrap_or_else(|| network.default_birthday());
 
     // Create the DB + schema before serving: RPC handlers open it read-only,
     // so the file must exist even if the first sync pass hasn't run yet.
@@ -116,7 +129,7 @@ async fn cmd_serve(
     // sync pass runs.
     let sync = async {
         loop {
-            if let Err(e) = sync_pass(&cli.db, &cli.lightwalletd, network, &ivk, birthday).await {
+            if let Err(e) = sync_pass(cli, network, &ivk, birthday).await {
                 tracing::warn!("sync pass failed: {e}");
             }
             tokio::time::sleep(std::time::Duration::from_secs(SYNC_INTERVAL_SECS)).await;
@@ -131,29 +144,27 @@ async fn cmd_serve(
 }
 
 async fn sync_pass(
-    db: &Path,
-    lwd: &str,
-    network: &Network,
+    cli: &Cli,
+    network: &Net,
     ivk: &PreparedIncomingViewingKey,
     birthday: u32,
 ) -> Result<()> {
-    let index = SqliteIndex::open(db)?;
-    let client = chain::connect(lwd).await?;
-    sync_to_tip(&index, client, network, ivk, birthday).await?;
+    let index = SqliteIndex::open(&cli.db)?;
+    let client = chain::connect(&cli.lightwalletd).await?;
+    let validator = cli.validator_rpc.as_deref().map(ValidatorClient::new).transpose()?;
+    sync_to_tip(&index, client, network, ivk, birthday, validator.as_ref()).await?;
     Ok(())
 }
 
-async fn cmd_sync(cli: &Cli, network: &Network, uivk: &str, birthday: Option<u32>) -> Result<()> {
+async fn cmd_sync(cli: &Cli, network: &Net, uivk: &str, birthday: Option<u32>) -> Result<()> {
     let index = SqliteIndex::open(&cli.db)?;
     let ivk = orchard_ivk(network, uivk)?;
-    let birthday = birthday.unwrap_or(match network {
-        Network::MainNetwork => MAINNET_NU5_HEIGHT,
-        _ => TESTNET_NU5_HEIGHT,
-    });
+    let birthday = birthday.unwrap_or_else(|| network.default_birthday());
     println!("[sync] scanning to tip via {} (birthday {birthday})", cli.lightwalletd);
 
     let client = chain::connect(&cli.lightwalletd).await?;
-    sync_to_tip(&index, client, network, &ivk, birthday).await?;
+    let validator = cli.validator_rpc.as_deref().map(ValidatorClient::new).transpose()?;
+    sync_to_tip(&index, client, network, &ivk, birthday, validator.as_ref()).await?;
 
     println!(
         "[sync] done. height={} names={}",

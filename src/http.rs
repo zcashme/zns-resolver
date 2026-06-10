@@ -14,7 +14,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::index::{Event, Registration, SqliteIndex};
+use crate::index::{ChainRow, Event, Registration, SqliteIndex};
 use zns_verify::Action;
 
 // ── Response shapes (subset of the indexer's, resolution-only) ───────────────
@@ -84,6 +84,37 @@ pub struct EventsResult {
     total: u64,
 }
 
+/// One link of a name's proof chain (`PROOFS.md §2`). `action` and `ua` are
+/// the resolver's claims; everything else is chain artifact the wallet's
+/// `zns_verify::proof::verify_chain` recomputes. Action names here are the
+/// canonical lowercase protocol strings (what the verifier hashes), not the
+/// uppercase indexer-API display form.
+#[derive(Debug, Clone, Serialize)]
+struct ProofLinkEntry {
+    action: String,
+    ua: String,
+    height: u64,
+    txid: String,
+    action_index: u64,
+    /// Full raw transaction, hex.
+    tx: String,
+    /// Raw block header, hex.
+    header: String,
+    /// Merkle branch siblings (leaf → root), hex each.
+    merkle_branch: Vec<String>,
+    merkle_index: u64,
+}
+
+/// The `chain` method's result: a name's full applied history with proof
+/// context — `DESIGN.md §11.4`'s `/chain/:name`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainResult {
+    /// The queried name.
+    name: String,
+    /// Every applied action in chain order, each verifiable standalone.
+    links: Vec<ProofLinkEntry>,
+}
+
 // ── RPC trait ────────────────────────────────────────────────────────────────
 
 /// The resolver's JSON-RPC surface (a resolution-only subset of the ZNS
@@ -91,8 +122,10 @@ pub struct EventsResult {
 #[rpc(server)]
 pub trait ZnsApi {
     /// Resolve a query: empty → all registrations; an exact name → that record;
-    /// otherwise an address → its names. `with_proof` is reserved (inclusion
-    /// proofs are not yet implemented).
+    /// otherwise an address → its names. With `with_proof` on an exact-name
+    /// query, the record carries its proof chain (`PROOFS.md §1`): the links
+    /// from the name's most recent CLAIM genesis to its tip, each one
+    /// self-verifying via `zns_verify::proof::verify_chain`.
     #[method(name = "resolve", blocking)]
     fn resolve(
         &self,
@@ -101,6 +134,12 @@ pub trait ZnsApi {
         offset: Option<u64>,
         with_proof: Option<bool>,
     ) -> RpcResult<Value>;
+
+    /// A name's full applied history (all segments, RELEASEs included) with
+    /// proof context — for auditing and longest-chain comparison across
+    /// resolvers (`DESIGN.md §11.4`, `§19.4`).
+    #[method(name = "chain", blocking)]
+    fn chain(&self, name: String) -> RpcResult<ChainResult>;
 
     /// Resolver status: synced height, registered count, and the scanning UIVK.
     #[method(name = "status", blocking)]
@@ -139,23 +178,38 @@ impl ZnsApiServer for RpcContext {
         query: String,
         limit: Option<u64>,
         offset: Option<u64>,
-        _with_proof: Option<bool>,
+        with_proof: Option<bool>,
     ) -> RpcResult<Value> {
         let idx = open(&self.db)?;
         let limit = limit.unwrap_or(50).min(500) as u32;
         let offset = offset.unwrap_or(0) as u32;
 
         // Empty → list all; an exact name → that single record; otherwise treat
-        // the query as an address and list its names. (Inclusion proofs are a
-        // later task; `with_proof` is accepted but ignored for now.)
+        // the query as an address and list its names. Proofs attach only to
+        // the exact-name form (the only shape a wallet verifies).
         let value = if query.is_empty() {
             entries(idx.list_registrations(limit, offset).map_err(internal)?)
         } else if let Some(reg) = idx.resolve_by_name(&query).map_err(internal)? {
-            serde_json::to_value(entry(reg)).unwrap()
+            let mut value = serde_json::to_value(entry(reg)).unwrap();
+            if with_proof == Some(true) {
+                // The current segment: links since the most recent
+                // CLAIM-from-zero genesis (PROOFS.md §1).
+                let rows = idx.chain_rows(&query).map_err(internal)?;
+                let links = proof_links(&idx, current_segment(&rows))?;
+                value["proof"] = serde_json::json!({ "links": links });
+            }
+            value
         } else {
             entries(idx.registrations_by_ua(&query, limit, offset).map_err(internal)?)
         };
         Ok(value)
+    }
+
+    fn chain(&self, name: String) -> RpcResult<ChainResult> {
+        let idx = open(&self.db)?;
+        let rows = idx.chain_rows(&name).map_err(internal)?;
+        let links = proof_links(&idx, &rows)?;
+        Ok(ChainResult { name, links })
     }
 
     fn status(&self) -> RpcResult<StatusResult> {
@@ -210,6 +264,42 @@ pub async fn serve(addr: &str, ctx: RpcContext) -> anyhow::Result<()> {
 }
 
 // ── internals ────────────────────────────────────────────────────────────────
+
+/// The current segment of a name's history: the rows from its most recent
+/// CLAIM genesis onward. Earlier claim/release cycles do not bear on the
+/// current binding (each CLAIM restarts the rcm chain from zero).
+fn current_segment(rows: &[ChainRow]) -> &[ChainRow] {
+    let start = rows.iter().rposition(|r| r.action == Action::Claim).unwrap_or(0);
+    &rows[start..]
+}
+
+/// Join proof material onto chain rows, building serveable links. A missing
+/// row means this resolver synced without `--validator-rpc`.
+fn proof_links(idx: &SqliteIndex, rows: &[ChainRow]) -> RpcResult<Vec<ProofLinkEntry>> {
+    rows.iter()
+        .map(|r| {
+            let m = idx.proof_material(&r.txid).map_err(internal)?.ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32011,
+                    "proof material unavailable (resolver synced without --validator-rpc)",
+                    None::<()>,
+                )
+            })?;
+            Ok(ProofLinkEntry {
+                // Canonical lowercase protocol strings — what the verifier hashes.
+                action: String::from_utf8(r.action.as_bytes().to_vec()).expect("ascii"),
+                ua: r.ua.clone(),
+                height: r.height as u64,
+                txid: hex::encode(r.txid),
+                action_index: r.action_index as u64,
+                tx: hex::encode(&m.raw_tx),
+                header: hex::encode(&m.header),
+                merkle_branch: m.merkle_branch.iter().map(hex::encode).collect(),
+                merkle_index: m.merkle_index as u64,
+            })
+        })
+        .collect()
+}
 
 fn entry(r: Registration) -> RegistrationEntry {
     RegistrationEntry {
@@ -270,4 +360,33 @@ fn open(db: &Path) -> RpcResult<SqliteIndex> {
 fn internal(e: impl std::fmt::Display) -> ErrorObjectOwned {
     tracing::error!("rpc: {e}");
     ErrorObjectOwned::owned(-32603, "Internal error", None::<()>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(action: Action, height: u32) -> ChainRow {
+        ChainRow { action, ua: String::new(), height, txid: [0; 32], action_index: 0 }
+    }
+
+    #[test]
+    fn current_segment_starts_at_last_claim() {
+        // claim → update → release → claim → update: the current binding
+        // begins at the second CLAIM.
+        let rows = vec![
+            row(Action::Claim, 1),
+            row(Action::Update, 2),
+            row(Action::Release, 3),
+            row(Action::Claim, 4),
+            row(Action::Update, 5),
+        ];
+        let seg = current_segment(&rows);
+        assert_eq!(seg.len(), 2);
+        assert_eq!(seg[0].height, 4);
+
+        // A single live segment is served whole.
+        let rows = vec![row(Action::Claim, 1), row(Action::Update, 2)];
+        assert_eq!(current_segment(&rows).len(), 2);
+    }
 }

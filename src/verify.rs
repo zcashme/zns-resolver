@@ -1,9 +1,13 @@
-//! ZNS memo parsing + binding verification.
+//! ZNS binding verification — the resolver's glue over the `zns-verify` kernel.
 //!
 //! The resolver's trust model: an indexer can be stale or omit, but cannot
 //! forge. [`verify_binding`] re-derives `(ψ, rcm)` from the claimed
 //! `(action, name, ua, prev_rcm)` and recomputes the Sinsemilla `cmx`, comparing
 //! it to the note's on-chain commitment.
+//!
+//! Memo parsing and the per-name transition rule live in the kernel
+//! (`zns_verify::memo`, `zns_verify::chain`) — they are protocol, shared
+//! verbatim with the registry and the proof verifier (`DESIGN.md §17`).
 //!
 //! `prev_rcm` is supplied by the caller from its own reconstructed per-name tip
 //! (it is *not* in the memo — see `DESIGN.md §5`). So a `cmx` match
@@ -13,7 +17,7 @@
 use group::ff::PrimeField;
 use orchard::Note;
 use pasta_curves::pallas;
-use zns_verify::{note_commitment_cmx, zns_psi_rcm, Action};
+use zns_verify::{note_commitment_cmx, zns_psi_rcm, Action, Tip};
 
 /// A name's current index entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,36 +32,11 @@ pub struct NameChainEntry {
     pub last_action: Action,
 }
 
-/// A ZNS lifecycle action parsed from a memo.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedAction {
-    /// CLAIM, UPDATE, or RELEASE.
-    pub action: Action,
-    /// The name.
-    pub name: String,
-    /// The bound UA (empty for RELEASE).
-    pub ua: String,
-}
-
-/// Parse a memo's printable prefix as a ZNS lifecycle action.
-///
-/// Grammar (`DESIGN.md §6`): `ZNS:claim:<name>:<ua>`, `ZNS:update:<name>:<ua>`,
-/// `ZNS:release:<name>`. Returns `None` for non-ZNS memos, the registry-only
-/// `confirm` verb, or malformed input.
-pub fn parse_memo(memo: &[u8]) -> Option<ParsedAction> {
-    let mut parts = printable_prefix(memo)?.splitn(4, ':');
-    if parts.next()? != "ZNS" {
-        return None;
+impl NameChainEntry {
+    /// This entry as the kernel fold rule's [`Tip`].
+    pub fn tip(&self) -> Tip {
+        Tip { action: self.last_action, rcm: self.rcm }
     }
-    let verb = parts.next()?;
-    let name = parts.next()?.to_string();
-    let (action, ua) = match verb {
-        "claim" => (Action::Claim, parts.next()?.to_string()),
-        "update" => (Action::Update, parts.next()?.to_string()),
-        "release" => (Action::Release, String::new()),
-        _ => return None, // "confirm" and anything else aren't index actions.
-    };
-    (!name.is_empty()).then_some(ParsedAction { action, name, ua })
 }
 
 /// Verify that a scanned Name Note binds `(action, name, ua)` to `prev_rcm`,
@@ -82,38 +61,4 @@ pub fn verify_binding(
     let (psi, rcm) = zns_psi_rcm(action.as_bytes(), name.as_bytes(), ua.as_bytes(), prev_rcm);
     let cmx = note_commitment_cmx(g_d, pk_d, note.value().inner(), rho, psi, rcm)?;
     (cmx == expected).then(|| rcm.to_repr())
-}
-
-fn printable_prefix(memo: &[u8]) -> Option<&str> {
-    let end = memo.iter().rposition(|b| *b != 0).map(|p| p + 1).unwrap_or(0);
-    std::str::from_utf8(&memo[..end]).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_claim_and_update() {
-        assert_eq!(
-            parse_memo(b"ZNS:claim:alice:u1xxx"),
-            Some(ParsedAction { action: Action::Claim, name: "alice".into(), ua: "u1xxx".into() }),
-        );
-        assert_eq!(parse_memo(b"ZNS:update:alice:u1new").unwrap().action, Action::Update);
-    }
-
-    #[test]
-    fn release_has_empty_ua() {
-        let p = parse_memo(b"ZNS:release:alice").unwrap();
-        assert_eq!(p.action, Action::Release);
-        assert_eq!(p.ua, "");
-    }
-
-    #[test]
-    fn rejects_confirm_and_malformed() {
-        assert!(parse_memo(b"ZNS:confirm:alice:1234").is_none());
-        assert!(parse_memo(b"not a zns memo").is_none());
-        assert!(parse_memo(b"ZNS:claim:alice").is_none()); // CLAIM needs a ua
-        assert!(parse_memo(b"ZNS:claim::u1xxx").is_none()); // empty name
-    }
 }

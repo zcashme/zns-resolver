@@ -94,6 +94,8 @@ fn same_batch_claim_then_update_applies_in_chain_order() {
             memo: memo("ZNS:claim:alice:u1old"),
             txid: [0xFF; 32], // sorts after the UPDATE's txid
             height: 100,
+            action_index: 0,
+            tx_bytes: vec![],
         },
         NameNote {
             note,
@@ -101,6 +103,8 @@ fn same_batch_claim_then_update_applies_in_chain_order() {
             memo: memo("ZNS:update:alice:u1new"),
             txid: [0x01; 32],
             height: 105,
+            action_index: 0,
+            tx_bytes: vec![],
         },
     ];
     idx.apply_notes(Cursor { height: BlockHeight::from_u32(105), hash: None }, &batch).unwrap();
