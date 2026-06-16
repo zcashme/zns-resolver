@@ -1,4 +1,24 @@
-//! ZNS resolver — see `AGENTS.md`.
+//! # ZNS resolver
+//!
+//! ## What problem does this solve?
+//!
+//! Zcash Names (ZNS) binds human-readable names to Orchard shielded addresses.
+//! The binding lives in Orchard note commitments on the Zcash chain. This resolver:
+//!
+//! 1. **Observes** shielded notes sent to the registry's viewing key
+//! 2. **Verifies** each note actually commits to `(action, name, ua, prev_rcm)`
+//! 3. **Indexes** the current tip of each name's per-name chain
+//! 4. **Serves** lookups and optional audit proofs (tx + header + merkle branch)
+//!
+//! ## Architecture (mono-file)
+//!
+//! ```text
+//! lightwalletd ──► observe_batch ──► apply_batch ──► SQLite
+//!                                        │                  │
+//!                                        ▼                  ▼
+//!                              materialize_proofs      JSON-RPC server
+//!                              (optional validator)    resolve / chain / events
+//! ```
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,7 +43,6 @@ use seer_sync::{parse_orchard, BlockHash, BlockHeight, TxId};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BranchId, Network, Parameters};
@@ -33,19 +52,34 @@ use zns_verify::{
 };
 
 // ── hardcoded configuration ───────────────────────────────────────────────────
+//
+// Production would load these from env/config; kept inline for the mono-file layout.
 
+/// Registry **incoming viewing key** (UIVK). Lets us trial-decrypt Orchard outputs
+/// addressed to the registry without spending authority. Visibility invariant.
 const UIVK: &str = "uivktest18a7ht78cymvm3sxdw9myrr04nrnj8nvrqdjhadj8dp3cv8pm2dqszuxnjrjyp6xyf0svtzjxnq3976l5sxzd09mmx9g6sj9xpp67ympwsrv6wen5ye25jhvq0l8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8jja5vlzday32pgq4cccqd2rjvtlsfnn9lne9cchrcfgn87jlx9";
 const NETWORK: Network = Network::TestNetwork;
+/// gRPC endpoint for compact blocks + raw tx fetch (via `seer-sync`).
 const LIGHTWALLETD: &str = "https://testnet.zec.rocks:443";
 const DB_PATH: &str = "zns-resolver.sqlite";
 const RPC_ADDR: &str = "127.0.0.1:8080";
+/// Optional `zcashd` JSON-RPC for block headers and tx merkle positions (derivability).
+/// Without this, `chain` / `resolve?with_proof` return proof-unavailable errors.
 const VALIDATOR_RPC: Option<&str> = None;
+/// First block height to scan when no checkpoint exists (registry launch height).
 const SCAN_BIRTHDAY: u32 = 1_687_104;
+/// Reorgs deeper than this trigger a full rescan instead of incremental rewind.
 const REORG_SHALLOW_MAX: u32 = 30;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+/// How long to sleep when caught up to chain tip.
 const TIP_POLL: Duration = Duration::from_secs(10);
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+// SQLite schema — four logical areas:
+//   scan_state     — checkpoint after commit (how far we've scanned)
+//   name_events    — append-only history of every verified lifecycle event
+//   names          — materialized current tip per name (fast resolve)
+//   proof_material — tx + header + merkle branch for optional client audit
 const SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -102,13 +136,10 @@ CREATE TABLE IF NOT EXISTS proof_material (
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Error)]
-enum DbError {
-    #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
-}
-
-/// Sync state: how far we've scanned, and the chain tip when that was recorded.
+/// **Checkpoint cursor** — persisted in `scan_state` after each successful batch.
+///
+/// - `height` / `hash`: last block fully processed (seam for reorg detection)
+/// - `chain_tip_height` / `chain_tip_hash`: tip at commit time
 #[derive(Clone, Copy)]
 struct Cursor {
     height: u32,
@@ -128,21 +159,36 @@ impl Cursor {
     }
 }
 
-struct RecoveredNote {
+/// A registry Orchard note we decrypted — carries the note (for binding
+/// verification) and memo (untrusted, parsed separately).
+struct DecryptedNote {
     note: orchard::Note,
+    /// On-chain note commitment (cmx) from the action; must match our recomputation.
     cmx: [u8; 32],
     memo: MemoBytes,
+    txid: [u8; 32],
+    height: u32,
+    /// Index of this Orchard action within the transaction's action list.
+    action_index: usize,
+    raw_tx: Vec<u8>,
+}
+
+/// A verified ZNS name note: Transition + Binding passed for one decrypted note.
+struct NameNote {
+    name: String,
+    ua: String,
+    action: Action,
+    prev_rcm: [u8; 32],
+    rcm: [u8; 32],
+    psi: [u8; 32],
+    cmx: [u8; 32],
     txid: [u8; 32],
     height: u32,
     action_index: usize,
     raw_tx: Vec<u8>,
 }
 
-struct Recorded {
-    txid: [u8; 32],
-    height: u32,
-}
-
+/// Current registration: a name's live tip (absent from `names` if released).
 #[derive(Debug, Clone)]
 struct Registration {
     name: String,
@@ -152,6 +198,7 @@ struct Registration {
     last_action: Action,
 }
 
+/// One verified lifecycle step in a name's per-name chain (from `name_events`).
 #[derive(Debug, Clone)]
 struct ChainRow {
     action: Action,
@@ -161,6 +208,7 @@ struct ChainRow {
     action_index: usize,
 }
 
+/// Event log entry for the `events` RPC (includes DB rowid).
 #[derive(Debug, Clone)]
 struct Event {
     id: i64,
@@ -171,43 +219,53 @@ struct Event {
     height: u32,
 }
 
+/// Everything a client needs to independently verify a binding on-chain (derivability).
 #[derive(Debug, Clone)]
 struct ProofMaterial {
     raw_tx: Vec<u8>,
     header: Vec<u8>,
+    /// Sibling hashes from leaf txid up to the block's tx merkle root.
     merkle_branch: Vec<[u8; 32]>,
     merkle_index: u32,
 }
 
+/// Thin SQLite wrapper — all writes go through `apply_batch` / `rewind`.
 struct Db {
     conn: Connection,
 }
 
+/// Compact-block scan hit: we trial-decrypted an action but don't have the memo yet.
 struct Candidate {
     txid: [u8; 32],
     action_index: usize,
 }
 
+/// HTTP client to a Zcash full node (`getblock` for header + tx ordering).
 struct ValidatorClient {
     client: HttpClient,
 }
 
+/// Per-block context needed to build merkle inclusion proofs.
 struct BlockContext {
     header: Vec<u8>,
+    /// Txids in block order (internal byte order, not display hex).
     txids: Vec<[u8; 32]>,
 }
 
 // ── database ──────────────────────────────────────────────────────────────────
+//
+// Write path: `apply_batch` runs Visibility→Transition→Binding in one transaction,
+// then updates the checkpoint. Read path: open read-only connections for RPC handlers.
 
 impl Db {
-    fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+    fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(SCHEMA_SQL)?;
         Ok(Self { conn })
     }
 
-    fn open_read_only(path: impl AsRef<Path>) -> Result<Self, DbError> {
+    fn open_read_only(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -218,7 +276,7 @@ impl Db {
         Ok(Self { conn })
     }
 
-    fn checkpoint(&self) -> Result<Option<Cursor>, DbError> {
+    fn checkpoint(&self) -> rusqlite::Result<Option<Cursor>> {
         self.conn
             .query_row(
                 "SELECT height, hash, chain_tip_height, chain_tip_hash FROM scan_state WHERE id = 0",
@@ -229,35 +287,51 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Process one scanned batch: for each decrypted note, run Transition + Binding,
+    /// append to `name_events`, update `names` tip, then checkpoint.
+    ///
+    /// Returns only name notes that were actually indexed (binding + transition passed).
     fn apply_batch(
         &self,
         scanned: Cursor,
         live_tip: Cursor,
-        notes: &[RecoveredNote],
-    ) -> Result<Vec<Recorded>, DbError> {
+        decrypted: &[DecryptedNote],
+    ) -> rusqlite::Result<Vec<NameNote>> {
         let tx = self.conn.unchecked_transaction()?;
-        let mut recorded = Vec::new();
+        let mut indexed = Vec::new();
 
-        for n in notes {
-            let Ok(ParsedMemo::Lifecycle { action, name, ua, prev_rcm: memo_prev }) =
-                memo::parse_memo(n.memo.as_slice())
+        for n in decrypted {
+            // ── Transition (step 1): parse memo narration ──
+            // Memo format is defined by ZNS; non-lifecycle memos are ignored.
+            let Ok(ParsedMemo::Lifecycle {
+                action,
+                name,
+                ua,
+                prev_rcm: memo_prev,
+            }) = memo::parse_memo(n.memo.as_slice())
             else {
                 continue;
             };
             let name = name.to_string();
             let ua = ua.to_string();
 
+            // Names that look like UAs are rejected to avoid namespace confusion.
             if shadows_ua_namespace(&name) {
                 continue;
             }
 
+            // ── Transition (step 2): legal move on our per-name chain ──
+            // claim requires no tip; update/release require tip.rcm as prev_rcm.
             let tip = self.name_tip_in_tx(&tx, &name)?;
             let Some(prev_rcm) = prev_rcm_for(tip.as_ref(), action) else {
                 continue;
             };
 
+            // ── Binding: recompute cmx; memo is not trusted for this ──
             let Some((psi, rcm)) = verify_binding(&n.note, n.cmx, action, &name, &ua, &prev_rcm)
             else {
+                // If memo claimed a different prev_rcm that *would* verify, someone
+                // may be building an alternate fork — log but don't index.
                 if let Some(claimed) = memo_prev.filter(|p| {
                     *p != prev_rcm
                         && verify_binding(&n.note, n.cmx, action, &name, &ua, p).is_some()
@@ -273,23 +347,38 @@ impl Db {
                 continue;
             };
 
+            let name_note = NameNote {
+                name: name.clone(),
+                ua: ua.clone(),
+                action,
+                prev_rcm,
+                rcm,
+                psi,
+                cmx: n.cmx,
+                txid: n.txid,
+                height: n.height,
+                action_index: n.action_index,
+                raw_tx: n.raw_tx.clone(),
+            };
+
             insert_event(
                 &tx,
-                &name,
-                &ua,
-                &prev_rcm,
-                &rcm,
-                &psi,
-                &n.cmx,
-                &n.txid,
-                n.height,
-                action,
-                n.action_index,
-                &n.raw_tx,
+                &name_note.name,
+                &name_note.ua,
+                &name_note.prev_rcm,
+                &name_note.rcm,
+                &name_note.psi,
+                &name_note.cmx,
+                &name_note.txid,
+                name_note.height,
+                name_note.action,
+                name_note.action_index,
+                &name_note.raw_tx,
             )?;
 
-            if action == Action::Release {
-                tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
+            // Release removes the name from the live index; event stays in history.
+            if name_note.action == Action::Release {
+                tx.execute("DELETE FROM names WHERE name = ?1", params![name_note.name])?;
             } else {
                 tx.execute(
                     "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index, raw_tx)
@@ -300,25 +389,22 @@ impl Db {
                        cmx = excluded.cmx, txid = excluded.txid, action_index = excluded.action_index,
                        raw_tx = excluded.raw_tx",
                     params![
-                        name,
-                        n.height as i64,
-                        action_str(action),
-                        ua,
-                        prev_rcm.as_slice(),
-                        rcm.as_slice(),
-                        psi.as_slice(),
-                        n.cmx.as_slice(),
-                        n.txid.as_slice(),
-                        n.action_index as i64,
-                        n.raw_tx,
+                        name_note.name,
+                        name_note.height as i64,
+                        action_str(name_note.action),
+                        name_note.ua,
+                        name_note.prev_rcm.as_slice(),
+                        name_note.rcm.as_slice(),
+                        name_note.psi.as_slice(),
+                        name_note.cmx.as_slice(),
+                        name_note.txid.as_slice(),
+                        name_note.action_index as i64,
+                        name_note.raw_tx,
                     ],
                 )?;
             }
 
-            recorded.push(Recorded {
-                txid: n.txid,
-                height: n.height,
-            });
+            indexed.push(name_note);
         }
 
         self.set_checkpoint_in_tx(
@@ -331,10 +417,13 @@ impl Db {
             },
         )?;
         tx.commit()?;
-        Ok(recorded)
+        Ok(indexed)
     }
 
-    fn rewind(&self, fork_height: u32, scanned_height: u32) -> Result<(), DbError> {
+    /// Handle a chain reorg: drop events above `fork_height`, rebuild `names` tips.
+    ///
+    /// Shallow reorgs rewind incrementally; deep ones wipe and rescan from birthday.
+    fn rewind(&self, fork_height: u32, scanned_height: u32) -> rusqlite::Result<()> {
         let depth = scanned_height.saturating_sub(fork_height);
         let tx = self.conn.unchecked_transaction()?;
 
@@ -344,8 +433,7 @@ impl Db {
             tx.execute("DELETE FROM proof_material", [])?;
             tx.execute("DELETE FROM scan_state", [])?;
         } else {
-            let mut stmt =
-                tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
+            let mut stmt = tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
             let affected: Vec<String> = stmt
                 .query_map(params![fork_height as i64], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
@@ -387,7 +475,7 @@ impl Db {
         header: &[u8],
         merkle_branch: &[[u8; 32]],
         merkle_index: u32,
-    ) -> Result<(), DbError> {
+    ) -> rusqlite::Result<()> {
         let branch: Vec<u8> = merkle_branch.iter().flatten().copied().collect();
         self.conn.execute(
             "INSERT OR IGNORE INTO proof_material
@@ -405,7 +493,7 @@ impl Db {
         Ok(())
     }
 
-    fn resolve_by_name(&self, name: &str) -> Result<Option<Registration>, DbError> {
+    fn resolve_by_name(&self, name: &str) -> rusqlite::Result<Option<Registration>> {
         self.conn
             .query_row(
                 "SELECT name, ua, txid, height, action FROM names WHERE name = ?1",
@@ -421,7 +509,7 @@ impl Db {
         ua: &str,
         limit: u32,
         offset: u32,
-    ) -> Result<Vec<Registration>, DbError> {
+    ) -> rusqlite::Result<Vec<Registration>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, ua, txid, height, action FROM names
              WHERE ua = ?1 ORDER BY name LIMIT ?2 OFFSET ?3",
@@ -432,7 +520,7 @@ impl Db {
         Ok(rows)
     }
 
-    fn list_registrations(&self, limit: u32, offset: u32) -> Result<Vec<Registration>, DbError> {
+    fn list_registrations(&self, limit: u32, offset: u32) -> rusqlite::Result<Vec<Registration>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, ua, txid, height, action FROM names ORDER BY name LIMIT ?1 OFFSET ?2",
         )?;
@@ -442,8 +530,10 @@ impl Db {
         Ok(rows)
     }
 
-    fn name_count(&self) -> Result<u64, DbError> {
-        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
+    fn name_count(&self) -> rusqlite::Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
         Ok(n as u64)
     }
 
@@ -454,7 +544,7 @@ impl Db {
         since_height: Option<u32>,
         limit: u32,
         offset: u32,
-    ) -> Result<(Vec<Event>, u64), DbError> {
+    ) -> rusqlite::Result<(Vec<Event>, u64)> {
         const WHERE: &str = "WHERE (?1 IS NULL OR name = ?1)
                              AND (?2 IS NULL OR action = ?2)
                              AND (?3 IS NULL OR height > ?3)";
@@ -493,7 +583,7 @@ impl Db {
         Ok((events, total as u64))
     }
 
-    fn chain_rows(&self, name: &str) -> Result<Vec<ChainRow>, DbError> {
+    fn chain_rows(&self, name: &str) -> rusqlite::Result<Vec<ChainRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT action, ua, height, txid, action_index FROM name_events
              WHERE name = ?1 ORDER BY height ASC, rowid ASC",
@@ -515,7 +605,7 @@ impl Db {
         Ok(rows)
     }
 
-    fn proof_material(&self, txid: &[u8; 32]) -> Result<Option<ProofMaterial>, DbError> {
+    fn proof_material(&self, txid: &[u8; 32]) -> rusqlite::Result<Option<ProofMaterial>> {
         self.conn
             .query_row(
                 "SELECT raw_tx, header, merkle_branch, merkle_index
@@ -542,7 +632,7 @@ impl Db {
         &self,
         tx: &rusqlite::Transaction<'_>,
         name: &str,
-    ) -> Result<Option<Tip>, DbError> {
+    ) -> rusqlite::Result<Option<Tip>> {
         tx.query_row(
             "SELECT action, rcm FROM names WHERE name = ?1",
             params![name],
@@ -563,7 +653,7 @@ impl Db {
         &self,
         tx: &rusqlite::Transaction<'_>,
         state: Cursor,
-    ) -> Result<(), DbError> {
+    ) -> rusqlite::Result<()> {
         tx.execute(
             "INSERT INTO scan_state (id, height, hash, chain_tip_height, chain_tip_hash)
              VALUES (0, ?1, ?2, ?3, ?4)
@@ -599,8 +689,22 @@ fn row_to_cursor(row: &Row<'_>) -> rusqlite::Result<Cursor> {
     })
 }
 
-fn rebuild_name_tip(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<(), DbError> {
-    let row: Option<(String, i64, String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>, i64)> = tx
+/// After deleting post-fork events, set `names` to the highest surviving event
+/// for this name (or delete the row if the tip was a release).
+fn rebuild_name_tip(tx: &rusqlite::Transaction<'_>, name: &str) -> rusqlite::Result<()> {
+    let row: Option<(
+        String,
+        i64,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        i64,
+    )> = tx
         .query_row(
             "SELECT name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, raw_tx, action_index
              FROM name_events WHERE name = ?1 ORDER BY height DESC, rowid DESC LIMIT 1",
@@ -673,7 +777,7 @@ fn insert_event(
     action: Action,
     action_index: usize,
     raw_tx: &[u8],
-) -> Result<(), DbError> {
+) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO name_events (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index, raw_tx)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -699,7 +803,9 @@ fn row_to_registration(r: &Row<'_>) -> rusqlite::Result<Registration> {
     Ok(Registration {
         name: r.get(0)?,
         ua: r.get(1)?,
-        txid: txid.try_into().map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?,
+        txid: txid
+            .try_into()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?,
         height: r.get::<_, i64>(3)? as u32,
         last_action: parse_action(&r.get::<_, String>(4)?)?,
     })
@@ -717,12 +823,21 @@ fn action_str(a: Action) -> &'static str {
     }
 }
 
+/// Reject names that could be mistaken for Zcash unified addresses.
 fn shadows_ua_namespace(name: &str) -> bool {
     name.starts_with("u1") || name.starts_with("utest1")
 }
 
 // ── binding verification ──────────────────────────────────────────────────────
+//
+// Core ZNS invariant: the name binding lives in (ψ, rcm) → cmx, not the memo.
+//
+//   ψ, rcm = zns_psi_rcm(action, name, ua, prev_rcm)   // domain-separated hash
+//   cmx    = Orchard note commitment with those extras
+//
+// We extract g_d, pk_d, ρ from the decrypted note and check cmx matches chain.
 
+/// Returns `(psi, rcm)` byte reprs if the note commitment matches on-chain cmx.
 fn verify_binding(
     note: &orchard::Note,
     on_chain_cmx: [u8; 32],
@@ -740,15 +855,22 @@ fn verify_binding(
     (cmx == expected).then(|| (psi.to_repr(), rcm.to_repr()))
 }
 
-// ── observe ───────────────────────────────────────────────────────────────────
+// ── observe (visibility invariant) ────────────────────────────────────────────
+//
+// Two-phase decrypt keeps compact-block scanning cheap:
+//   1. trial-decrypt on compact actions → Candidate list
+//   2. fetch full tx → decrypt again for memo bytes
 
+/// Parse UIVK/UFVK encoding into a prepared Orchard IVK for trial decryption.
 fn orchard_ivk(network: &impl Parameters, encoding: &str) -> Result<PreparedIncomingViewingKey> {
     use orchard::keys::Scope;
     use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedIncomingViewingKey};
 
     if let Ok(ufvk) = UnifiedFullViewingKey::decode(network, encoding) {
         if let Some(fvk) = ufvk.orchard() {
-            return Ok(PreparedIncomingViewingKey::new(&fvk.to_ivk(Scope::External)));
+            return Ok(PreparedIncomingViewingKey::new(
+                &fvk.to_ivk(Scope::External),
+            ));
         }
     }
     if let Ok(uivk) = UnifiedIncomingViewingKey::decode(network, encoding) {
@@ -759,6 +881,7 @@ fn orchard_ivk(network: &impl Parameters, encoding: &str) -> Result<PreparedInco
     anyhow::bail!("no Orchard incoming viewing key in the provided encoding")
 }
 
+/// Pass 1: walk compact blocks, trial-decrypt each Orchard action to the registry IVK.
 fn scan_candidates(blocks: &[CompactBlock], ivk: &PreparedIncomingViewingKey) -> Vec<Candidate> {
     let mut out = Vec::new();
     for block in blocks {
@@ -779,12 +902,14 @@ fn scan_candidates(blocks: &[CompactBlock], ivk: &PreparedIncomingViewingKey) ->
     out
 }
 
-async fn recover_notes(
+/// Pass 2: fetch full transactions and decrypt again for note + memo.
+async fn decrypt_notes(
     client: &mut LwdClient,
     network: &impl Parameters,
     ivk: &PreparedIncomingViewingKey,
     candidates: Vec<Candidate>,
-) -> Result<Vec<RecoveredNote>> {
+) -> Result<Vec<DecryptedNote>> {
+    // Deduplicate fetches when multiple candidates share a txid.
     type Fetched = Option<(Transaction, u32, Vec<u8>)>;
     let mut fetched: HashMap<[u8; 32], Fetched> = HashMap::new();
     let mut out = Vec::new();
@@ -797,10 +922,7 @@ async fn recover_notes(
             let height = raw.height as u32;
             let parsed = Transaction::read(
                 &raw.data[..],
-                BranchId::for_height(
-                    network,
-                    BlockHeight::from_u32(height),
-                ),
+                BranchId::for_height(network, BlockHeight::from_u32(height)),
             )
             .ok()
             .map(|tx| (tx, height, raw.data));
@@ -821,7 +943,7 @@ async fn recover_notes(
             continue;
         };
 
-        out.push(RecoveredNote {
+        out.push(DecryptedNote {
             note,
             cmx: action.cmx().to_bytes(),
             memo,
@@ -835,21 +957,27 @@ async fn recover_notes(
     Ok(out)
 }
 
+/// Visibility pipeline for one compact-block batch from lightwalletd.
 async fn observe_batch(
     client: &mut LwdClient,
     network: &impl Parameters,
     ivk: &PreparedIncomingViewingKey,
     blocks: &[CompactBlock],
-) -> Result<Vec<RecoveredNote>> {
+) -> Result<Vec<DecryptedNote>> {
     let candidates = scan_candidates(blocks, ivk);
-    recover_notes(client, network, ivk, candidates).await
+    decrypt_notes(client, network, ivk, candidates).await
 }
 
-// ── proof material ────────────────────────────────────────────────────────────
+// ── proof material (derivability invariant) ─────────────────────────────────────
+//
+// Clients can audit bindings without trusting this resolver: given raw tx, block
+// header, and merkle siblings they can re-derive inclusion and re-run binding checks.
 
 impl ValidatorClient {
     fn new(url: &str) -> Result<Self> {
-        let client = HttpClient::builder().build(url).context("validator RPC url")?;
+        let client = HttpClient::builder()
+            .build(url)
+            .context("validator RPC url")?;
         Ok(Self { client })
     }
 
@@ -868,8 +996,9 @@ impl ValidatorClient {
             .iter()
             .map(|v| {
                 let hex_str = v.as_str().ok_or_else(|| anyhow!("non-string txid"))?;
-                let mut bytes: [u8; 32] =
-                    hex::decode(hex_str)?.try_into().map_err(|_| anyhow!("txid length"))?;
+                let mut bytes: [u8; 32] = hex::decode(hex_str)?
+                    .try_into()
+                    .map_err(|_| anyhow!("txid length"))?;
                 bytes.reverse();
                 Ok(bytes)
             })
@@ -890,6 +1019,7 @@ impl ValidatorClient {
     }
 }
 
+/// Build a Bitcoin-style merkle inclusion path (double-SHA256 pairs).
 fn merkle_branch(txids: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
     assert!(index < txids.len(), "leaf index in range");
     let mut level: Vec<[u8; 32]> = txids.to_vec();
@@ -915,42 +1045,50 @@ fn merkle_branch(txids: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
 }
 
 fn sha256d(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let first = Sha256::new().chain_update(left).chain_update(right).finalize();
+    let first = Sha256::new()
+        .chain_update(left)
+        .chain_update(right)
+        .finalize();
     Sha256::digest(first).into()
 }
 
+/// For each newly indexed name note, fetch block context from validator and persist proofs.
 async fn materialize_proofs(
     db: &Db,
     validator: &ValidatorClient,
-    notes: &[RecoveredNote],
-    recorded: &[Recorded],
+    indexed: &[NameNote],
 ) -> Result<()> {
-    let mut heights: Vec<u32> = recorded.iter().map(|r| r.height).collect();
+    let mut heights: Vec<u32> = indexed.iter().map(|n| n.height).collect();
     heights.sort_unstable();
     heights.dedup();
 
     for height in heights {
         let ctx = validator.block_context(height).await?;
-        for r in recorded.iter().filter(|r| r.height == height) {
-            let Some(pos) = ctx.txids.iter().position(|t| *t == r.txid) else {
+        for n in indexed.iter().filter(|n| n.height == height) {
+            let Some(pos) = ctx.txids.iter().position(|t| *t == n.txid) else {
                 anyhow::bail!(
                     "validator block {height} does not contain tx {}",
-                    hex::encode(r.txid)
+                    hex::encode(n.txid)
                 );
             };
             let branch = merkle_branch(&ctx.txids, pos);
-            let raw_tx = notes
-                .iter()
-                .find(|n| n.txid == r.txid)
-                .map(|n| n.raw_tx.as_slice())
-                .expect("recorded action came from this batch");
-            db.insert_proof_material(&r.txid, height, raw_tx, &ctx.header, &branch, pos as u32)?;
+            db.insert_proof_material(
+                &n.txid,
+                height,
+                &n.raw_tx,
+                &ctx.header,
+                &branch,
+                pos as u32,
+            )?;
         }
     }
     Ok(())
 }
 
-// ── JSON-RPC ──────────────────────────────────────────────────────────────────
+// ── JSON-RPC (thin consumer API) ──────────────────────────────────────────────
+//
+// Handlers open a read-only DB handle per request. No crypto here — just serving
+// what the indexer already verified.
 
 #[derive(Debug, Clone, Serialize)]
 struct RegistrationEntry {
@@ -1021,8 +1159,12 @@ pub struct ChainResult {
     links: Vec<ProofLinkEntry>,
 }
 
+/// Public resolver API. `blocking` methods run on jsonrpsee's thread pool since
+/// SQLite is synchronous.
 #[rpc(server)]
 trait ZnsApi {
+    /// Lookup by name (exact), UA prefix (reverse lookup), or list all if query empty.
+    /// `with_proof=true` attaches merkle proof links for the current claim segment.
     #[method(name = "resolve", blocking)]
     fn resolve(
         &self,
@@ -1032,15 +1174,19 @@ trait ZnsApi {
         with_proof: Option<bool>,
     ) -> RpcResult<Value>;
 
+    /// Full per-name event chain with proof material for every link.
     #[method(name = "chain", blocking)]
     fn chain(&self, name: String) -> RpcResult<ChainResult>;
 
+    /// Sync progress: scanned height vs chain tip, registration count.
     #[method(name = "status", blocking)]
     fn status(&self) -> RpcResult<StatusResult>;
 
+    /// Placeholder for marketplace listings (not implemented in resolver).
     #[method(name = "listings", blocking)]
     fn listings(&self, limit: Option<u64>, offset: Option<u64>) -> RpcResult<ListingsResult>;
 
+    /// Paginated lifecycle event log with optional filters.
     #[method(name = "events", blocking)]
     fn events(
         &self,
@@ -1080,7 +1226,10 @@ impl ZnsApiServer for RpcContext {
             }
             value
         } else {
-            entries(db.registrations_by_ua(&query, limit, offset).map_err(rpc_err)?)
+            entries(
+                db.registrations_by_ua(&query, limit, offset)
+                    .map_err(rpc_err)?,
+            )
         };
         Ok(value)
     }
@@ -1160,21 +1309,29 @@ impl ZnsApiServer for RpcContext {
     }
 }
 
+/// Proof links cover the current ownership segment: from the latest claim forward.
+/// Earlier claim/update/release chains are historical only.
 fn current_segment(rows: &[ChainRow]) -> &[ChainRow] {
-    let start = rows.iter().rposition(|r| r.action == Action::Claim).unwrap_or(0);
+    let start = rows
+        .iter()
+        .rposition(|r| r.action == Action::Claim)
+        .unwrap_or(0);
     &rows[start..]
 }
 
 fn proof_links(db: &Db, rows: &[ChainRow]) -> RpcResult<Vec<ProofLinkEntry>> {
     rows.iter()
         .map(|r| {
-            let m = db.proof_material(&r.txid).map_err(rpc_err)?.ok_or_else(|| {
-                ErrorObjectOwned::owned(
-                    -32011,
-                    "proof material unavailable (no validator RPC configured)",
-                    None::<()>,
-                )
-            })?;
+            let m = db
+                .proof_material(&r.txid)
+                .map_err(rpc_err)?
+                .ok_or_else(|| {
+                    ErrorObjectOwned::owned(
+                        -32011,
+                        "proof material unavailable (no validator RPC configured)",
+                        None::<()>,
+                    )
+                })?;
             Ok(ProofLinkEntry {
                 action: String::from_utf8(r.action.as_bytes().to_vec()).expect("ascii"),
                 ua: r.ua.clone(),
@@ -1256,12 +1413,30 @@ async fn serve_rpc(addr: &str, ctx: RpcContext) -> Result<()> {
     Ok(())
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
+// ── main: sync loop ───────────────────────────────────────────────────────────
+//
+// ```text
+//   connect lightwalletd
+//        │
+//        ▼
+//   stream compact blocks from checkpoint+1 ──► observe_batch
+//        │                                          │
+//        │                                          ▼
+//        │                                    apply_batch + checkpoint
+//        │                                          │
+//        │                                          ▼
+//        └──────────────────────────── materialize_proofs (if validator set)
+//
+//   On reorg: rewind with exponential backoff (rewind_by *= 2)
+//   On catch-up: sleep TIP_POLL
+// ```
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("zns_resolver=info".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("zns_resolver=info".parse().unwrap()),
+        )
         .init();
 
     let ivk = match orchard_ivk(&NETWORK, UIVK) {
@@ -1281,6 +1456,7 @@ async fn main() {
         }
     };
 
+    // RPC server runs concurrently; sync loop owns the writable DB connection.
     let rpc_ctx = RpcContext {
         db: PathBuf::from(DB_PATH),
         uivk: UIVK.to_string(),
@@ -1292,6 +1468,7 @@ async fn main() {
         }
     });
 
+    // Reorg rewind depth doubles on each consecutive reorg (1, 2, 4, … blocks).
     let mut rewind_by = 1u32;
 
     loop {
@@ -1334,6 +1511,7 @@ async fn main() {
         };
         let live_tip = Cursor::at(tip_height, tip_hash);
 
+        // Resume from checkpoint+1; `seam` hash lets seer-sync detect reorgs at the boundary.
         let (start, seam) = match checkpoint {
             Some(c) => (c.height.saturating_add(1), c.hash.map(BlockHash)),
             None => (SCAN_BIRTHDAY, None),
@@ -1346,6 +1524,7 @@ async fn main() {
 
         let mut stream = chain::blocks(client, start, tip_height, DEFAULT_CHUNK_OUTPUTS, seam);
 
+        // Inner loop: process block batches until stream ends or an error breaks out.
         loop {
             match stream.next().await {
                 None => break,
@@ -1353,17 +1532,14 @@ async fn main() {
                     let Some(last) = batch.last() else {
                         continue;
                     };
-                    let scanned = Cursor::at(
-                        last.height as u32,
-                        last.hash[..].try_into().ok(),
-                    );
+                    let scanned = Cursor::at(last.height as u32, last.hash[..].try_into().ok());
 
                     match observe_batch(&mut fetch_client, &NETWORK, &ivk, &batch).await {
-                        Ok(notes) => match db.apply_batch(scanned, live_tip, &notes) {
-                            Ok(recorded) => {
+                        Ok(decrypted) => match db.apply_batch(scanned, live_tip, &decrypted) {
+                            Ok(indexed) => {
                                 if let Some(ref validator) = validator {
                                     if let Err(e) =
-                                        materialize_proofs(&db, validator, &notes, &recorded).await
+                                        materialize_proofs(&db, validator, &indexed).await
                                     {
                                         eprintln!("proofs: {e}");
                                     }
@@ -1372,8 +1548,8 @@ async fn main() {
                                 tracing::info!(
                                     height = scanned.height,
                                     tip = live_tip.height,
-                                    notes = notes.len(),
-                                    applied = recorded.len(),
+                                    decrypted = decrypted.len(),
+                                    indexed = indexed.len(),
                                     "batch applied"
                                 );
                             }
@@ -1388,9 +1564,15 @@ async fn main() {
                         }
                     }
                 }
+                // Chain hash mismatch at seam → rewind and retry outer loop.
                 Some(Err(ChainError::Reorg(at))) => {
                     let rewind_to = at.saturating_sub(rewind_by);
-                    let scanned = db.checkpoint().ok().flatten().map(|c| c.height).unwrap_or(0);
+                    let scanned = db
+                        .checkpoint()
+                        .ok()
+                        .flatten()
+                        .map(|c| c.height)
+                        .unwrap_or(0);
                     eprintln!("reorg at {at}, rewind to {rewind_to}");
                     if let Err(e) = db.rewind(rewind_to, scanned) {
                         eprintln!("rewind: {e}");

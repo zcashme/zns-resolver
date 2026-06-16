@@ -1,3 +1,6 @@
+# ZNS resolver — mono-file binary. Watches the registry inbox on Zcash,
+# verifies Orchard note bindings, indexes name→UA, serves JSON-RPC.
+# Local path deps: seer-sync (chain I/O), zns-verify (crypto + memos), zns-orchard.
 [package]
 name = "zns-resolver"
 description = "ZNS resolver: verifies name bindings and maintains a name → UA index."
@@ -28,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 hex = "0.4"
-thiserror = "1"
+
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
