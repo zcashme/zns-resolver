@@ -258,14 +258,14 @@ struct BlockContext {
 // then updates the checkpoint. Read path: open read-only connections for RPC handlers.
 
 impl Db {
-    fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+    fn open_for_indexer(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(SCHEMA_SQL)?;
         Ok(Self { conn })
     }
 
-    fn open_read_only(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+    fn open_for_rpc(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -1211,7 +1211,7 @@ impl ZnsApiServer for RpcContext {
         offset: Option<u64>,
         with_proof: Option<bool>,
     ) -> RpcResult<Value> {
-        let db = open_read(&self.db)?;
+        let db = open_for_rpc(&self.db)?;
         let limit = limit.unwrap_or(50).min(500) as u32;
         let offset = offset.unwrap_or(0) as u32;
 
@@ -1235,14 +1235,14 @@ impl ZnsApiServer for RpcContext {
     }
 
     fn chain(&self, name: String) -> RpcResult<ChainResult> {
-        let db = open_read(&self.db)?;
+        let db = open_for_rpc(&self.db)?;
         let rows = db.chain_rows(&name).map_err(rpc_err)?;
         let links = proof_links(&db, &rows)?;
         Ok(ChainResult { name, links })
     }
 
     fn status(&self) -> RpcResult<StatusResult> {
-        let db = open_read(&self.db)?;
+        let db = open_for_rpc(&self.db)?;
         let cp = db.checkpoint().map_err(rpc_err)?;
         let synced_height = cp.map(|c| c.height).unwrap_or(0) as u64;
         let (chain_tip_height, synced, blocks_behind) =
@@ -1294,7 +1294,7 @@ impl ZnsApiServer for RpcContext {
             Some(some) => some,
             None => None,
         };
-        let db = open_read(&self.db)?;
+        let db = open_for_rpc(&self.db)?;
         let limit = limit.unwrap_or(50).min(500) as u32;
         let offset = offset.unwrap_or(0) as u32;
         let since = since_height.map(|h| h.min(u32::MAX as u64) as u32);
@@ -1396,8 +1396,8 @@ fn parse_action_filter(s: &str) -> Option<Action> {
     }
 }
 
-fn open_read(db: &Path) -> RpcResult<Db> {
-    Db::open_read_only(db).map_err(rpc_err)
+fn open_for_rpc(db: &Path) -> RpcResult<Db> {
+    Db::open_for_rpc(db).map_err(rpc_err)
 }
 
 fn rpc_err(e: impl std::fmt::Display) -> ErrorObjectOwned {
@@ -1472,7 +1472,7 @@ async fn main() {
     let mut rewind_by = 1u32;
 
     loop {
-        let db = match Db::open(DB_PATH) {
+        let db = match Db::open_for_indexer(DB_PATH) {
             Ok(db) => db,
             Err(e) => {
                 eprintln!("database: {e}");
