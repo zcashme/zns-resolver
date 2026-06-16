@@ -52,9 +52,11 @@ PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS scan_state (
-    id     INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
-    height INTEGER NOT NULL,
-    hash   BLOB
+    id               INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+    height           INTEGER NOT NULL,
+    hash             BLOB,
+    chain_tip_height INTEGER,
+    chain_tip_hash   BLOB
 );
 
 CREATE TABLE IF NOT EXISTS name_events (
@@ -106,10 +108,24 @@ enum DbError {
     Sqlite(#[from] rusqlite::Error),
 }
 
+/// Sync state: how far we've scanned, and the chain tip when that was recorded.
 #[derive(Clone, Copy)]
 struct Cursor {
     height: u32,
     hash: Option<[u8; 32]>,
+    chain_tip_height: Option<u32>,
+    chain_tip_hash: Option<[u8; 32]>,
+}
+
+impl Cursor {
+    fn at(height: u32, hash: Option<[u8; 32]>) -> Self {
+        Self {
+            height,
+            hash,
+            chain_tip_height: None,
+            chain_tip_hash: None,
+        }
+    }
 }
 
 struct RecoveredNote {
@@ -205,21 +221,20 @@ impl Db {
     fn checkpoint(&self) -> Result<Option<Cursor>, DbError> {
         self.conn
             .query_row(
-                "SELECT height, hash FROM scan_state WHERE id = 0",
+                "SELECT height, hash, chain_tip_height, chain_tip_hash FROM scan_state WHERE id = 0",
                 [],
-                |row| {
-                    let height: u32 = row.get(0)?;
-                    let hash: Option<[u8; 32]> = row
-                        .get::<_, Option<Vec<u8>>>(1)?
-                        .and_then(|v| v.try_into().ok());
-                    Ok(Cursor { height, hash })
-                },
+                row_to_cursor,
             )
             .optional()
             .map_err(Into::into)
     }
 
-    fn apply_batch(&self, at: Cursor, notes: &[RecoveredNote]) -> Result<Vec<Recorded>, DbError> {
+    fn apply_batch(
+        &self,
+        scanned: Cursor,
+        live_tip: Cursor,
+        notes: &[RecoveredNote],
+    ) -> Result<Vec<Recorded>, DbError> {
         let tx = self.conn.unchecked_transaction()?;
         let mut recorded = Vec::new();
 
@@ -306,7 +321,15 @@ impl Db {
             });
         }
 
-        self.set_checkpoint_in_tx(&tx, at)?;
+        self.set_checkpoint_in_tx(
+            &tx,
+            Cursor {
+                height: scanned.height,
+                hash: scanned.hash,
+                chain_tip_height: Some(live_tip.height),
+                chain_tip_hash: live_tip.hash,
+            },
+        )?;
         tx.commit()?;
         Ok(recorded)
     }
@@ -346,6 +369,8 @@ impl Db {
                 Cursor {
                     height: fork_height,
                     hash: None,
+                    chain_tip_height: None,
+                    chain_tip_hash: None,
                 },
             )?;
         }
@@ -415,10 +440,6 @@ impl Db {
             .query_map(params![limit, offset], row_to_registration)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
-    }
-
-    fn last_scanned_height(&self) -> Result<Option<u32>, DbError> {
-        Ok(self.checkpoint()?.map(|c| c.height))
     }
 
     fn name_count(&self) -> Result<u64, DbError> {
@@ -541,15 +562,41 @@ impl Db {
     fn set_checkpoint_in_tx(
         &self,
         tx: &rusqlite::Transaction<'_>,
-        cursor: Cursor,
+        state: Cursor,
     ) -> Result<(), DbError> {
         tx.execute(
-            "INSERT INTO scan_state (id, height, hash) VALUES (0, ?1, ?2)
-             ON CONFLICT (id) DO UPDATE SET height = ?1, hash = ?2",
-            params![cursor.height, cursor.hash],
+            "INSERT INTO scan_state (id, height, hash, chain_tip_height, chain_tip_hash)
+             VALUES (0, ?1, ?2, ?3, ?4)
+             ON CONFLICT (id) DO UPDATE SET
+               height = ?1, hash = ?2, chain_tip_height = ?3, chain_tip_hash = ?4",
+            params![
+                state.height,
+                state.hash,
+                state.chain_tip_height.map(|h| h as i64),
+                state.chain_tip_hash,
+            ],
         )?;
         Ok(())
     }
+}
+
+fn row_to_cursor(row: &Row<'_>) -> rusqlite::Result<Cursor> {
+    let height: u32 = row.get(0)?;
+    let hash: Option<[u8; 32]> = row
+        .get::<_, Option<Vec<u8>>>(1)?
+        .and_then(|v| v.try_into().ok());
+    let chain_tip_height: Option<u32> = row
+        .get::<_, Option<i64>>(2)?
+        .and_then(|h| u32::try_from(h).ok());
+    let chain_tip_hash: Option<[u8; 32]> = row
+        .get::<_, Option<Vec<u8>>>(3)?
+        .and_then(|v| v.try_into().ok());
+    Ok(Cursor {
+        height,
+        hash,
+        chain_tip_height,
+        chain_tip_hash,
+    })
 }
 
 fn rebuild_name_tip(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<(), DbError> {
@@ -920,6 +967,9 @@ struct RegistrationEntry {
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusResult {
     synced_height: u64,
+    chain_tip_height: u64,
+    synced: bool,
+    blocks_behind: u64,
     uivk: String,
     registered: u64,
     admin_pubkey: String,
@@ -1044,8 +1094,25 @@ impl ZnsApiServer for RpcContext {
 
     fn status(&self) -> RpcResult<StatusResult> {
         let db = open_read(&self.db)?;
+        let cp = db.checkpoint().map_err(rpc_err)?;
+        let synced_height = cp.map(|c| c.height).unwrap_or(0) as u64;
+        let (chain_tip_height, synced, blocks_behind) =
+            match cp.and_then(|c| c.chain_tip_height.map(|tip| (c.height, tip))) {
+                Some((scanned, tip)) => {
+                    let synced = scanned >= tip;
+                    (
+                        tip as u64,
+                        synced,
+                        if synced { 0 } else { (tip - scanned) as u64 },
+                    )
+                }
+                None => (0, false, 0),
+            };
         Ok(StatusResult {
-            synced_height: db.last_scanned_height().map_err(rpc_err)?.unwrap_or(0) as u64,
+            synced_height,
+            chain_tip_height,
+            synced,
+            blocks_behind,
             uivk: self.uivk.clone(),
             registered: db.name_count().map_err(rpc_err)?,
             admin_pubkey: String::new(),
@@ -1257,26 +1324,27 @@ async fn main() {
 
         let mut fetch_client = client.clone();
 
-        let tip = match chain::tip_height(&mut client).await {
-            Ok(h) => h,
+        let (tip_height, tip_hash) = match chain::tip(&mut client).await {
+            Ok(t) => t,
             Err(e) => {
                 eprintln!("tip: {e}");
                 tokio::time::sleep(RETRY_DELAY).await;
                 continue;
             }
         };
+        let live_tip = Cursor::at(tip_height, tip_hash);
 
         let (start, seam) = match checkpoint {
             Some(c) => (c.height.saturating_add(1), c.hash.map(BlockHash)),
             None => (SCAN_BIRTHDAY, None),
         };
 
-        if start > tip {
+        if start > tip_height {
             tokio::time::sleep(TIP_POLL).await;
             continue;
         }
 
-        let mut stream = chain::blocks(client, start, tip, DEFAULT_CHUNK_OUTPUTS, seam);
+        let mut stream = chain::blocks(client, start, tip_height, DEFAULT_CHUNK_OUTPUTS, seam);
 
         loop {
             match stream.next().await {
@@ -1285,13 +1353,13 @@ async fn main() {
                     let Some(last) = batch.last() else {
                         continue;
                     };
-                    let cursor = Cursor {
-                        height: last.height as u32,
-                        hash: last.hash[..].try_into().ok(),
-                    };
+                    let scanned = Cursor::at(
+                        last.height as u32,
+                        last.hash[..].try_into().ok(),
+                    );
 
                     match observe_batch(&mut fetch_client, &NETWORK, &ivk, &batch).await {
-                        Ok(notes) => match db.apply_batch(cursor, &notes) {
+                        Ok(notes) => match db.apply_batch(scanned, live_tip, &notes) {
                             Ok(recorded) => {
                                 if let Some(ref validator) = validator {
                                     if let Err(e) =
@@ -1302,7 +1370,8 @@ async fn main() {
                                 }
                                 rewind_by = 1;
                                 tracing::info!(
-                                    height = cursor.height,
+                                    height = scanned.height,
+                                    tip = live_tip.height,
                                     notes = notes.len(),
                                     applied = recorded.len(),
                                     "batch applied"
