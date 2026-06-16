@@ -43,6 +43,7 @@ use seer_sync::{parse_orchard, BlockHash, BlockHeight, TxId};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BranchId, Network, Parameters};
@@ -71,8 +72,8 @@ const SCAN_BIRTHDAY: u32 = 1_687_104;
 /// Reorgs deeper than this trigger a full rescan instead of incremental rewind.
 const REORG_SHALLOW_MAX: u32 = 30;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-/// How long to sleep when caught up to chain tip.
-const TIP_POLL: Duration = Duration::from_secs(10);
+/// How often the tip watcher polls `GetLatestBlock` while idle at chain tip.
+const TIP_WATCH_INTERVAL: Duration = Duration::from_secs(10);
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 // SQLite schema — four logical areas:
@@ -136,11 +137,11 @@ CREATE TABLE IF NOT EXISTS proof_material (
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
-/// **Checkpoint cursor** — persisted in `scan_state` after each successful batch.
+/// Persisted `scan_state` row: how far we've scanned and the chain tip at last commit.
 ///
-/// - `height` / `hash`: last block fully processed (seam for reorg detection)
-/// - `chain_tip_height` / `chain_tip_hash`: tip at commit time
-#[derive(Clone, Copy)]
+/// For a live tip from the watcher, only `height` / `hash` are set (`chain_tip_*` are `None`).
+/// After `apply_batch`, all four fields are written to SQLite.
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Cursor {
     height: u32,
     hash: Option<[u8; 32]>,
@@ -149,12 +150,23 @@ struct Cursor {
 }
 
 impl Cursor {
+    /// Scan seam or live chain tip (`GetLatestBlock`).
     fn at(height: u32, hash: Option<[u8; 32]>) -> Self {
         Self {
             height,
             hash,
             chain_tip_height: None,
             chain_tip_hash: None,
+        }
+    }
+
+    /// Checkpoint to persist after a batch: scanned position + tip snapshot.
+    fn checkpoint(scanned: Self, live_tip: Self) -> Self {
+        Self {
+            height: scanned.height,
+            hash: scanned.hash,
+            chain_tip_height: Some(live_tip.height),
+            chain_tip_hash: live_tip.hash,
         }
     }
 }
@@ -232,12 +244,6 @@ struct ProofMaterial {
 /// Thin SQLite wrapper — all writes go through `apply_batch` / `rewind`.
 struct Db {
     conn: Connection,
-}
-
-/// Compact-block scan hit: we trial-decrypted an action but don't have the memo yet.
-struct Candidate {
-    txid: [u8; 32],
-    action_index: usize,
 }
 
 /// HTTP client to a Zcash full node (`getblock` for header + tx ordering).
@@ -407,15 +413,7 @@ impl Db {
             indexed.push(name_note);
         }
 
-        self.set_checkpoint_in_tx(
-            &tx,
-            Cursor {
-                height: scanned.height,
-                hash: scanned.hash,
-                chain_tip_height: Some(live_tip.height),
-                chain_tip_hash: live_tip.hash,
-            },
-        )?;
+        self.set_checkpoint_in_tx(&tx, Cursor::checkpoint(scanned, live_tip))?;
         tx.commit()?;
         Ok(indexed)
     }
@@ -857,9 +855,7 @@ fn verify_binding(
 
 // ── observe (visibility invariant) ────────────────────────────────────────────
 //
-// Two-phase decrypt keeps compact-block scanning cheap:
-//   1. trial-decrypt on compact actions → Candidate list
-//   2. fetch full tx → decrypt again for memo bytes
+// Compact blocks support trial-decrypt only; memos need the full transaction.
 
 /// Parse UIVK/UFVK encoding into a prepared Orchard IVK for trial decryption.
 fn orchard_ivk(network: &impl Parameters, encoding: &str) -> Result<PreparedIncomingViewingKey> {
@@ -881,9 +877,17 @@ fn orchard_ivk(network: &impl Parameters, encoding: &str) -> Result<PreparedInco
     anyhow::bail!("no Orchard incoming viewing key in the provided encoding")
 }
 
-/// Pass 1: walk compact blocks, trial-decrypt each Orchard action to the registry IVK.
-fn scan_candidates(blocks: &[CompactBlock], ivk: &PreparedIncomingViewingKey) -> Vec<Candidate> {
+/// Visibility pipeline for one compact-block batch from lightwalletd.
+async fn observe_batch(
+    client: &mut LwdClient,
+    network: &impl Parameters,
+    ivk: &PreparedIncomingViewingKey,
+    blocks: &[CompactBlock],
+) -> Result<Vec<DecryptedNote>> {
+    type Fetched = Option<(Transaction, u32, Vec<u8>)>;
+    let mut fetched: HashMap<[u8; 32], Fetched> = HashMap::new();
     let mut out = Vec::new();
+
     for block in blocks {
         for tx in &block.vtx {
             let Ok(txid) = tx.txid[..].try_into() else {
@@ -893,79 +897,55 @@ fn scan_candidates(blocks: &[CompactBlock], ivk: &PreparedIncomingViewingKey) ->
                 let Some(action) = parse_orchard(act) else {
                     continue;
                 };
-                if zns_verify::decrypt::try_compact_orchard(ivk, &action).is_some() {
-                    out.push(Candidate { txid, action_index });
+                if zns_verify::decrypt::try_compact_orchard(ivk, &action).is_none() {
+                    continue;
                 }
+
+                if let std::collections::hash_map::Entry::Vacant(e) = fetched.entry(txid) {
+                    let raw = chain::fetch_raw_transaction(client, &TxId::from_bytes(txid))
+                        .await
+                        .with_context(|| format!("fetch tx {}", hex::encode(txid)))?;
+                    let height = raw.height as u32;
+                    let parsed = Transaction::read(
+                        &raw.data[..],
+                        BranchId::for_height(network, BlockHeight::from_u32(height)),
+                    )
+                    .ok()
+                    .map(|tx| (tx, height, raw.data));
+                    e.insert(parsed);
+                }
+
+                let Some((parsed_tx, height, raw)) =
+                    fetched.get(&txid).and_then(|o| o.as_ref())
+                else {
+                    continue;
+                };
+                let Some(bundle) = parsed_tx.orchard_bundle() else {
+                    continue;
+                };
+                let Some(action) = bundle.actions().get(action_index) else {
+                    continue;
+                };
+                let Some((note, _recipient, memo)) =
+                    zns_verify::decrypt::try_decrypt_orchard(action, ivk)
+                else {
+                    continue;
+                };
+
+                out.push(DecryptedNote {
+                    note,
+                    cmx: action.cmx().to_bytes(),
+                    memo,
+                    txid,
+                    height: *height,
+                    action_index,
+                    raw_tx: raw.clone(),
+                });
             }
         }
     }
-    out
-}
-
-/// Pass 2: fetch full transactions and decrypt again for note + memo.
-async fn decrypt_notes(
-    client: &mut LwdClient,
-    network: &impl Parameters,
-    ivk: &PreparedIncomingViewingKey,
-    candidates: Vec<Candidate>,
-) -> Result<Vec<DecryptedNote>> {
-    // Deduplicate fetches when multiple candidates share a txid.
-    type Fetched = Option<(Transaction, u32, Vec<u8>)>;
-    let mut fetched: HashMap<[u8; 32], Fetched> = HashMap::new();
-    let mut out = Vec::new();
-
-    for c in candidates {
-        if let std::collections::hash_map::Entry::Vacant(e) = fetched.entry(c.txid) {
-            let raw = chain::fetch_raw_transaction(client, &TxId::from_bytes(c.txid))
-                .await
-                .with_context(|| format!("fetch tx {}", hex::encode(c.txid)))?;
-            let height = raw.height as u32;
-            let parsed = Transaction::read(
-                &raw.data[..],
-                BranchId::for_height(network, BlockHeight::from_u32(height)),
-            )
-            .ok()
-            .map(|tx| (tx, height, raw.data));
-            e.insert(parsed);
-        }
-
-        let Some((tx, height, raw)) = fetched.get(&c.txid).and_then(|o| o.as_ref()) else {
-            continue;
-        };
-        let Some(bundle) = tx.orchard_bundle() else {
-            continue;
-        };
-        let Some(action) = bundle.actions().get(c.action_index) else {
-            continue;
-        };
-        let Some((note, _recipient, memo)) = zns_verify::decrypt::try_decrypt_orchard(action, ivk)
-        else {
-            continue;
-        };
-
-        out.push(DecryptedNote {
-            note,
-            cmx: action.cmx().to_bytes(),
-            memo,
-            txid: c.txid,
-            height: *height,
-            action_index: c.action_index,
-            raw_tx: raw.clone(),
-        });
-    }
 
     Ok(out)
-}
-
-/// Visibility pipeline for one compact-block batch from lightwalletd.
-async fn observe_batch(
-    client: &mut LwdClient,
-    network: &impl Parameters,
-    ivk: &PreparedIncomingViewingKey,
-    blocks: &[CompactBlock],
-) -> Result<Vec<DecryptedNote>> {
-    let candidates = scan_candidates(blocks, ivk);
-    decrypt_notes(client, network, ivk, candidates).await
 }
 
 // ── proof material (derivability invariant) ─────────────────────────────────────
@@ -1413,10 +1393,30 @@ async fn serve_rpc(addr: &str, ctx: RpcContext) -> Result<()> {
     Ok(())
 }
 
+// ── tip watcher ───────────────────────────────────────────────────────────────
+
+/// Polls lightwalletd for the chain tip and notifies the sync worker when it moves.
+async fn run_tip_watcher(url: &'static str, interval: Duration, tx: watch::Sender<Cursor>) {
+    loop {
+        match chain::connect(url).await {
+            Ok(mut client) => match chain::tip(&mut client).await {
+                Ok((height, hash)) => {
+                    let _ = tx.send(Cursor::at(height, hash));
+                }
+                Err(e) => eprintln!("tip watcher: {e}"),
+            },
+            Err(e) => eprintln!("tip watcher connect: {e}"),
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 // ── main: sync loop ───────────────────────────────────────────────────────────
 //
 // ```text
-//   connect lightwalletd
+//   tip watcher (GetLatestBlock) ──notify──► sync worker
+//                                                  │
+//   connect lightwalletd ◄─────────────────────────┘
 //        │
 //        ▼
 //   stream compact blocks from checkpoint+1 ──► observe_batch
@@ -1428,7 +1428,7 @@ async fn serve_rpc(addr: &str, ctx: RpcContext) -> Result<()> {
 //        └──────────────────────────── materialize_proofs (if validator set)
 //
 //   On reorg: rewind with exponential backoff (rewind_by *= 2)
-//   On catch-up: sleep TIP_POLL
+//   When caught up: sync worker waits on tip watcher (no poll sleep in sync loop)
 // ```
 
 #[tokio::main]
@@ -1468,6 +1468,13 @@ async fn main() {
         }
     });
 
+    let (tip_tx, mut tip_rx) = watch::channel(Cursor::at(0, None));
+    tokio::spawn(run_tip_watcher(
+        LIGHTWALLETD,
+        TIP_WATCH_INTERVAL,
+        tip_tx,
+    ));
+
     // Reorg rewind depth doubles on each consecutive reorg (1, 2, 4, … blocks).
     let mut rewind_by = 1u32;
 
@@ -1490,7 +1497,7 @@ async fn main() {
             }
         };
 
-        let mut client = match chain::connect(LIGHTWALLETD).await {
+        let client = match chain::connect(LIGHTWALLETD).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("lightwalletd: {e}");
@@ -1501,15 +1508,7 @@ async fn main() {
 
         let mut fetch_client = client.clone();
 
-        let (tip_height, tip_hash) = match chain::tip(&mut client).await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("tip: {e}");
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
-        };
-        let live_tip = Cursor::at(tip_height, tip_hash);
+        let live_tip = *tip_rx.borrow_and_update();
 
         // Resume from checkpoint+1; `seam` hash lets seer-sync detect reorgs at the boundary.
         let (start, seam) = match checkpoint {
@@ -1517,12 +1516,21 @@ async fn main() {
             None => (SCAN_BIRTHDAY, None),
         };
 
-        if start > tip_height {
-            tokio::time::sleep(TIP_POLL).await;
+        if live_tip.height == 0 || start > live_tip.height {
+            if tip_rx.changed().await.is_err() {
+                eprintln!("tip watcher stopped");
+                break;
+            }
             continue;
         }
 
-        let mut stream = chain::blocks(client, start, tip_height, DEFAULT_CHUNK_OUTPUTS, seam);
+        let mut stream = chain::blocks(
+            client,
+            start,
+            live_tip.height,
+            DEFAULT_CHUNK_OUTPUTS,
+            seam,
+        );
 
         // Inner loop: process block batches until stream ends or an error breaks out.
         loop {
@@ -1532,7 +1540,8 @@ async fn main() {
                     let Some(last) = batch.last() else {
                         continue;
                     };
-                    let scanned = Cursor::at(last.height as u32, last.hash[..].try_into().ok());
+                    let scanned =
+                        Cursor::at(last.height as u32, last.hash[..].try_into().ok());
 
                     match observe_batch(&mut fetch_client, &NETWORK, &ivk, &batch).await {
                         Ok(decrypted) => match db.apply_batch(scanned, live_tip, &decrypted) {
