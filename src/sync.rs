@@ -249,7 +249,7 @@ pub(crate) async fn run_sync_loop(
                     let scanned = (last.height as u32, last.hash[..].try_into().ok());
 
                     match observe_batch(&mut fetch_client, &network, &ivk, &batch).await {
-                        Ok(decrypted) => match db.apply_batch(scanned, live, &decrypted) {
+                        Ok(decrypted) => match db.apply_batch(&network, scanned, live, &decrypted) {
                             Ok(indexed) => {
                                 if let Some(ref zebrad) = zebrad {
                                     if let Err(e) =

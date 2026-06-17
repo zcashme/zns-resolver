@@ -1,11 +1,12 @@
-//! ZNS name index in SQLite (`scan_state`, `name_events`, `names`, `proof_material`).
+//! ZNS name index in SQLite (`registry_account`, `scan_state`, `name_events`, `names`, `proof_material`).
 
 use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
+use zcash_protocol::consensus::Parameters;
 use zns_verify::{
-    chain::prev_rcm_for, memo, Action, ParsedMemo, Tip,
+    chain::prev_rcm_for, parse_memo_validated, Action, ParsedMemo, Tip,
 };
 
 use crate::orchard::{verify_binding, DecryptedNote};
@@ -13,15 +14,21 @@ use crate::orchard::{verify_binding, DecryptedNote};
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const REORG_SHALLOW_MAX: u32 = 30;
 
-// SQLite schema — four logical areas:
-//   scan_state     — checkpoint after commit (how far we've scanned)
-//   name_events    — append-only history of every verified lifecycle event
-//   names          — materialized current tip per name (fast resolve)
-//   proof_material — tx + header + merkle branch for optional client audit
+// SQLite schema:
+//   registry_account — singleton: registry inbox UIVK (set once at create, not scan state)
+//   scan_state       — checkpoint after commit (how far we've scanned)
+//   name_events      — append-only history of every verified lifecycle event
+//   names            — materialized current tip per name (fast resolve)
+//   proof_material   — tx + header + merkle branch for optional client audit
 const SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS registry_account (
+    id   INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+    uivk TEXT    NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS scan_state (
     id               INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
@@ -156,7 +163,42 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(SCHEMA_SQL)?;
+        // One-time: older DBs briefly stored uivk on scan_state.
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO registry_account (id, uivk)
+             SELECT 0, uivk FROM scan_state WHERE id = 0 AND uivk IS NOT NULL",
+            [],
+        );
         Ok(Self { conn })
+    }
+
+    /// Record registry inbox UIVK when the DB is first created. No-op if already set;
+    /// warns if the binary's UIVK disagrees (index identity is fixed).
+    pub(crate) fn install_registry_uivk(&self, uivk: &str) -> rusqlite::Result<()> {
+        if let Some(existing) = self.registry_uivk()? {
+            if existing != uivk {
+                tracing::warn!(
+                    stored = %existing,
+                    "registry_account uivk already set; not changing"
+                );
+            }
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO registry_account (id, uivk) VALUES (0, ?1)",
+            params![uivk],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn registry_uivk(&self) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT uivk FROM registry_account WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
     }
 
     pub(crate) fn open_for_rpc(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
@@ -187,6 +229,7 @@ impl Db {
     /// Returns only name notes that were actually indexed (binding + transition passed).
     pub(crate) fn apply_batch(
         &self,
+        network: &impl Parameters,
         scanned: BlockPos,
         live: BlockPos,
         decrypted: &[DecryptedNote],
@@ -202,7 +245,7 @@ impl Db {
                 name,
                 ua,
                 prev_rcm: memo_prev,
-            }) = memo::parse_memo(n.memo.as_slice())
+            }) = parse_memo_validated(n.memo.as_slice(), network)
             else {
                 continue;
             };
