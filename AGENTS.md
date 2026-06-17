@@ -9,6 +9,8 @@ The name-binding lives in `(ψ, rcm) → cmx`, not the memo - the memo is untrus
 3. **Binding** — Recompute `cmx` from `(action, name, ua, prev_rcm)`; no match, no index entry.
 4. **Derivability** — Serve tx, header, and merkle branch with answers; resolver verifies on index, proofs enable optional audit.
 
+**Ingest (`names::apply_batch`):** `lifecycle_claim_from_memo` → candidate claims; `try_admit_name_note` → transition + binding. Only the latter indexes a row.
+
 ## Programming principles
 
 **Binary modules:** `sync`, `orchard`, `names`, `jsonrpc` (no `lib.rs`). 

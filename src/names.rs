@@ -214,10 +214,11 @@ impl Db {
             .map_err(Into::into)
     }
 
-    /// Process one scanned batch: for each decrypted note, run Transition + Binding,
-    /// append to `name_events`, update `names` tip, then checkpoint.
+    /// Process one scanned batch: visibility already happened in [`crate::orchard`].
     ///
-    /// Returns only name notes that were actually indexed (binding + transition passed).
+    /// Per decrypted note: memo may supply a **candidate** `(action, name, ua)`; a row is
+    /// admitted only when **transition + binding** pass (`(ψ, rcm) → cmx`). Memo parse
+    /// failure means no candidate claims, not a crypto proof that the note is unrelated.
     pub(crate) fn apply_batch(
         &self,
         network: &impl Parameters,
@@ -229,56 +230,22 @@ impl Db {
         let mut indexed = Vec::new();
 
         for n in decrypted {
-            // ── Transition (step 1): parse memo narration ──
-            // Memo format is defined by ZNS; non-lifecycle memos are ignored.
-            let Ok(ParsedMemo::Lifecycle {
-                action,
-                name,
-                ua,
-                prev_rcm: memo_prev,
-            }) = parse_memo_validated(n.memo.as_slice(), network)
-            else {
-                continue;
-            };
-            let name = name.to_string();
-            let ua = ua.to_string();
-
-            // Names that look like UAs are rejected to avoid namespace confusion.
-            if shadows_ua_namespace(&name) {
-                continue;
-            }
-
-            // ── Transition (step 2): legal move on our per-name chain ──
-            // claim requires no tip; update/release require tip.rcm as prev_rcm.
-            let tip = self.name_tip_in_tx(&tx, &name)?;
-            let Some(prev_rcm) = prev_rcm_for(tip.as_ref(), action) else {
+            let Some(claim) = lifecycle_claim_from_memo(n.memo.as_slice(), network) else {
                 continue;
             };
 
-            // ── Binding: recompute cmx; memo is not trusted for this ──
-            let Some((psi, rcm)) = verify_binding(&n.note, n.cmx, action, &name, &ua, &prev_rcm)
+            let tip = self.name_tip_in_tx(&tx, &claim.name)?;
+            let Some((prev_rcm, psi, rcm)) =
+                try_admit_name_note(&claim, n, tip.as_ref())
             else {
-                // If memo claimed a different prev_rcm that *would* verify, someone
-                // may be building an alternate fork — log but don't index.
-                if let Some(claimed) = memo_prev.filter(|p| {
-                    *p != prev_rcm
-                        && verify_binding(&n.note, n.cmx, action, &name, &ua, p).is_some()
-                }) {
-                    tracing::warn!(
-                        name,
-                        height = n.height,
-                        claimed = hex::encode(claimed),
-                        tip = hex::encode(prev_rcm),
-                        "registry fork: note extends a different predecessor than our tip"
-                    );
-                }
+                warn_registry_fork(&claim, n, tip.as_ref());
                 continue;
             };
 
             let name_note = NameNote {
-                name: name.clone(),
-                ua: ua.clone(),
-                action,
+                name: claim.name.clone(),
+                ua: claim.ua.clone(),
+                action: claim.action,
                 prev_rcm,
                 rcm,
                 psi,
@@ -742,6 +709,83 @@ fn action_str(a: Action) -> &'static str {
         Action::Update => "update",
         Action::Release => "release",
     }
+}
+
+/// Candidate fields parsed from a canonical lifecycle memo — **untrusted** until binding passes.
+struct LifecycleClaim {
+    action: Action,
+    name: String,
+    ua: String,
+    /// Optional memo witness; transition uses index tip `prev_rcm`, not this field.
+    memo_prev_rcm: Option<[u8; 32]>,
+}
+
+/// Extract indexing claims from memo. Does not admit a name note (see [`try_admit_name_note`]).
+fn lifecycle_claim_from_memo(memo: &[u8], network: &impl Parameters) -> Option<LifecycleClaim> {
+    let Ok(ParsedMemo::Lifecycle {
+        action,
+        name,
+        ua,
+        prev_rcm,
+    }) = parse_memo_validated(memo, network)
+    else {
+        return None;
+    };
+    if shadows_ua_namespace(name) {
+        return None;
+    }
+    Some(LifecycleClaim {
+        action,
+        name: name.to_string(),
+        ua: ua.to_string(),
+        memo_prev_rcm: prev_rcm,
+    })
+}
+
+/// Admission gate: legal transition on our per-name chain + ZNS binding to on-chain `cmx`.
+fn try_admit_name_note(
+    claim: &LifecycleClaim,
+    n: &DecryptedNote,
+    tip: Option<&Tip>,
+) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
+    let prev_rcm = prev_rcm_for(tip, claim.action)?;
+    let (psi, rcm) = verify_binding(
+        &n.note,
+        n.cmx,
+        claim.action,
+        &claim.name,
+        &claim.ua,
+        &prev_rcm,
+    )?;
+    Some((prev_rcm, psi, rcm))
+}
+
+/// If binding failed but memo's `prev_rcm` witness would verify, log a possible fork.
+fn warn_registry_fork(claim: &LifecycleClaim, n: &DecryptedNote, tip: Option<&Tip>) {
+    let Some(prev_rcm) = prev_rcm_for(tip, claim.action) else {
+        return;
+    };
+    let Some(claimed) = claim.memo_prev_rcm.filter(|p| {
+        *p != prev_rcm
+            && verify_binding(
+                &n.note,
+                n.cmx,
+                claim.action,
+                &claim.name,
+                &claim.ua,
+                p,
+            )
+            .is_some()
+    }) else {
+        return;
+    };
+    tracing::warn!(
+        name = %claim.name,
+        height = n.height,
+        claimed = hex::encode(claimed),
+        tip = hex::encode(prev_rcm),
+        "registry fork: note extends a different predecessor than our tip"
+    );
 }
 
 /// Reject names that could be mistaken for Zcash unified addresses.
