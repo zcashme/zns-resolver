@@ -26,7 +26,6 @@ pasta_curves = "0.5"
 group = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
 jsonrpsee = { version = "0.26", features = ["server", "macros", "http-client"] }
-sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -34,7 +33,7 @@ hex = "0.4"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = true }
 
 [patch.crates-io]
 orchard = { path = "../zns-orchard" }

@@ -9,9 +9,10 @@
 //!                                        │                          │
 //!                                        ▼                          ▼
 //!                              sync::materialize_proofs      jsonrpc
+//!                                        (zebrad getblock)
 //! ```
 //!
-//! Modules: `sync`, `orchard`, `names`, `jsonrpc` (no `lib.rs`).
+//! Modules: `sync`, `orchard`, `names`, `jsonrpc` (no `lib.rs`). Proof I/O lives in `sync`.
 
 mod jsonrpc;
 mod names;
@@ -21,9 +22,9 @@ mod sync;
 use std::path::PathBuf;
 
 use orchard::orchard_ivk;
-use sync::{run_sync_loop, run_tip_watcher, ValidatorClient, TIP_WATCH_INTERVAL};
+use sync::{run_sync_loop, run_tip_watcher, ZebradClient, TIP_WATCH_INTERVAL};
 use tokio::sync::watch;
-use tracing_subscriber::EnvFilter;
+use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
 use jsonrpc::{serve_rpc, RpcContext};
@@ -34,15 +35,14 @@ const NETWORK: Network = Network::TestNetwork;
 const LIGHTWALLETD: &str = "https://testnet.zec.rocks:443";
 const DB_PATH: &str = "zns-resolver.sqlite";
 const RPC_ADDR: &str = "127.0.0.1:8080";
-const VALIDATOR_RPC: Option<&str> = None;
+/// zebrad JSON-RPC for proof material (regtest: `zebra-regtest` → `:18232`). `None` → proofs omitted.
+const ZEBRAD_RPC: Option<&str> = None;
 const SCAN_BIRTHDAY: u32 = 4_000_000;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("zns_resolver=info".parse().unwrap()),
-        )
+        .with_max_level(LevelFilter::INFO)
         .init();
 
     let ivk = match orchard_ivk(&NETWORK, UIVK) {
@@ -53,11 +53,11 @@ async fn main() {
         }
     };
 
-    let validator = VALIDATOR_RPC.map(ValidatorClient::new).transpose();
-    let validator = match validator {
+    let zebrad = ZEBRAD_RPC.map(ZebradClient::new).transpose();
+    let zebrad = match zebrad {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("validator: {e}");
+            eprintln!("zebrad: {e}");
             std::process::exit(1);
         }
     };
@@ -86,7 +86,7 @@ async fn main() {
         NETWORK,
         SCAN_BIRTHDAY,
         ivk,
-        validator,
+        zebrad,
         tip_rx,
     )
     .await;

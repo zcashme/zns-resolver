@@ -1,4 +1,4 @@
-//! Chain sync: lightwalletd compact blocks, reorg rewind, validator proofs.
+//! Chain sync: lightwalletd compact blocks, reorg rewind, zebrad proof material.
 
 use std::time::Duration;
 
@@ -10,9 +10,11 @@ use jsonrpsee::rpc_params;
 use orchard::keys::PreparedIncomingViewingKey;
 use seer_sync::chain::{self, ChainError, DEFAULT_CHUNK_OUTPUTS};
 use seer_sync::BlockHash;
-use sha2::{Digest, Sha256};
+use serde::Deserialize;
 use tokio::sync::watch;
+use zcash_primitives::block::BlockHeader;
 use zcash_protocol::consensus::Network;
+use zns_verify::proof::{merkle_branch, verify_link_inclusion};
 
 use crate::names::{BlockPos, Db, NameNote};
 use crate::orchard::observe_batch;
@@ -20,8 +22,8 @@ use crate::orchard::observe_batch;
 pub(crate) const RETRY_DELAY: Duration = Duration::from_secs(5);
 pub(crate) const TIP_WATCH_INTERVAL: Duration = Duration::from_secs(10);
 
-
-pub(crate) struct ValidatorClient {
+/// zebrad JSON-RPC (`getblock`) for proof material — tested on regtest; same RPC shape as zcashd.
+pub(crate) struct ZebradClient {
     client: HttpClient,
 }
 
@@ -30,49 +32,46 @@ struct BlockContext {
     txids: Vec<[u8; 32]>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GetBlockObject {
+    tx: Vec<String>,
+}
+
 // ── proof material (derivability invariant) ─────────────────────────────────────
 //
 // Clients can audit bindings without trusting this resolver: given raw tx, block
 // header, and merkle siblings they can re-derive inclusion and re-run binding checks.
+// Stale or omit, never forge: failed fetches or failed inclusion checks skip the row.
 
-impl ValidatorClient {
+impl ZebradClient {
     pub(crate) fn new(url: &str) -> Result<Self> {
         let client = HttpClient::builder()
             .build(url)
-            .context("validator RPC url")?;
+            .context("zebrad RPC url")?;
         Ok(Self { client })
     }
 
     async fn block_context(&self, height: u32) -> Result<BlockContext> {
         let arg = height.to_string();
 
-        let info: serde_json::Value = self
+        let block: GetBlockObject = self
             .client
             .request("getblock", rpc_params![&arg, 1])
             .await
-            .with_context(|| format!("getblock {height} (verbose)"))?;
-        let txids = info
-            .get("tx")
-            .and_then(|t| t.as_array())
-            .ok_or_else(|| anyhow!("getblock {height}: no tx list"))?
+            .with_context(|| format!("zebrad getblock {height} verbosity=1"))?;
+        let txids = block
+            .tx
             .iter()
-            .map(|v| {
-                let hex_str = v.as_str().ok_or_else(|| anyhow!("non-string txid"))?;
-                let mut bytes: [u8; 32] = hex::decode(hex_str)?
-                    .try_into()
-                    .map_err(|_| anyhow!("txid length"))?;
-                bytes.reverse();
-                Ok(bytes)
-            })
+            .map(|hex_str| txid_from_display_hex(hex_str))
             .collect::<Result<Vec<_>>>()?;
 
         let raw_hex: String = self
             .client
             .request("getblock", rpc_params![&arg, 0])
             .await
-            .with_context(|| format!("getblock {height} (raw)"))?;
-        let raw = hex::decode(raw_hex.trim()).context("raw block hex")?;
-        let parsed = zcash_primitives::block::BlockHeader::read(&raw[..])
+            .with_context(|| format!("zebrad getblock {height} verbosity=0"))?;
+        let raw = hex::decode(raw_hex.trim()).context("zebrad getblock raw hex")?;
+        let parsed = BlockHeader::read(&raw[..])
             .with_context(|| format!("block {height} header parse"))?;
         let mut header = Vec::new();
         parsed.write(&mut header)?;
@@ -81,43 +80,19 @@ impl ValidatorClient {
     }
 }
 
-/// Build a Bitcoin-style merkle inclusion path (double-SHA256 pairs).
-fn merkle_branch(txids: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
-    assert!(index < txids.len(), "leaf index in range");
-    let mut level: Vec<[u8; 32]> = txids.to_vec();
-    let mut idx = index;
-    let mut branch = Vec::new();
-    while level.len() > 1 {
-        if level.len() % 2 == 1 {
-            level.push(*level.last().expect("non-empty"));
-        }
-        let sibling = if idx % 2 == 1 {
-            level[idx - 1]
-        } else {
-            level[idx + 1]
-        };
-        branch.push(sibling);
-        level = level
-            .chunks_exact(2)
-            .map(|pair| sha256d(&pair[0], &pair[1]))
-            .collect();
-        idx /= 2;
-    }
-    branch
+fn txid_from_display_hex(hex_str: &str) -> Result<[u8; 32]> {
+    let mut bytes: [u8; 32] = hex::decode(hex_str)?
+        .try_into()
+        .map_err(|_| anyhow!("txid length"))?;
+    bytes.reverse();
+    Ok(bytes)
 }
 
-fn sha256d(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let first = Sha256::new()
-        .chain_update(left)
-        .chain_update(right)
-        .finalize();
-    Sha256::digest(first).into()
-}
-
-/// For each newly indexed name note, fetch block context from validator and persist proofs.
+/// For each newly indexed name note, fetch block context from zebrad and persist proofs.
 async fn materialize_proofs(
     db: &Db,
-    validator: &ValidatorClient,
+    network: &Network,
+    zebrad: &ZebradClient,
     indexed: &[NameNote],
 ) -> Result<()> {
     let mut heights: Vec<u32> = indexed.iter().map(|n| n.height).collect();
@@ -125,23 +100,59 @@ async fn materialize_proofs(
     heights.dedup();
 
     for height in heights {
-        let ctx = validator.block_context(height).await?;
+        let ctx = match zebrad.block_context(height).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                tracing::warn!(height, error = %e, "proof material: zebrad block context");
+                continue;
+            }
+        };
+
         for n in indexed.iter().filter(|n| n.height == height) {
             let Some(pos) = ctx.txids.iter().position(|t| *t == n.txid) else {
-                anyhow::bail!(
-                    "validator block {height} does not contain tx {}",
-                    hex::encode(n.txid)
+                tracing::warn!(
+                    height,
+                    txid = %hex::encode(n.txid),
+                    "proof material: tx not in zebrad block"
                 );
+                continue;
             };
             let branch = merkle_branch(&ctx.txids, pos);
-            db.insert_proof_material(
+            let merkle_index = pos as u32;
+
+            if let Err(e) = verify_link_inclusion(
+                network,
+                0,
+                height,
+                &n.raw_tx,
+                &ctx.header,
+                &branch,
+                merkle_index,
+            ) {
+                tracing::warn!(
+                    height,
+                    txid = %hex::encode(n.txid),
+                    error = %e,
+                    "proof material: inclusion check failed"
+                );
+                continue;
+            }
+
+            if let Err(e) = db.insert_proof_material(
                 &n.txid,
                 height,
                 &n.raw_tx,
                 &ctx.header,
                 &branch,
-                pos as u32,
-            )?;
+                merkle_index,
+            ) {
+                tracing::warn!(
+                    height,
+                    txid = %hex::encode(n.txid),
+                    error = %e,
+                    "proof material: db insert"
+                );
+            }
         }
     }
     Ok(())
@@ -165,14 +176,13 @@ pub(crate) async fn run_tip_watcher(url: &'static str, interval: Duration, tx: w
     }
 }
 
-
 pub(crate) async fn run_sync_loop(
     lightwalletd: &'static str,
     db_path: &'static str,
     network: Network,
     scan_birthday: u32,
     ivk: PreparedIncomingViewingKey,
-    validator: Option<ValidatorClient>,
+    zebrad: Option<ZebradClient>,
     mut tip_rx: watch::Receiver<BlockPos>,
 ) {
     let mut rewind_by = 1u32;
@@ -241,9 +251,9 @@ pub(crate) async fn run_sync_loop(
                     match observe_batch(&mut fetch_client, &network, &ivk, &batch).await {
                         Ok(decrypted) => match db.apply_batch(scanned, live, &decrypted) {
                             Ok(indexed) => {
-                                if let Some(ref validator) = validator {
+                                if let Some(ref zebrad) = zebrad {
                                     if let Err(e) =
-                                        materialize_proofs(&db, validator, &indexed).await
+                                        materialize_proofs(&db, &network, zebrad, &indexed).await
                                     {
                                         eprintln!("proofs: {e}");
                                     }

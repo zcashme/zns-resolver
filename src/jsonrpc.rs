@@ -1,4 +1,4 @@
-//! JSON-RPC read API (thin consumer).
+//! JSON-RPC read API
 
 use std::path::{Path, PathBuf};
 
@@ -265,7 +265,7 @@ fn proof_links(db: &Db, rows: &[ChainRow]) -> RpcResult<Vec<ProofLinkEntry>> {
                 .ok_or_else(|| {
                     ErrorObjectOwned::owned(
                         -32011,
-                        "proof material unavailable (no validator RPC configured)",
+                        "proof material unavailable (zebrad RPC not configured)",
                         None::<()>,
                     )
                 })?;
@@ -349,4 +349,3 @@ pub(crate) async fn serve_rpc(addr: &str, ctx: RpcContext) -> Result<()> {
     handle.stopped().await;
     Ok(())
 }
-
