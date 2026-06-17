@@ -2,7 +2,7 @@
 
 Trust model: **stale or omit, never forge.** Binding lives in `(ψ, rcm) → cmx`, not the memo.
 
-Binary modules: `sync`, `orchard`, `names`, `jsonrpc` (no `lib.rs`). Proof I/O lives in `sync` (zebrad `getblock`), not a fifth module.
+Binary modules: `sync`, `orchard`, `registry`, `jsonrpc` (no `lib.rs`).
 
 ```mermaid
 flowchart TB
@@ -16,12 +16,12 @@ flowchart TB
         FULL[relaxed full-tx decrypt + memo]
     end
 
-    subgraph trans ["2. Transition (names)"]
+    subgraph trans ["2. Transition (registry)"]
         MEMO[memo::parse_memo]
         CHAIN[chain::prev_rcm_for]
     end
 
-    subgraph bind ["3. Binding (orchard + names)"]
+    subgraph bind ["3. Binding (orchard + registry)"]
         PSI[zns_psi_rcm]
         CMX[note_commitment_cmx check]
         APPLY[apply_batch → checkpoint commit]

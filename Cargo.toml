@@ -1,4 +1,4 @@
-# ZNS resolver binary (`sync`, `orchard`, `names`, `jsonrpc`). Watches the registry inbox on Zcash,
+# ZNS resolver binary (`sync`, `orchard`, `registry`, `jsonrpc`). Watches the registry inbox on Zcash,
 # verifies Orchard note bindings, indexes name→UA, serves JSON-RPC.
 # Local path deps: seer-sync (chain I/O), zns-verify (crypto + memos), zns-orchard.
 [package]

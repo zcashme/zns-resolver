@@ -6,20 +6,20 @@
 //!
 
 mod jsonrpc;
-mod names;
+mod registry;
 mod orchard;
 mod sync;
 
 use std::path::PathBuf;
 
 use orchard::orchard_ivk;
-use sync::{run_sync_loop, run_tip_watcher, TIP_WATCH_INTERVAL};
+use sync::{run_sync_loop, run_tip_watcher, LwdSession, TIP_WATCH_INTERVAL};
 use tokio::sync::watch;
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
 use jsonrpc::serve_rpc;
-use names::Db;
+use registry::Db;
 
 /// Registry **incoming viewing key** (UIVK).
 const UIVK: &str = "uivktest18a7ht78cymvm3sxdw9myrr04nrnj8nvrqdjhadj8dp3cv8pm2dqszuxnjrjyp6xyf0svtzjxnq3976l5sxzd09mmx9g6sj9xpp67ympwsrv6wen5ye25jhvq0l8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8jja5vlzday32pgq4cccqd2rjvtlsfnn9lne9cchrcfgn87jlx9";
@@ -53,10 +53,11 @@ async fn main() {
     });
 
     let (tip_tx, tip_rx) = watch::channel((0, None));
-    tokio::spawn(run_tip_watcher(LIGHTWALLETD, TIP_WATCH_INTERVAL, tip_tx));
+    let lwd = LwdSession::new(LIGHTWALLETD.to_string());
+    tokio::spawn(run_tip_watcher(lwd.clone(), TIP_WATCH_INTERVAL, tip_tx));
 
     run_sync_loop(
-        LIGHTWALLETD,
+        lwd,
         DB_PATH,
         NETWORK,
         SCAN_BIRTHDAY,

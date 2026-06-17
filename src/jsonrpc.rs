@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::Value;
 use zns_verify::Action;
 
-use crate::names::{Db, Event, Registration};
+use crate::registry::{Db, Event, Registration};
 
 // ── JSON-RPC (thin consumer API) ──────────────────────────────────────────────
 //

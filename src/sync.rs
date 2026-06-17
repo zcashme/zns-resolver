@@ -9,34 +9,50 @@ use seer_sync::BlockHash;
 use tokio::sync::watch;
 use zcash_protocol::consensus::Network;
 
-use crate::names::{Cursor, Db};
+use crate::registry::{Cursor, Db};
 use crate::orchard::observe_batch;
 
 pub(crate) const RETRY_DELAY: Duration = Duration::from_secs(5);
 pub(crate) const TIP_WATCH_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Owned lightwalletd URL — pass a clone into tasks; RPC via `seer_sync::chain`.
+#[derive(Clone)]
+pub(crate) struct LwdSession(String);
+
+impl LwdSession {
+    pub(crate) fn new(url: String) -> Self {
+        Self(url)
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) async fn poll_tip(&self) -> Result<Cursor, ChainError> {
+        let mut client = chain::connect(self.url()).await?;
+        chain::tip(&mut client).await
+    }
+}
+
 /// Polls lightwalletd for the chain tip and notifies the sync worker when it moves.
 pub(crate) async fn run_tip_watcher(
-    url: &'static str,
+    session: LwdSession,
     interval: Duration,
     tx: watch::Sender<Cursor>,
 ) {
     loop {
-        match chain::connect(url).await {
-            Ok(mut client) => match chain::tip(&mut client).await {
-                Ok(tip) => {
-                    let _ = tx.send(tip);
-                }
-                Err(e) => eprintln!("tip watcher: {e}"),
-            },
-            Err(e) => eprintln!("tip watcher connect: {e}"),
+        match session.poll_tip().await {
+            Ok(tip) => {
+                let _ = tx.send(tip);
+            }
+            Err(e) => eprintln!("tip watcher: {e}"),
         }
         tokio::time::sleep(interval).await;
     }
 }
 
 pub(crate) async fn run_sync_loop(
-    lightwalletd: &'static str,
+    session: LwdSession,
     db_path: &'static str,
     network: Network,
     scan_birthday: u32,
@@ -64,7 +80,7 @@ pub(crate) async fn run_sync_loop(
             }
         };
 
-        let client = match chain::connect(lightwalletd).await {
+        let client = match chain::connect(session.url()).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("lightwalletd: {e}");
