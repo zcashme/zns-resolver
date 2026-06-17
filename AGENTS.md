@@ -11,7 +11,7 @@ The name-binding lives in `(ψ, rcm) → cmx`, not the memo - the memo is untrus
 
 ## Programming principles
 
-**Mono-file.** 
+**Binary modules:** `sync`, `orchard`, `names`, `jsonrpc` (no `lib.rs`). 
 **Thin consumer.** 
 **Checkpoint after commit.** 
 **Stale or omit, never forge.**
