@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::Value;
 use zns_verify::Action;
 
-use crate::names::{ChainRow, Db, Event, Registration};
+use crate::names::{Db, Event, Registration};
 
 // ── JSON-RPC (thin consumer API) ──────────────────────────────────────────────
 //
@@ -55,6 +55,7 @@ struct EventEntry {
     action: String,
     txid: String,
     height: u64,
+    action_index: u64,
     ua: Option<String>,
     price: Option<u64>,
     nonce: u64,
@@ -148,7 +149,7 @@ impl ZnsApiServer for RpcContext {
         } else if let Some(reg) = db.resolve_by_name(&query).map_err(rpc_err)? {
             let mut value = serde_json::to_value(entry(reg)).unwrap();
             if with_proof == Some(true) {
-                let rows = db.chain_rows(&query).map_err(rpc_err)?;
+                let rows = db.chain_events(&query).map_err(rpc_err)?;
                 let links = proof_links(&db, current_segment(&rows))?;
                 value["proof"] = serde_json::json!({ "links": links });
             }
@@ -164,7 +165,7 @@ impl ZnsApiServer for RpcContext {
 
     fn chain(&self, name: String) -> RpcResult<ChainResult> {
         let db = open_for_rpc(&self.db)?;
-        let rows = db.chain_rows(&name).map_err(rpc_err)?;
+        let rows = db.chain_events(&name).map_err(rpc_err)?;
         let links = proof_links(&db, &rows)?;
         Ok(ChainResult { name, links })
     }
@@ -248,7 +249,7 @@ impl ZnsApiServer for RpcContext {
 
 /// Proof links cover the current ownership segment: from the latest claim forward.
 /// Earlier claim/update/release chains are historical only.
-fn current_segment(rows: &[ChainRow]) -> &[ChainRow] {
+fn current_segment(rows: &[Event]) -> &[Event] {
     let start = rows
         .iter()
         .rposition(|r| r.action == Action::Claim)
@@ -256,7 +257,7 @@ fn current_segment(rows: &[ChainRow]) -> &[ChainRow] {
     &rows[start..]
 }
 
-fn proof_links(db: &Db, rows: &[ChainRow]) -> RpcResult<Vec<ProofLinkEntry>> {
+fn proof_links(db: &Db, rows: &[Event]) -> RpcResult<Vec<ProofLinkEntry>> {
     rows.iter()
         .map(|r| {
             let m = db
@@ -308,6 +309,7 @@ fn event_entry(e: Event) -> EventEntry {
         action: action_name(e.action).to_string(),
         txid: hex::encode(e.txid),
         height: e.height as u64,
+        action_index: e.action_index as u64,
         ua: (!e.ua.is_empty()).then_some(e.ua),
         price: None,
         nonce: 0,

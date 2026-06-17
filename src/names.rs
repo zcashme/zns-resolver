@@ -117,17 +117,7 @@ pub(crate) struct Registration {
     pub(crate) last_action: Action,
 }
 
-/// One verified lifecycle step in a name's per-name chain (from `name_events`).
-#[derive(Debug, Clone)]
-pub(crate) struct ChainRow {
-    pub(crate) action: Action,
-    pub(crate) ua: String,
-    pub(crate) height: u32,
-    pub(crate) txid: [u8; 32],
-    pub(crate) action_index: usize,
-}
-
-/// Event log entry for the `events` RPC (includes DB rowid).
+/// One verified lifecycle row from `name_events` (event log + per-name chain).
 #[derive(Debug, Clone)]
 pub(crate) struct Event {
     pub(crate) id: i64,
@@ -136,6 +126,7 @@ pub(crate) struct Event {
     pub(crate) ua: String,
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
+    pub(crate) action_index: usize,
 }
 
 /// Everything a client needs to independently verify a binding on-chain (derivability).
@@ -499,45 +490,23 @@ impl Db {
             |r| r.get(0),
         )?;
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT rowid, name, action, ua, txid, height FROM name_events {WHERE}
+            "SELECT rowid, name, action, ua, txid, height, action_index FROM name_events {WHERE}
              ORDER BY height DESC, rowid DESC LIMIT ?4 OFFSET ?5"
         ))?;
         let events = stmt
-            .query_map(p, |r| {
-                let txid: Vec<u8> = r.get(4)?;
-                Ok(Event {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    action: parse_action(&r.get::<_, String>(2)?)?,
-                    ua: r.get(3)?,
-                    txid: txid
-                        .try_into()
-                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, 0))?,
-                    height: r.get::<_, i64>(5)? as u32,
-                })
-            })?
+            .query_map(p, |r| row_to_event(r))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((events, total as u64))
     }
 
-    pub(crate) fn chain_rows(&self, name: &str) -> rusqlite::Result<Vec<ChainRow>> {
+    /// Per-name chain in ascending height order (`chain` RPC / proofs).
+    pub(crate) fn chain_events(&self, name: &str) -> rusqlite::Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
-            "SELECT action, ua, height, txid, action_index FROM name_events
+            "SELECT rowid, name, action, ua, txid, height, action_index FROM name_events
              WHERE name = ?1 ORDER BY height ASC, rowid ASC",
         )?;
         let rows = stmt
-            .query_map(params![name], |r| {
-                let txid: Vec<u8> = r.get(3)?;
-                Ok(ChainRow {
-                    action: parse_action(&r.get::<_, String>(0)?)?,
-                    ua: r.get(1)?,
-                    height: r.get::<_, i64>(2)? as u32,
-                    txid: txid
-                        .try_into()
-                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, 0))?,
-                    action_index: r.get::<_, i64>(4)? as usize,
-                })
-            })?
+            .query_map(params![name], |r| row_to_event(r))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -605,6 +574,21 @@ impl Db {
         )?;
         Ok(())
     }
+}
+
+fn row_to_event(row: &Row<'_>) -> rusqlite::Result<Event> {
+    let txid: Vec<u8> = row.get(4)?;
+    Ok(Event {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        action: parse_action(&row.get::<_, String>(2)?)?,
+        ua: row.get(3)?,
+        txid: txid
+            .try_into()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, 0))?,
+        height: row.get::<_, i64>(5)? as u32,
+        action_index: row.get::<_, i64>(6)? as usize,
+    })
 }
 
 fn row_to_checkpoint(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
