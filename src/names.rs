@@ -1,4 +1,4 @@
-//! ZNS name index in SQLite (`registry_account`, `scan_state`, `name_events`, `names`, `proof_material`).
+//! ZNS name index in SQLite (`registry_account`, `scan_state`, `name_events`, `names`).
 
 use std::path::Path;
 use std::time::Duration;
@@ -19,7 +19,6 @@ const REORG_SHALLOW_MAX: u32 = 30;
 //   scan_state       — checkpoint after commit (how far we've scanned)
 //   name_events      — append-only history of every verified lifecycle event
 //   names            — materialized current tip per name (fast resolve)
-//   proof_material   — tx + header + merkle branch for optional client audit
 const SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -68,15 +67,6 @@ CREATE TABLE IF NOT EXISTS names (
     action_index INTEGER NOT NULL,
     raw_tx       BLOB    NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS proof_material (
-    txid          BLOB    NOT NULL PRIMARY KEY,
-    height        INTEGER NOT NULL,
-    raw_tx        BLOB    NOT NULL,
-    header        BLOB    NOT NULL,
-    merkle_branch BLOB    NOT NULL,
-    merkle_index  INTEGER NOT NULL
-) WITHOUT ROWID;
 "#;
 
 // ── types ─────────────────────────────────────────────────────────────────────
@@ -127,16 +117,6 @@ pub(crate) struct Event {
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
     pub(crate) action_index: usize,
-}
-
-/// Everything a client needs to independently verify a binding on-chain (derivability).
-#[derive(Debug, Clone)]
-pub(crate) struct ProofMaterial {
-    pub(crate) raw_tx: Vec<u8>,
-    pub(crate) header: Vec<u8>,
-    /// Sibling hashes from leaf txid up to the block's tx merkle root.
-    pub(crate) merkle_branch: Vec<[u8; 32]>,
-    pub(crate) merkle_index: u32,
 }
 
 /// Thin SQLite wrapper — all writes go through `apply_batch` / `rewind`.
@@ -325,7 +305,6 @@ impl Db {
         if depth > REORG_SHALLOW_MAX {
             tx.execute("DELETE FROM name_events", [])?;
             tx.execute("DELETE FROM names", [])?;
-            tx.execute("DELETE FROM proof_material", [])?;
             tx.execute("DELETE FROM scan_state", [])?;
         } else {
             let mut stmt = tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
@@ -336,10 +315,6 @@ impl Db {
 
             tx.execute(
                 "DELETE FROM name_events WHERE height > ?1",
-                params![fork_height as i64],
-            )?;
-            tx.execute(
-                "DELETE FROM proof_material WHERE height > ?1",
                 params![fork_height as i64],
             )?;
 
@@ -359,32 +334,6 @@ impl Db {
         }
 
         tx.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn insert_proof_material(
-        &self,
-        txid: &[u8; 32],
-        height: u32,
-        raw_tx: &[u8],
-        header: &[u8],
-        merkle_branch: &[[u8; 32]],
-        merkle_index: u32,
-    ) -> rusqlite::Result<()> {
-        let branch: Vec<u8> = merkle_branch.iter().flatten().copied().collect();
-        self.conn.execute(
-            "INSERT OR IGNORE INTO proof_material
-                 (txid, height, raw_tx, header, merkle_branch, merkle_index)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                txid.as_slice(),
-                height as i64,
-                raw_tx,
-                header,
-                branch,
-                merkle_index as i64
-            ],
-        )?;
         Ok(())
     }
 
@@ -464,41 +413,6 @@ impl Db {
             .query_map(p, |r| row_to_event(r))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((events, total as u64))
-    }
-
-    /// Per-name chain in ascending height order (`chain` RPC / proofs).
-    pub(crate) fn chain_events(&self, name: &str) -> rusqlite::Result<Vec<Event>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT rowid, name, action, ua, txid, height, action_index FROM name_events
-             WHERE name = ?1 ORDER BY height ASC, rowid ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![name], |r| row_to_event(r))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    pub(crate) fn proof_material(&self, txid: &[u8; 32]) -> rusqlite::Result<Option<ProofMaterial>> {
-        self.conn
-            .query_row(
-                "SELECT raw_tx, header, merkle_branch, merkle_index
-                 FROM proof_material WHERE txid = ?1",
-                params![txid.as_slice()],
-                |r| {
-                    let branch: Vec<u8> = r.get(2)?;
-                    Ok(ProofMaterial {
-                        raw_tx: r.get(0)?,
-                        header: r.get(1)?,
-                        merkle_branch: branch
-                            .chunks_exact(32)
-                            .map(|c| c.try_into().expect("32-byte siblings"))
-                            .collect(),
-                        merkle_index: r.get::<_, i64>(3)? as u32,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
     }
 
     fn name_tip_in_tx(

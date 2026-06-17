@@ -69,43 +69,18 @@ pub struct EventsResult {
     total: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ProofLinkEntry {
-    action: String,
-    ua: String,
-    height: u64,
-    txid: String,
-    action_index: u64,
-    tx: String,
-    header: String,
-    merkle_branch: Vec<String>,
-    merkle_index: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ChainResult {
-    name: String,
-    links: Vec<ProofLinkEntry>,
-}
-
 /// Public resolver API. `blocking` methods run on jsonrpsee's thread pool since
 /// SQLite is synchronous.
 #[rpc(server)]
 trait ZnsApi {
     /// Lookup by name (exact), UA prefix (reverse lookup), or list all if query empty.
-    /// `with_proof=true` attaches merkle proof links for the current claim segment.
     #[method(name = "resolve", blocking)]
     fn resolve(
         &self,
         query: String,
         limit: Option<u64>,
         offset: Option<u64>,
-        with_proof: Option<bool>,
     ) -> RpcResult<Value>;
-
-    /// Full per-name event chain with proof material for every link.
-    #[method(name = "chain", blocking)]
-    fn chain(&self, name: String) -> RpcResult<ChainResult>;
 
     /// Sync progress: scanned height vs chain tip, registration count.
     #[method(name = "status", blocking)]
@@ -127,33 +102,21 @@ trait ZnsApi {
     ) -> RpcResult<EventsResult>;
 }
 
-pub(crate) struct RpcContext {
-    pub(crate) db: PathBuf,
-    pub(crate) uivk: String,
-}
-
-impl ZnsApiServer for RpcContext {
+impl ZnsApiServer for PathBuf {
     fn resolve(
         &self,
         query: String,
         limit: Option<u64>,
         offset: Option<u64>,
-        with_proof: Option<bool>,
     ) -> RpcResult<Value> {
-        let db = open_for_rpc(&self.db)?;
+        let db = open_for_rpc(self)?;
         let limit = limit.unwrap_or(50).min(500) as u32;
         let offset = offset.unwrap_or(0) as u32;
 
         let value = if query.is_empty() {
             entries(db.list_registrations(limit, offset).map_err(rpc_err)?)
         } else if let Some(reg) = db.resolve_by_name(&query).map_err(rpc_err)? {
-            let mut value = serde_json::to_value(entry(reg)).unwrap();
-            if with_proof == Some(true) {
-                let rows = db.chain_events(&query).map_err(rpc_err)?;
-                let links = proof_links(&db, current_segment(&rows))?;
-                value["proof"] = serde_json::json!({ "links": links });
-            }
-            value
+            serde_json::to_value(entry(reg)).unwrap()
         } else {
             entries(
                 db.registrations_by_ua(&query, limit, offset)
@@ -163,15 +126,8 @@ impl ZnsApiServer for RpcContext {
         Ok(value)
     }
 
-    fn chain(&self, name: String) -> RpcResult<ChainResult> {
-        let db = open_for_rpc(&self.db)?;
-        let rows = db.chain_events(&name).map_err(rpc_err)?;
-        let links = proof_links(&db, &rows)?;
-        Ok(ChainResult { name, links })
-    }
-
     fn status(&self) -> RpcResult<StatusResult> {
-        let db = open_for_rpc(&self.db)?;
+        let db = open_for_rpc(self)?;
         let cp = db.checkpoint().map_err(rpc_err)?;
         let (synced_height, chain_tip_height, synced, blocks_behind) = match cp {
             Some(c) => {
@@ -195,12 +151,13 @@ impl ZnsApiServer for RpcContext {
             }
             None => (0, 0, false, 0),
         };
+        let uivk = db.registry_uivk().map_err(rpc_err)?.unwrap_or_default();
         Ok(StatusResult {
             synced_height,
             chain_tip_height,
             synced,
             blocks_behind,
-            uivk: self.uivk.clone(),
+            uivk,
             registered: db.name_count().map_err(rpc_err)?,
             admin_pubkey: String::new(),
             listed: 0,
@@ -232,7 +189,7 @@ impl ZnsApiServer for RpcContext {
             Some(some) => some,
             None => None,
         };
-        let db = open_for_rpc(&self.db)?;
+        let db = open_for_rpc(self)?;
         let limit = limit.unwrap_or(50).min(500) as u32;
         let offset = offset.unwrap_or(0) as u32;
         let since = since_height.map(|h| h.min(u32::MAX as u64) as u32);
@@ -245,44 +202,6 @@ impl ZnsApiServer for RpcContext {
             total,
         })
     }
-}
-
-/// Proof links cover the current ownership segment: from the latest claim forward.
-/// Earlier claim/update/release chains are historical only.
-fn current_segment(rows: &[Event]) -> &[Event] {
-    let start = rows
-        .iter()
-        .rposition(|r| r.action == Action::Claim)
-        .unwrap_or(0);
-    &rows[start..]
-}
-
-fn proof_links(db: &Db, rows: &[Event]) -> RpcResult<Vec<ProofLinkEntry>> {
-    rows.iter()
-        .map(|r| {
-            let m = db
-                .proof_material(&r.txid)
-                .map_err(rpc_err)?
-                .ok_or_else(|| {
-                    ErrorObjectOwned::owned(
-                        -32011,
-                        "proof material unavailable (zebrad RPC not configured)",
-                        None::<()>,
-                    )
-                })?;
-            Ok(ProofLinkEntry {
-                action: String::from_utf8(r.action.as_bytes().to_vec()).expect("ascii"),
-                ua: r.ua.clone(),
-                height: r.height as u64,
-                txid: hex::encode(r.txid),
-                action_index: r.action_index as u64,
-                tx: hex::encode(&m.raw_tx),
-                header: hex::encode(&m.header),
-                merkle_branch: m.merkle_branch.iter().map(hex::encode).collect(),
-                merkle_index: m.merkle_index as u64,
-            })
-        })
-        .collect()
 }
 
 fn entry(r: Registration) -> RegistrationEntry {
@@ -344,9 +263,9 @@ fn rpc_err(e: impl std::fmt::Display) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(-32603, "Internal error", None::<()>)
 }
 
-pub(crate) async fn serve_rpc(addr: &str, ctx: RpcContext) -> Result<()> {
+pub(crate) async fn serve_rpc(addr: &str, db: PathBuf) -> Result<()> {
     let server = Server::builder().build(addr).await?;
-    let handle = server.start(ctx.into_rpc());
+    let handle = server.start(db.into_rpc());
     tracing::info!("JSON-RPC listening on {addr}");
     handle.stopped().await;
     Ok(())
