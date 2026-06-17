@@ -81,8 +81,8 @@ CREATE TABLE IF NOT EXISTS proof_material (
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
-/// Ephemeral `(height, hash)` — live tip from watcher or scan seam; not persisted.
-pub(crate) type BlockPos = (u32, Option<[u8; 32]>);
+/// Ephemeral scan `(height, hash)` — live tip from watcher or batch end before commit.
+pub(crate) type Cursor = (u32, Option<[u8; 32]>);
 
 /// Persisted `scan_state` row.
 pub(crate) struct Checkpoint {
@@ -230,8 +230,8 @@ impl Db {
     pub(crate) fn apply_batch(
         &self,
         network: &impl Parameters,
-        scanned: BlockPos,
-        live: BlockPos,
+        scanned: Cursor,
+        live: Cursor,
         decrypted: &[DecryptedNote],
     ) -> rusqlite::Result<Vec<NameNote>> {
         let tx = self.conn.unchecked_transaction()?;

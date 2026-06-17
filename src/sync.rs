@@ -16,7 +16,7 @@ use zcash_primitives::block::BlockHeader;
 use zcash_protocol::consensus::Network;
 use zns_verify::proof::{merkle_branch, verify_link_inclusion};
 
-use crate::names::{BlockPos, Db, NameNote};
+use crate::names::{Cursor, Db, NameNote};
 use crate::orchard::observe_batch;
 
 pub(crate) const RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -161,7 +161,7 @@ async fn materialize_proofs(
 // ── tip watcher ───────────────────────────────────────────────────────────────
 
 /// Polls lightwalletd for the chain tip and notifies the sync worker when it moves.
-pub(crate) async fn run_tip_watcher(url: &'static str, interval: Duration, tx: watch::Sender<BlockPos>) {
+pub(crate) async fn run_tip_watcher(url: &'static str, interval: Duration, tx: watch::Sender<Cursor>) {
     loop {
         match chain::connect(url).await {
             Ok(mut client) => match chain::tip(&mut client).await {
@@ -183,7 +183,7 @@ pub(crate) async fn run_sync_loop(
     scan_birthday: u32,
     ivk: PreparedIncomingViewingKey,
     zebrad: Option<ZebradClient>,
-    mut tip_rx: watch::Receiver<BlockPos>,
+    mut tip_rx: watch::Receiver<Cursor>,
 ) {
     let mut rewind_by = 1u32;
 

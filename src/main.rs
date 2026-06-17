@@ -27,7 +27,7 @@ use tokio::sync::watch;
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
-use jsonrpc::serve_rpc;
+use jsonrpc::{serve_rpc, RpcContext};
 use names::Db;
 
 /// Registry **incoming viewing key** (UIVK).
@@ -62,9 +62,12 @@ async fn main() {
     }
 
     let rpc_addr = RPC_ADDR.to_string();
-    let rpc_db = db_path.clone();
+    let rpc_ctx = RpcContext {
+        db: db_path,
+        uivk: UIVK.to_string(),
+    };
     tokio::spawn(async move {
-        if let Err(e) = serve_rpc(&rpc_addr, rpc_db).await {
+        if let Err(e) = serve_rpc(&rpc_addr, rpc_ctx).await {
             eprintln!("rpc: {e}");
         }
     });
