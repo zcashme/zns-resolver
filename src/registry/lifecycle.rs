@@ -1,12 +1,4 @@
-//! Memo parsing and admission control for name lifecycle events.
-//!
-//! Per the trust model: the memo is untrusted narration. The binding
-//! (ψ, rcm) → cmx is what actually authorizes a name transition.
-//!
-//! Ingest flow inside `apply_batch`:
-//!   lifecycle_claim_from_memo → candidate (untrusted)
-//!   try_admit_name_note        → transition check + binding check
-//! Only success from the second step results in an indexed row.
+//! Memo parsing and admission control for ZNS name lifecycle events.
 
 use zcash_protocol::consensus::Parameters;
 use zns_verify::{chain::prev_rcm_for, parse_memo_validated, Action, ParsedMemo, Tip};
@@ -23,7 +15,10 @@ pub(super) struct LifecycleClaim {
 }
 
 /// Extract indexing claims from memo. Does not admit a name note (see [`try_admit_name_note`]).
-pub(super) fn lifecycle_claim_from_memo(memo: &[u8], network: &impl Parameters) -> Option<LifecycleClaim> {
+pub(super) fn lifecycle_claim_from_memo(
+    memo: &[u8],
+    network: &impl Parameters,
+) -> Option<LifecycleClaim> {
     let Ok(ParsedMemo::Lifecycle {
         action,
         name,
@@ -69,15 +64,7 @@ pub(super) fn warn_registry_fork(claim: &LifecycleClaim, n: &DecryptedNote, tip:
     };
     let Some(claimed) = claim.memo_prev_rcm.filter(|p| {
         *p != prev_rcm
-            && verify_binding(
-                &n.note,
-                n.cmx,
-                claim.action,
-                &claim.name,
-                &claim.ua,
-                p,
-            )
-            .is_some()
+            && verify_binding(&n.note, n.cmx, claim.action, &claim.name, &claim.ua, p).is_some()
     }) else {
         return;
     };

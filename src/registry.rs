@@ -3,8 +3,8 @@
 //! `registry_account` stores the UIVK + the network + scan birthday used to initialize.
 //!
 //! All SQLite I/O runs on one dedicated thread. [`Registry`] is a cloneable handle.
-//! The transactional core lives in `core`, the actor surface in `handle`,
-//! the durable schema description in `storage`, and read queries in `queries`.
+//! The transactional core (including all reads and writes) lives in `core`,
+//! the actor surface in `handle`, and the durable schema description in `storage`.
 //!
 //! Key invariants are documented and enforced in `core.rs`:
 //! - apply_batch + names updates + checkpoint advance happen in a single transaction.
@@ -17,7 +17,6 @@ use zns_verify::Action;
 mod core;
 mod handle;
 mod lifecycle;
-mod queries;
 mod storage;
 
 // The main public (pub(crate)) surface for the rest of the crate.

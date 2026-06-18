@@ -1,8 +1,4 @@
 //! Actor handle for the registry.
-//!
-//! `Registry` is a cheap Clone handle. All work is sent over a channel
-//! to a dedicated thread that owns the DB connection (`core::DbConn`).
-//! This enforces the single-writer-thread invariant.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -12,9 +8,7 @@ use rusqlite;
 use zcash_protocol::consensus::Network;
 
 use super::core;
-use super::{
-    Checkpoint, Cursor, Event, NameNote, Registration, RegistryError,
-};
+use super::{Checkpoint, Cursor, Event, NameNote, Registration, RegistryError};
 use crate::orchard::DecryptedNote;
 use zns_verify::Action;
 
@@ -91,15 +85,13 @@ impl Registry {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (op_tx, op_rx) = mpsc::sync_channel(QUEUE_CAP);
 
-        let join = std::thread::spawn(move || {
-            match core::DbConn::open(&path) {
-                Ok(mut db) => {
-                    let _ = ready_tx.send(Ok(()));
-                    run_db_thread(&mut db, op_rx);
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                }
+        let join = std::thread::spawn(move || match core::DbConn::open(&path) {
+            Ok(mut db) => {
+                let _ = ready_tx.send(Ok(()));
+                run_db_thread(&mut db, op_rx);
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
             }
         });
 
@@ -156,7 +148,11 @@ impl Registry {
         recv_db_reply(rx)
     }
 
-    pub(crate) fn rewind(&self, fork_height: u32, scanned_height: u32) -> Result<(), RegistryError> {
+    pub(crate) fn rewind(
+        &self,
+        fork_height: u32,
+        scanned_height: u32,
+    ) -> Result<(), RegistryError> {
         let (reply, rx) = mpsc::channel();
         self.tx
             .send(Op::Rewind {
@@ -184,7 +180,10 @@ impl Registry {
         recv_db_reply(rx)
     }
 
-    pub(crate) fn resolve_by_name(&self, name: &str) -> Result<Option<Registration>, RegistryError> {
+    pub(crate) fn resolve_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<Registration>, RegistryError> {
         let (reply, rx) = mpsc::channel();
         self.tx
             .send(Op::ResolveByName {
@@ -264,7 +263,12 @@ fn run_db_thread(db: &mut core::DbConn, rx: Receiver<Op>) {
     while let Ok(op) = rx.recv() {
         match op {
             Op::Shutdown => break,
-            Op::InstallRegistryConfig { uivk, network, birthday, reply } => {
+            Op::InstallRegistryConfig {
+                uivk,
+                network,
+                birthday,
+                reply,
+            } => {
                 let _ = reply.send(db.install_registry_config(&uivk, &network, birthday));
             }
             Op::ApplyBatch {

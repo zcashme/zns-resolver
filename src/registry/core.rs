@@ -1,17 +1,4 @@
 //! Transactional core of the registry.
-//!
-//! This module owns `DbConn` and all logic that must execute inside
-//! SQLite transactions. The key invariants live here:
-//!
-//! - apply_batch: all admitted events + names updates + checkpoint written
-//!   in ONE transaction, then commit. Checkpoint must not advance without
-//!   the events.
-//! - name_tip_in_tx sees uncommitted writes from the current batch (for
-//!   correct prev_rcm chaining within the batch).
-//! - rewind + rebuild_name_tip run in the same tx; rebuild must produce
-//!   the same projection as the normal ingest path.
-//!
-//! Only the dedicated writer thread (in handle) calls into this.
 
 use std::path::Path;
 
@@ -20,10 +7,10 @@ use zcash_protocol::consensus::Parameters;
 
 use zns_verify::{Action, Tip};
 
-use super::storage;
-use super::{Checkpoint, Cursor, NameNote, Registration, Event};  // types live in parent for now
-use crate::orchard::DecryptedNote;
 use super::lifecycle;
+use super::storage;
+use super::{Checkpoint, Cursor, Event, NameNote, Registration}; // types live in parent for now
+use crate::orchard::DecryptedNote;
 
 const REORG_SHALLOW_MAX: u32 = 30;
 
@@ -117,7 +104,8 @@ impl DbConn {
         let mut indexed = Vec::new();
 
         for n in decrypted {
-            let Some(claim) = lifecycle::lifecycle_claim_from_memo(n.memo.as_slice(), network) else {
+            let Some(claim) = lifecycle::lifecycle_claim_from_memo(n.memo.as_slice(), network)
+            else {
                 continue;
             };
 
@@ -269,7 +257,11 @@ impl DbConn {
         Ok(rows)
     }
 
-    pub(super) fn list_registrations(&self, limit: u32, offset: u32) -> rusqlite::Result<Vec<Registration>> {
+    pub(super) fn list_registrations(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> rusqlite::Result<Vec<Registration>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, ua, txid, height, action FROM names ORDER BY name LIMIT ?1 OFFSET ?2",
         )?;
@@ -322,11 +314,7 @@ impl DbConn {
 
     // --- helpers that must be called inside a transaction ---
 
-    fn name_tip_in_tx(
-        &self,
-        tx: &Transaction<'_>,
-        name: &str,
-    ) -> rusqlite::Result<Option<Tip>> {
+    fn name_tip_in_tx(&self, tx: &Transaction<'_>, name: &str) -> rusqlite::Result<Option<Tip>> {
         tx.query_row(
             "SELECT action, rcm FROM names WHERE name = ?1",
             params![name],

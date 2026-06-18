@@ -1,11 +1,5 @@
 //! Durable representation of the ZNS name index.
 //
-// The structure captures:
-//   name_events  — append-only per-name chain of binding-verified transitions
-//   names        — materialized current tip per name (for resolution + reorg rebuild)
-//
-// scan_state provides resumability ("checkpoint after commit").
-// registry_account holds the inbox viewing key, network, and scan birthday.
 
 /// The SQL to create the name index tables (and supporting state).
 pub(super) const SCHEMA_SQL: &str = r#"
