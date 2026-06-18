@@ -4,62 +4,61 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use orchard::keys::PreparedIncomingViewingKey;
-use seer_sync::chain::{self, ChainError, DEFAULT_CHUNK_OUTPUTS};
+use seer_sync::chain::{self, ChainError, LwdClient, DEFAULT_CHUNK_OUTPUTS};
 use seer_sync::BlockHash;
-use tokio::sync::watch;
 use zcash_protocol::consensus::Network;
 
-use crate::registry::{Cursor, Registry};
 use crate::orchard::observe_batch;
+use crate::registry::{Cursor, Registry};
 
 pub(crate) const RETRY_DELAY: Duration = Duration::from_secs(5);
-pub(crate) const TIP_WATCH_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const TIP_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Owned lightwalletd URL — pass a clone into tasks; RPC via `seer_sync::chain`.
-#[derive(Clone)]
-pub(crate) struct LwdSession(String);
+/// Connected lightwalletd client
+struct Lwd(LwdClient);
 
-impl LwdSession {
-    pub(crate) fn new(url: String) -> Self {
-        Self(url)
+impl Lwd {
+    async fn connect(url: &str) -> Result<Self, ChainError> {
+        chain::connect(url).await.map(Self)
     }
 
-    pub(crate) fn url(&self) -> &str {
-        &self.0
+    async fn reconnect(&mut self, url: &str) -> Result<(), ChainError> {
+        self.0 = chain::connect(url).await?;
+        Ok(())
     }
 
-    pub(crate) async fn poll_tip(&self) -> Result<Cursor, ChainError> {
-        let mut client = chain::connect(self.url()).await?;
-        chain::tip(&mut client).await
+    fn fork(&self) -> LwdClient {
+        self.0.clone()
     }
 }
 
-/// Polls lightwalletd for the chain tip and notifies the sync worker when it moves.
-pub(crate) async fn run_tip_watcher(
-    session: LwdSession,
-    interval: Duration,
-    tip_sender: watch::Sender<Cursor>,
-) {
+async fn wait_until_caught_up(lwd: &mut Lwd, start: u32) -> Result<Cursor, ChainError> {
     loop {
-        match session.poll_tip().await {
-            Ok(tip) => {
-                let _ = tip_sender.send(tip);
-            }
-            Err(e) => tracing::warn!(error = %e, "tip poll failed"),
+        let live = chain::tip(&mut lwd.0).await?;
+        if live.0 != 0 && start <= live.0 {
+            return Ok(live);
         }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(TIP_POLL_INTERVAL).await;
     }
 }
 
 pub(crate) async fn run_sync_loop(
-    session: LwdSession,
+    lightwalletd: &'static str,
     registry: Registry,
     network: Network,
     scan_birthday: u32,
     ivk: PreparedIncomingViewingKey,
-    mut tip_rx: watch::Receiver<Cursor>,
 ) {
     let mut rewind_by = 1u32;
+    let mut lwd = loop {
+        match Lwd::connect(lightwalletd).await {
+            Ok(s) => break s,
+            Err(e) => {
+                tracing::warn!(error = %e, "lightwalletd connect failed");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    };
 
     loop {
         let checkpoint = match registry.checkpoint() {
@@ -71,18 +70,16 @@ pub(crate) async fn run_sync_loop(
             }
         };
 
-        let client = match chain::connect(session.url()).await {
-            Ok(c) => c,
+        let live = match chain::tip(&mut lwd.0).await {
+            Ok(tip) => tip,
             Err(e) => {
-                tracing::warn!(error = %e, "lightwalletd connect failed");
-                tokio::time::sleep(RETRY_DELAY).await;
+                tracing::warn!(error = %e, "tip poll failed");
+                if lwd.reconnect(lightwalletd).await.is_err() {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
                 continue;
             }
         };
-
-        let mut fetch_client = client.clone();
-
-        let live = *tip_rx.borrow_and_update();
 
         let (start, seam) = match checkpoint {
             Some(c) => (
@@ -92,15 +89,22 @@ pub(crate) async fn run_sync_loop(
             None => (scan_birthday, None),
         };
 
-        if live.0 == 0 || start > live.0 {
-            if tip_rx.changed().await.is_err() {
-                tracing::error!("tip watcher stopped");
-                break;
+        let live = if live.0 == 0 || start > live.0 {
+            match wait_until_caught_up(&mut lwd, start).await {
+                Ok(tip) => tip,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tip wait failed");
+                    let _ = lwd.reconnect(lightwalletd).await;
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
             }
-            continue;
-        }
+        } else {
+            live
+        };
 
-        let mut stream = chain::blocks(client, start, live.0, DEFAULT_CHUNK_OUTPUTS, seam);
+        let mut fetch_client = lwd.fork();
+        let mut stream = chain::blocks(lwd.fork(), start, live.0, DEFAULT_CHUNK_OUTPUTS, seam);
 
         loop {
             match stream.next().await {
@@ -110,7 +114,15 @@ pub(crate) async fn run_sync_loop(
                         continue;
                     };
                     let scanned = (last.height as u32, last.hash[..].try_into().ok());
-                    let live = *tip_rx.borrow_and_update();
+
+                    let live = match chain::tip(&mut lwd.0).await {
+                        Ok(tip) => tip,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "tip poll failed during sync");
+                            let _ = lwd.reconnect(lightwalletd).await;
+                            break;
+                        }
+                    };
 
                     match observe_batch(&mut fetch_client, &network, &ivk, &batch).await {
                         Ok(decrypted) => {
@@ -134,6 +146,7 @@ pub(crate) async fn run_sync_loop(
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "observe batch failed");
+                            let _ = lwd.reconnect(lightwalletd).await;
                             break;
                         }
                     }
@@ -155,6 +168,7 @@ pub(crate) async fn run_sync_loop(
                 }
                 Some(Err(e)) => {
                     tracing::warn!(error = %e, "block stream failed");
+                    let _ = lwd.reconnect(lightwalletd).await;
                     break;
                 }
             }

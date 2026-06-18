@@ -6,15 +6,14 @@
 //!
 
 mod jsonrpc;
-mod registry;
 mod orchard;
+mod registry;
 mod sync;
 
 use std::path::PathBuf;
 
 use orchard::orchard_ivk;
-use sync::{run_sync_loop, run_tip_watcher, LwdSession, TIP_WATCH_INTERVAL};
-use tokio::sync::watch;
+use sync::run_sync_loop;
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
@@ -54,18 +53,13 @@ async fn main() {
         }
     });
 
-    let (tip_tx, tip_rx) = watch::channel((0, None));
-    let lwd = LwdSession::new(LIGHTWALLETD.to_string());
-    tokio::spawn(run_tip_watcher(lwd.clone(), TIP_WATCH_INTERVAL, tip_tx));
-
     tokio::select! {
         () = run_sync_loop(
-            lwd,
+            LIGHTWALLETD,
             registry.clone(),
             NETWORK,
             SCAN_BIRTHDAY,
             ivk,
-            tip_rx,
         ) => {}
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutdown requested");
