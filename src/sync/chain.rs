@@ -8,6 +8,18 @@ use crate::registry::Cursor;
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 
+async fn connect_with_retry(url: &'static str, what: &str) -> LwdClient {
+    loop {
+        match chain::connect(url).await {
+            Ok(client) => return client,
+            Err(e) => {
+                tracing::warn!(error = %e, "lightwalletd {what} failed");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
 pub(crate) struct Lwd {
     client: LwdClient,
     url: &'static str,
@@ -15,30 +27,12 @@ pub(crate) struct Lwd {
 
 impl Lwd {
     pub(crate) async fn connect(url: &'static str) -> Self {
-        loop {
-            match chain::connect(url).await {
-                Ok(client) => return Self { client, url },
-                Err(e) => {
-                    tracing::warn!(error = %e, "lightwalletd connect failed");
-                    tokio::time::sleep(RETRY_DELAY).await;
-                }
-            }
-        }
+        let client = connect_with_retry(url, "connect").await;
+        Self { client, url }
     }
 
     pub(crate) async fn reconnect(&mut self) {
-        loop {
-            match chain::connect(self.url).await {
-                Ok(client) => {
-                    self.client = client;
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "lightwalletd reconnect failed");
-                    tokio::time::sleep(RETRY_DELAY).await;
-                }
-            }
-        }
+        self.client = connect_with_retry(self.url, "reconnect").await;
     }
 
     pub(crate) fn fork(&self) -> LwdClient {
