@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use rusqlite;
@@ -10,6 +11,7 @@ use zcash_protocol::consensus::Network;
 use super::core;
 use super::{Checkpoint, Cursor, Event, NameNote, Registration, RegistryError};
 use crate::orchard::DecryptedNote;
+use crate::sync::SyncStatus;
 use zns_verify::Action;
 
 const QUEUE_CAP: usize = 256;
@@ -18,6 +20,7 @@ const QUEUE_CAP: usize = 256;
 #[derive(Clone)]
 pub(crate) struct Registry {
     tx: SyncSender<Op>,
+    sync_status: Arc<Mutex<SyncStatus>>,
 }
 
 enum Op {
@@ -96,7 +99,13 @@ impl Registry {
         });
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok((Registry { tx: op_tx }, join)),
+            Ok(Ok(())) => Ok((
+                Registry {
+                    tx: op_tx,
+                    sync_status: Arc::new(Mutex::new(SyncStatus::default())),
+                },
+                join,
+            )),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
@@ -107,6 +116,19 @@ impl Registry {
 
     pub(crate) fn shutdown(&self) {
         let _ = self.tx.send(Op::Shutdown);
+    }
+
+    pub(crate) fn set_sync_status(&self, status: SyncStatus) {
+        if let Ok(mut guard) = self.sync_status.lock() {
+            *guard = status;
+        }
+    }
+
+    pub(crate) fn sync_status(&self) -> SyncStatus {
+        self.sync_status
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn install_registry_config(

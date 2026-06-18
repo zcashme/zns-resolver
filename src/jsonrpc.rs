@@ -33,6 +33,10 @@ pub struct StatusResult {
     chain_tip_height: u64,
     synced: bool,
     blocks_behind: u64,
+    scanning: bool,
+    scan_scanned_height: u64,
+    scan_tip_height: u64,
+    last_error: Option<String>,
     uivk: String,
     registered: u64,
     admin_pubkey: String,
@@ -72,12 +76,7 @@ pub struct EventsResult {
 trait ZnsApi {
     /// Lookup by name (exact), UA prefix (reverse lookup), or list all if query empty.
     #[method(name = "resolve", blocking)]
-    fn resolve(
-        &self,
-        query: String,
-        limit: Option<u64>,
-        offset: Option<u64>,
-    ) -> RpcResult<Value>;
+    fn resolve(&self, query: String, limit: Option<u64>, offset: Option<u64>) -> RpcResult<Value>;
 
     /// Sync progress: scanned height vs chain tip, registration count.
     #[method(name = "status", blocking)]
@@ -100,12 +99,7 @@ trait ZnsApi {
 }
 
 impl ZnsApiServer for Registry {
-    fn resolve(
-        &self,
-        query: String,
-        limit: Option<u64>,
-        offset: Option<u64>,
-    ) -> RpcResult<Value> {
+    fn resolve(&self, query: String, limit: Option<u64>, offset: Option<u64>) -> RpcResult<Value> {
         let limit = limit.unwrap_or(50).min(500) as u32;
         let offset = offset.unwrap_or(0) as u32;
 
@@ -147,11 +141,16 @@ impl ZnsApiServer for Registry {
             None => (0, 0, false, 0),
         };
         let uivk = self.registry_uivk().map_err(rpc_err)?.unwrap_or_default();
+        let sync_status = self.sync_status();
         Ok(StatusResult {
             synced_height,
             chain_tip_height,
             synced,
             blocks_behind,
+            scanning: sync_status.scanning,
+            scan_scanned_height: sync_status.scanned_height as u64,
+            scan_tip_height: sync_status.tip_height as u64,
+            last_error: sync_status.last_error,
             uivk,
             registered: self.name_count().map_err(rpc_err)?,
             admin_pubkey: String::new(),
