@@ -45,7 +45,7 @@ pub(crate) async fn run_tip_watcher(
             Ok(tip) => {
                 let _ = tip_sender.send(tip);
             }
-            Err(e) => eprintln!("tip watcher: {e}"),
+            Err(e) => tracing::warn!(error = %e, "tip poll failed"),
         }
         tokio::time::sleep(interval).await;
     }
