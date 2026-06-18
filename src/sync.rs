@@ -38,12 +38,12 @@ impl LwdSession {
 pub(crate) async fn run_tip_watcher(
     session: LwdSession,
     interval: Duration,
-    tx: watch::Sender<Cursor>,
+    tip_sender: watch::Sender<Cursor>,
 ) {
     loop {
         match session.poll_tip().await {
             Ok(tip) => {
-                let _ = tx.send(tip);
+                let _ = tip_sender.send(tip);
             }
             Err(e) => eprintln!("tip watcher: {e}"),
         }
