@@ -1,12 +1,8 @@
 //! Thin wrapper around the lightwalletd client.
 
-use std::time::Duration;
-
 use seer_sync::chain::{self, ChainError, LwdClient};
 
 use crate::registry::Cursor;
-
-const RETRY_DELAY: Duration = Duration::from_secs(5);
 
 async fn connect_with_retry(url: &'static str, what: &str) -> LwdClient {
     loop {
@@ -14,7 +10,6 @@ async fn connect_with_retry(url: &'static str, what: &str) -> LwdClient {
             Ok(client) => return client,
             Err(e) => {
                 tracing::warn!(error = %e, "lightwalletd {what} failed");
-                tokio::time::sleep(RETRY_DELAY).await;
             }
         }
     }

@@ -15,7 +15,6 @@ use crate::sync::chain::Lwd;
 use crate::sync::status::SyncStatus;
 
 const TIP_POLL_INTERVAL: Duration = Duration::from_secs(10);
-const RETRY_DELAY: Duration = Duration::from_secs(5);
 const REORG_REWIND_INITIAL: u32 = 1;
 
 pub(crate) async fn run_sync_loop(
@@ -34,7 +33,6 @@ pub(crate) async fn run_sync_loop(
             Err(e) => {
                 tracing::warn!(error = %e, "checkpoint read failed");
                 registry.set_sync_status(SyncStatus::error("checkpoint read failed"));
-                tokio::time::sleep(RETRY_DELAY).await;
                 continue;
             }
         };
@@ -88,7 +86,6 @@ pub(crate) async fn run_sync_loop(
             RangeOutcome::Reconnect => {
                 registry.set_sync_status(SyncStatus::error("block stream failed, reconnecting"));
                 lwd.reconnect().await;
-                tokio::time::sleep(RETRY_DELAY).await;
             }
         }
     }
