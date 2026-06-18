@@ -1,8 +1,10 @@
 //! # ZNS resolver
 //!
 //! Zcash Names binds human-readable names to Orchard shielded addresses via note
-//! commitments on chain. This binary watches the registry inbox, verifies bindings,
-//! indexes name tips, and serves JSON-RPC.
+//! commitments on chain.
+//!
+//! The ZNS Resolver watches the registry inbox, verifies bindings,
+//! indexes name tips, and serves names using a JSON-RPC HTTP API.
 //!
 
 mod jsonrpc;
@@ -24,7 +26,7 @@ use registry::Registry;
 const UIVK: &str = "uivktest18a7ht78cymvm3sxdw9myrr04nrnj8nvrqdjhadj8dp3cv8pm2dqszuxnjrjyp6xyf0svtzjxnq3976l5sxzd09mmx9g6sj9xpp67ympwsrv6wen5ye25jhvq0l8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8jja5vlzday32pgq4cccqd2rjvtlsfnn9lne9cchrcfgn87jlx9";
 const NETWORK: Network = Network::TestNetwork;
 const LIGHTWALLETD: &str = "https://testnet.zec.rocks:443";
-const DB_PATH: &str = "zns-resolver.sqlite";
+const DB_PATH: &str = "zns.sqlite";
 const RPC_ADDR: &str = "127.0.0.1:8080";
 const SCAN_BIRTHDAY: u32 = 4_000_000;
 

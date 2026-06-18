@@ -1,16 +1,4 @@
-//! ZNS name index in SQLite (`registry_account`, `scan_state`, `name_events`, `names`).
-//!
-//! `registry_account` stores the UIVK + the network + scan birthday used to initialize.
-//!
-//! All SQLite I/O runs on one dedicated thread. [`Registry`] is a cloneable handle.
-//! The transactional core (including all reads and writes) lives in `core`,
-//! the actor surface in `handle`, and the durable schema description in `storage`.
-//!
-//! Key invariants are documented and enforced in `core.rs`:
-//! - apply_batch + names updates + checkpoint advance happen in a single transaction.
-//! - The binding gate in `lifecycle` is the precise point at which a candidate
-//!   becomes recorded (graduation).
-//! - `names` is a derived projection of the latest non-release event per name.
+//! ZNS name index in SQLite
 
 use zns_verify::Action;
 
@@ -23,9 +11,6 @@ mod storage;
 pub(crate) use handle::Registry;
 
 // ── types ─────────────────────────────────────────────────────────────────────
-// These are kept in the module root (no dedicated types module) as they
-// form the documented interface between the registry and its callers
-// (sync, jsonrpc, main). This keeps the data model visible without extra files.
 
 /// Ephemeral scan `(height, hash)` — live tip from watcher or batch end before commit.
 pub(crate) type Cursor = (u32, Option<[u8; 32]>);
@@ -39,8 +24,6 @@ pub(crate) struct Checkpoint {
 }
 
 /// A verified ZNS name note: Transition + Binding passed for one decrypted note.
-/// This is the internal result of successful admission. Primarily used
-/// by the caller to count how many names were indexed from a batch.
 pub(crate) struct NameNote {
     pub(crate) name: String,
     pub(crate) ua: String,

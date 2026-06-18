@@ -107,8 +107,7 @@ pub(crate) async fn observe_batch(
                     e.insert(parsed);
                 }
 
-                let Some((parsed_tx, height, raw)) =
-                    fetched.get(&txid).and_then(|o| o.as_ref())
+                let Some((parsed_tx, height, raw)) = fetched.get(&txid).and_then(|o| o.as_ref())
                 else {
                     continue;
                 };
