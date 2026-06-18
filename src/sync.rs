@@ -30,15 +30,9 @@ impl Lwd {
     fn fork(&self) -> LwdClient {
         self.0.clone()
     }
-}
 
-async fn wait_until_caught_up(lwd: &mut Lwd, start: u32) -> Result<Cursor, ChainError> {
-    loop {
-        let live = chain::tip(&mut lwd.0).await?;
-        if live.0 != 0 && start <= live.0 {
-            return Ok(live);
-        }
-        tokio::time::sleep(TIP_POLL_INTERVAL).await;
+    async fn tip(&mut self) -> Result<Cursor, ChainError> {
+        chain::tip(&mut self.0).await
     }
 }
 
@@ -60,23 +54,12 @@ pub(crate) async fn run_sync_loop(
         }
     };
 
-    loop {
+    'sync: loop {
         let checkpoint = match registry.checkpoint() {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "checkpoint read failed");
                 tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
-        };
-
-        let live = match chain::tip(&mut lwd.0).await {
-            Ok(tip) => tip,
-            Err(e) => {
-                tracing::warn!(error = %e, "tip poll failed");
-                if lwd.reconnect(lightwalletd).await.is_err() {
-                    tokio::time::sleep(RETRY_DELAY).await;
-                }
                 continue;
             }
         };
@@ -89,19 +72,29 @@ pub(crate) async fn run_sync_loop(
             None => (scan_birthday, None),
         };
 
-        let live = if live.0 == 0 || start > live.0 {
-            match wait_until_caught_up(&mut lwd, start).await {
+        let mut live = match lwd.tip().await {
+            Ok(tip) => tip,
+            Err(e) => {
+                tracing::warn!(error = %e, "tip poll failed");
+                if lwd.reconnect(lightwalletd).await.is_err() {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                continue;
+            }
+        };
+
+        while live.0 == 0 || start > live.0 {
+            tokio::time::sleep(TIP_POLL_INTERVAL).await;
+            live = match lwd.tip().await {
                 Ok(tip) => tip,
                 Err(e) => {
-                    tracing::warn!(error = %e, "tip wait failed");
+                    tracing::warn!(error = %e, "tip poll failed");
                     let _ = lwd.reconnect(lightwalletd).await;
                     tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
+                    continue 'sync;
                 }
-            }
-        } else {
-            live
-        };
+            };
+        }
 
         let mut fetch_client = lwd.fork();
         let mut stream = chain::blocks(lwd.fork(), start, live.0, DEFAULT_CHUNK_OUTPUTS, seam);
@@ -115,7 +108,7 @@ pub(crate) async fn run_sync_loop(
                     };
                     let scanned = (last.height as u32, last.hash[..].try_into().ok());
 
-                    let live = match chain::tip(&mut lwd.0).await {
+                    let live = match lwd.tip().await {
                         Ok(tip) => tip,
                         Err(e) => {
                             tracing::warn!(error = %e, "tip poll failed during sync");
