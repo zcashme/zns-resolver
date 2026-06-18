@@ -1,5 +1,7 @@
 //! ZNS name index in SQLite (`registry_account`, `scan_state`, `name_events`, `names`).
 //!
+//! `registry_account` stores the UIVK + the network + scan birthday used to initialize.
+//!
 //! All SQLite I/O runs on one dedicated thread. [`Registry`] is a cloneable handle;
 //! [`DbConn`] (private) owns the `Connection`.
 
@@ -97,8 +99,10 @@ pub(crate) struct Registry {
 }
 
 enum Op {
-    InstallRegistryUivk {
+    InstallRegistryConfig {
         uivk: String,
+        network: String,
+        birthday: u32,
         reply: Sender<Result<(), rusqlite::Error>>,
     },
     ApplyBatch {
@@ -189,11 +193,19 @@ impl Registry {
         let _ = self.tx.send(Op::Shutdown);
     }
 
-    pub(crate) fn install_registry_uivk(&self, uivk: &str) -> Result<(), RegistryError> {
+    pub(crate) fn install_registry_config(
+        &self,
+        uivk: &str,
+        network: Network,
+        birthday: u32,
+    ) -> Result<(), RegistryError> {
+        let net_str = network_to_str(network);
         let (reply, rx) = mpsc::channel();
         self.tx
-            .send(Op::InstallRegistryUivk {
+            .send(Op::InstallRegistryConfig {
                 uivk: uivk.to_string(),
+                network: net_str.to_string(),
+                birthday,
                 reply,
             })
             .map_err(|_| RegistryError::Disconnected)?;
@@ -328,8 +340,8 @@ fn run_db_thread(db: &mut DbConn, rx: Receiver<Op>) {
     while let Ok(op) = rx.recv() {
         match op {
             Op::Shutdown => break,
-            Op::InstallRegistryUivk { uivk, reply } => {
-                let _ = reply.send(db.install_registry_uivk(&uivk));
+            Op::InstallRegistryConfig { uivk, network, birthday, reply } => {
+                let _ = reply.send(db.install_registry_config(&uivk, &network, birthday));
             }
             Op::ApplyBatch {
                 network,
@@ -395,19 +407,37 @@ impl DbConn {
         Ok(Self { conn })
     }
 
-    fn install_registry_uivk(&self, uivk: &str) -> rusqlite::Result<()> {
-        if let Some(existing) = self.registry_uivk()? {
-            if existing != uivk {
+    fn install_registry_config(
+        &self,
+        uivk: &str,
+        network: &str,
+        birthday: u32,
+    ) -> rusqlite::Result<()> {
+        if let Some((stored_uivk, stored_net, stored_birthday)) = self.registry_config()? {
+            if stored_uivk != uivk {
                 tracing::warn!(
-                    stored = %existing,
+                    stored = %stored_uivk,
                     "registry_account uivk already set; not changing"
+                );
+            }
+            if stored_net != network {
+                tracing::warn!(
+                    stored = %stored_net,
+                    "registry_account network already set; not changing"
+                );
+            }
+            if stored_birthday != birthday as i64 {
+                tracing::warn!(
+                    stored = stored_birthday,
+                    "registry_account birthday already set; not changing"
                 );
             }
             return Ok(());
         }
+
         self.conn.execute(
-            "INSERT INTO registry_account (id, uivk) VALUES (0, ?1)",
-            params![uivk],
+            "INSERT INTO registry_account (id, uivk, network, birthday) VALUES (0, ?1, ?2, ?3)",
+            params![uivk, network, birthday as i64],
         )?;
         Ok(())
     }
@@ -418,6 +448,16 @@ impl DbConn {
                 "SELECT uivk FROM registry_account WHERE id = 0",
                 [],
                 |row| row.get(0),
+            )
+            .optional()
+    }
+
+    fn registry_config(&self) -> rusqlite::Result<Option<(String, String, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT uivk, network, birthday FROM registry_account WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
     }
@@ -853,6 +893,14 @@ fn action_str(a: Action) -> &'static str {
         Action::Claim => "claim",
         Action::Update => "update",
         Action::Release => "release",
+    }
+}
+
+fn network_to_str(network: Network) -> &'static str {
+    if network == Network::MainNetwork {
+        "main"
+    } else {
+        "test"
     }
 }
 

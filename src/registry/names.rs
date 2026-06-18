@@ -5,7 +5,7 @@
 //   names        — materialized current tip per name (for resolution + reorg rebuild)
 //
 // scan_state provides resumability ("checkpoint after commit").
-// registry_account holds the inbox viewing key.
+// registry_account holds the inbox viewing key, network, and scan birthday.
 
 /// The SQL to create the name index tables (and supporting state).
 pub(super) const SCHEMA_SQL: &str = r#"
@@ -14,8 +14,10 @@ PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS registry_account (
-    id   INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
-    uivk TEXT    NOT NULL
+    id       INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+    uivk     TEXT    NOT NULL,
+    network  TEXT    NOT NULL,
+    birthday INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS scan_state (

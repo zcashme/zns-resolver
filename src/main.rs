@@ -40,10 +40,12 @@ async fn main() {
         tracing::error!(error = %e, "registry database failed to open");
         std::process::exit(1);
     });
-    registry.install_registry_uivk(UIVK).unwrap_or_else(|e| {
-        tracing::error!(error = %e, "registry_account uivk install failed");
-        std::process::exit(1);
-    });
+    registry
+        .install_registry_config(UIVK, NETWORK, SCAN_BIRTHDAY)
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "registry_account config install failed");
+            std::process::exit(1);
+        });
 
     let rpc_addr = RPC_ADDR.to_string();
     let rpc_registry = registry.clone();
