@@ -1,7 +1,5 @@
 //! JSON-RPC read API
 
-use std::path::{Path, PathBuf};
-
 use anyhow::Result;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
@@ -11,12 +9,11 @@ use serde::Serialize;
 use serde_json::Value;
 use zns_verify::Action;
 
-use crate::registry::{Db, Event, Registration};
+use crate::registry::{Event, Registration, Registry};
 
-// ── JSON-RPC (thin consumer API) ──────────────────────────────────────────────
+// ── JSON-RPC ──────────────────────────────────────────────────────────────────
 //
-// Handlers open a read-only DB handle per request. No crypto here — just serving
-// what the indexer already verified.
+// Handlers use [`Registry`] (queued reads on the DB thread). No crypto here.
 
 #[derive(Debug, Clone, Serialize)]
 struct RegistrationEntry {
@@ -102,33 +99,31 @@ trait ZnsApi {
     ) -> RpcResult<EventsResult>;
 }
 
-impl ZnsApiServer for PathBuf {
+impl ZnsApiServer for Registry {
     fn resolve(
         &self,
         query: String,
         limit: Option<u64>,
         offset: Option<u64>,
     ) -> RpcResult<Value> {
-        let db = open_for_rpc(self)?;
         let limit = limit.unwrap_or(50).min(500) as u32;
         let offset = offset.unwrap_or(0) as u32;
 
         let value = if query.is_empty() {
-            entries(db.list_registrations(limit, offset).map_err(rpc_err)?)
-        } else if let Some(reg) = db.resolve_by_name(&query).map_err(rpc_err)? {
-            serde_json::to_value(entry(reg)).unwrap()
+            entries(self.list_registrations(limit, offset).map_err(rpc_err)?)?
+        } else if let Some(reg) = self.resolve_by_name(&query).map_err(rpc_err)? {
+            serde_json::to_value(entry(reg)).map_err(rpc_err)?
         } else {
             entries(
-                db.registrations_by_ua(&query, limit, offset)
+                self.registrations_by_ua(&query, limit, offset)
                     .map_err(rpc_err)?,
-            )
+            )?
         };
         Ok(value)
     }
 
     fn status(&self) -> RpcResult<StatusResult> {
-        let db = open_for_rpc(self)?;
-        let cp = db.checkpoint().map_err(rpc_err)?;
+        let cp = self.checkpoint().map_err(rpc_err)?;
         let (synced_height, chain_tip_height, synced, blocks_behind) = match cp {
             Some(c) => {
                 let synced_height = c.scanned_height as u64;
@@ -151,14 +146,14 @@ impl ZnsApiServer for PathBuf {
             }
             None => (0, 0, false, 0),
         };
-        let uivk = db.registry_uivk().map_err(rpc_err)?.unwrap_or_default();
+        let uivk = self.registry_uivk().map_err(rpc_err)?.unwrap_or_default();
         Ok(StatusResult {
             synced_height,
             chain_tip_height,
             synced,
             blocks_behind,
             uivk,
-            registered: db.name_count().map_err(rpc_err)?,
+            registered: self.name_count().map_err(rpc_err)?,
             admin_pubkey: String::new(),
             listed: 0,
         })
@@ -189,12 +184,11 @@ impl ZnsApiServer for PathBuf {
             Some(some) => some,
             None => None,
         };
-        let db = open_for_rpc(self)?;
         let limit = limit.unwrap_or(50).min(500) as u32;
         let offset = offset.unwrap_or(0) as u32;
         let since = since_height.map(|h| h.min(u32::MAX as u64) as u32);
 
-        let (events, total) = db
+        let (events, total) = self
             .events(name.as_deref(), action, since, limit, offset)
             .map_err(rpc_err)?;
         Ok(EventsResult {
@@ -217,8 +211,8 @@ fn entry(r: Registration) -> RegistrationEntry {
     }
 }
 
-fn entries(regs: Vec<Registration>) -> Value {
-    serde_json::to_value(regs.into_iter().map(entry).collect::<Vec<_>>()).unwrap()
+fn entries(regs: Vec<Registration>) -> RpcResult<Value> {
+    Ok(serde_json::to_value(regs.into_iter().map(entry).collect::<Vec<_>>()).map_err(rpc_err)?)
 }
 
 fn event_entry(e: Event) -> EventEntry {
@@ -254,18 +248,14 @@ fn parse_action_filter(s: &str) -> Option<Action> {
     }
 }
 
-fn open_for_rpc(db: &Path) -> RpcResult<Db> {
-    Db::open_for_rpc(db).map_err(rpc_err)
-}
-
 fn rpc_err(e: impl std::fmt::Display) -> ErrorObjectOwned {
-    tracing::error!("rpc: {e}");
+    tracing::error!(error = %e, "rpc handler failed");
     ErrorObjectOwned::owned(-32603, "Internal error", None::<()>)
 }
 
-pub(crate) async fn serve_rpc(addr: &str, db: PathBuf) -> Result<()> {
+pub(crate) async fn serve_rpc(addr: &str, registry: Registry) -> Result<()> {
     let server = Server::builder().build(addr).await?;
-    let handle = server.start(db.into_rpc());
+    let handle = server.start(registry.into_rpc());
     tracing::info!("JSON-RPC listening on {addr}");
     handle.stopped().await;
     Ok(())

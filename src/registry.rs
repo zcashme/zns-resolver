@@ -1,17 +1,21 @@
 //! ZNS name index in SQLite (`registry_account`, `scan_state`, `name_events`, `names`).
+//!
+//! All SQLite I/O runs on one dedicated thread. [`Registry`] is a cloneable handle;
+//! [`DbConn`] (private) owns the `Connection`.
 
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::thread::JoinHandle;
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
-use zcash_protocol::consensus::Parameters;
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use zcash_protocol::consensus::{Network, Parameters};
 use zns_verify::{
     chain::prev_rcm_for, parse_memo_validated, Action, ParsedMemo, Tip,
 };
 
 use crate::orchard::{verify_binding, DecryptedNote};
 
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const QUEUE_CAP: usize = 256;
 const REORG_SHALLOW_MAX: u32 = 30;
 
 // SQLite schema:
@@ -119,27 +123,333 @@ pub(crate) struct Event {
     pub(crate) action_index: usize,
 }
 
-/// Thin SQLite wrapper — all writes go through `apply_batch` / `rewind`.
-pub(crate) struct Db {
+#[derive(Debug)]
+pub(crate) enum RegistryError {
+    Db(rusqlite::Error),
+    Disconnected,
+}
+
+impl From<rusqlite::Error> for RegistryError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db(e) => write!(f, "{e}"),
+            Self::Disconnected => write!(f, "registry db thread disconnected"),
+        }
+    }
+}
+
+/// Cloneable handle to the registry index — enqueues work on the dedicated DB thread.
+#[derive(Clone)]
+pub(crate) struct Registry {
+    tx: SyncSender<Op>,
+}
+
+enum Op {
+    InstallRegistryUivk {
+        uivk: String,
+        reply: Sender<Result<(), rusqlite::Error>>,
+    },
+    ApplyBatch {
+        network: Network,
+        scanned: Cursor,
+        live: Cursor,
+        decrypted: Vec<DecryptedNote>,
+        reply: Sender<Result<Vec<NameNote>, rusqlite::Error>>,
+    },
+    Rewind {
+        fork_height: u32,
+        scanned_height: u32,
+        reply: Sender<Result<(), rusqlite::Error>>,
+    },
+    Checkpoint {
+        reply: Sender<Result<Option<Checkpoint>, rusqlite::Error>>,
+    },
+    RegistryUivk {
+        reply: Sender<Result<Option<String>, rusqlite::Error>>,
+    },
+    ResolveByName {
+        name: String,
+        reply: Sender<Result<Option<Registration>, rusqlite::Error>>,
+    },
+    RegistrationsByUa {
+        ua: String,
+        limit: u32,
+        offset: u32,
+        reply: Sender<Result<Vec<Registration>, rusqlite::Error>>,
+    },
+    ListRegistrations {
+        limit: u32,
+        offset: u32,
+        reply: Sender<Result<Vec<Registration>, rusqlite::Error>>,
+    },
+    NameCount {
+        reply: Sender<Result<u64, rusqlite::Error>>,
+    },
+    Events {
+        name: Option<String>,
+        action: Option<Action>,
+        since_height: Option<u32>,
+        limit: u32,
+        offset: u32,
+        reply: Sender<Result<(Vec<Event>, u64), rusqlite::Error>>,
+    },
+    Shutdown,
+}
+
+struct DbConn {
     conn: Connection,
 }
 
-// ── database ──────────────────────────────────────────────────────────────────
-//
-// Write path: `apply_batch` runs Visibility→Transition→Binding in one transaction,
-// then updates the checkpoint. Read path: open read-only connections for RPC handlers.
+fn recv_db_reply<T>(rx: mpsc::Receiver<Result<T, rusqlite::Error>>) -> Result<T, RegistryError> {
+    rx.recv()
+        .map_err(|_| RegistryError::Disconnected)?
+        .map_err(RegistryError::from)
+}
 
-impl Db {
-    pub(crate) fn open_for_indexer(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+impl Registry {
+    pub(crate) fn start(path: PathBuf) -> Result<(Self, JoinHandle<()>), rusqlite::Error> {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (op_tx, op_rx) = mpsc::sync_channel(QUEUE_CAP);
+
+        let join = std::thread::spawn(move || {
+            match DbConn::open(&path) {
+                Ok(mut db) => {
+                    let _ = ready_tx.send(Ok(()));
+                    run_db_thread(&mut db, op_rx);
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                }
+            }
+        });
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok((Registry { tx: op_tx }, join)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                Some("registry db thread exited before ready".into()),
+            )),
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let _ = self.tx.send(Op::Shutdown);
+    }
+
+    pub(crate) fn install_registry_uivk(&self, uivk: &str) -> Result<(), RegistryError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Op::InstallRegistryUivk {
+                uivk: uivk.to_string(),
+                reply,
+            })
+            .map_err(|_| RegistryError::Disconnected)?;
+        recv_db_reply(rx)
+    }
+
+    pub(crate) fn apply_batch(
+        &self,
+        network: Network,
+        scanned: Cursor,
+        live: Cursor,
+        decrypted: Vec<DecryptedNote>,
+    ) -> Result<Vec<NameNote>, RegistryError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Op::ApplyBatch {
+                network,
+                scanned,
+                live,
+                decrypted,
+                reply,
+            })
+            .map_err(|_| RegistryError::Disconnected)?;
+        recv_db_reply(rx)
+    }
+
+    pub(crate) fn rewind(&self, fork_height: u32, scanned_height: u32) -> Result<(), RegistryError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Op::Rewind {
+                fork_height,
+                scanned_height,
+                reply,
+            })
+            .map_err(|_| RegistryError::Disconnected)?;
+        recv_db_reply(rx)
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<Option<Checkpoint>, RegistryError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Op::Checkpoint { reply })
+            .map_err(|_| RegistryError::Disconnected)?;
+        recv_db_reply(rx)
+    }
+
+    pub(crate) fn registry_uivk(&self) -> Result<Option<String>, RegistryError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Op::RegistryUivk { reply })
+            .map_err(|_| RegistryError::Disconnected)?;
+        recv_db_reply(rx)
+    }
+
+    pub(crate) fn resolve_by_name(&self, name: &str) -> Result<Option<Registration>, RegistryError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Op::ResolveByName {
+                name: name.to_string(),
+                reply,
+            })
+            .map_err(|_| RegistryError::Disconnected)?;
+        recv_db_reply(rx)
+    }
+
+    pub(crate) fn registrations_by_ua(
+        &self,
+        ua: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Registration>, RegistryError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Op::RegistrationsByUa {
+                ua: ua.to_string(),
+                limit,
+                offset,
+                reply,
+            })
+            .map_err(|_| RegistryError::Disconnected)?;
+        recv_db_reply(rx)
+    }
+
+    pub(crate) fn list_registrations(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Registration>, RegistryError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Op::ListRegistrations {
+                limit,
+                offset,
+                reply,
+            })
+            .map_err(|_| RegistryError::Disconnected)?;
+        recv_db_reply(rx)
+    }
+
+    pub(crate) fn name_count(&self) -> Result<u64, RegistryError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Op::NameCount { reply })
+            .map_err(|_| RegistryError::Disconnected)?;
+        recv_db_reply(rx)
+    }
+
+    pub(crate) fn events(
+        &self,
+        name: Option<&str>,
+        action: Option<Action>,
+        since_height: Option<u32>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<Event>, u64), RegistryError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Op::Events {
+                name: name.map(str::to_string),
+                action,
+                since_height,
+                limit,
+                offset,
+                reply,
+            })
+            .map_err(|_| RegistryError::Disconnected)?;
+        recv_db_reply(rx)
+    }
+}
+
+fn run_db_thread(db: &mut DbConn, rx: Receiver<Op>) {
+    while let Ok(op) = rx.recv() {
+        match op {
+            Op::Shutdown => break,
+            Op::InstallRegistryUivk { uivk, reply } => {
+                let _ = reply.send(db.install_registry_uivk(&uivk));
+            }
+            Op::ApplyBatch {
+                network,
+                scanned,
+                live,
+                decrypted,
+                reply,
+            } => {
+                let _ = reply.send(db.apply_batch(&network, scanned, live, &decrypted));
+            }
+            Op::Rewind {
+                fork_height,
+                scanned_height,
+                reply,
+            } => {
+                let _ = reply.send(db.rewind(fork_height, scanned_height));
+            }
+            Op::Checkpoint { reply } => {
+                let _ = reply.send(db.checkpoint());
+            }
+            Op::RegistryUivk { reply } => {
+                let _ = reply.send(db.registry_uivk());
+            }
+            Op::ResolveByName { name, reply } => {
+                let _ = reply.send(db.resolve_by_name(&name));
+            }
+            Op::RegistrationsByUa {
+                ua,
+                limit,
+                offset,
+                reply,
+            } => {
+                let _ = reply.send(db.registrations_by_ua(&ua, limit, offset));
+            }
+            Op::ListRegistrations {
+                limit,
+                offset,
+                reply,
+            } => {
+                let _ = reply.send(db.list_registrations(limit, offset));
+            }
+            Op::NameCount { reply } => {
+                let _ = reply.send(db.name_count());
+            }
+            Op::Events {
+                name,
+                action,
+                since_height,
+                limit,
+                offset,
+                reply,
+            } => {
+                let _ = reply.send(db.events(name.as_deref(), action, since_height, limit, offset));
+            }
+        }
+    }
+}
+
+impl DbConn {
+    fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(SCHEMA_SQL)?;
         Ok(Self { conn })
     }
 
-    /// Record registry inbox UIVK when the DB is first created. No-op if already set;
-    /// warns if the binary's UIVK disagrees (index identity is fixed).
-    pub(crate) fn install_registry_uivk(&self, uivk: &str) -> rusqlite::Result<()> {
+    fn install_registry_uivk(&self, uivk: &str) -> rusqlite::Result<()> {
         if let Some(existing) = self.registry_uivk()? {
             if existing != uivk {
                 tracing::warn!(
@@ -156,7 +466,7 @@ impl Db {
         Ok(())
     }
 
-    pub(crate) fn registry_uivk(&self) -> rusqlite::Result<Option<String>> {
+    fn registry_uivk(&self) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row(
                 "SELECT uivk FROM registry_account WHERE id = 0",
@@ -166,18 +476,7 @@ impl Db {
             .optional()
     }
 
-    pub(crate) fn open_for_rpc(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        Ok(Self { conn })
-    }
-
-    pub(crate) fn checkpoint(&self) -> rusqlite::Result<Option<Checkpoint>> {
+    fn checkpoint(&self) -> rusqlite::Result<Option<Checkpoint>> {
         self.conn
             .query_row(
                 "SELECT height, hash, chain_tip_height, chain_tip_hash FROM scan_state WHERE id = 0",
@@ -188,12 +487,7 @@ impl Db {
             .map_err(Into::into)
     }
 
-    /// Process one scanned batch: visibility already happened in [`crate::orchard`].
-    ///
-    /// Per decrypted note: memo may supply a **candidate** `(action, name, ua)`; a row is
-    /// admitted only when **transition + binding** pass (`(ψ, rcm) → cmx`). Memo parse
-    /// failure means no candidate claims, not a crypto proof that the note is unrelated.
-    pub(crate) fn apply_batch(
+    fn apply_batch(
         &self,
         network: &impl Parameters,
         scanned: Cursor,
@@ -289,10 +583,7 @@ impl Db {
         Ok(indexed)
     }
 
-    /// Handle a chain reorg: drop events above `fork_height`, rebuild `names` tips.
-    ///
-    /// Shallow reorgs rewind incrementally; deep ones wipe and rescan from birthday.
-    pub(crate) fn rewind(&self, fork_height: u32, scanned_height: u32) -> rusqlite::Result<()> {
+    fn rewind(&self, fork_height: u32, scanned_height: u32) -> rusqlite::Result<()> {
         let depth = scanned_height.saturating_sub(fork_height);
         let tx = self.conn.unchecked_transaction()?;
 
@@ -331,7 +622,7 @@ impl Db {
         Ok(())
     }
 
-    pub(crate) fn resolve_by_name(&self, name: &str) -> rusqlite::Result<Option<Registration>> {
+    fn resolve_by_name(&self, name: &str) -> rusqlite::Result<Option<Registration>> {
         self.conn
             .query_row(
                 "SELECT name, ua, txid, height, action FROM names WHERE name = ?1",
@@ -342,7 +633,7 @@ impl Db {
             .map_err(Into::into)
     }
 
-    pub(crate) fn registrations_by_ua(
+    fn registrations_by_ua(
         &self,
         ua: &str,
         limit: u32,
@@ -358,7 +649,7 @@ impl Db {
         Ok(rows)
     }
 
-    pub(crate) fn list_registrations(&self, limit: u32, offset: u32) -> rusqlite::Result<Vec<Registration>> {
+    fn list_registrations(&self, limit: u32, offset: u32) -> rusqlite::Result<Vec<Registration>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, ua, txid, height, action FROM names ORDER BY name LIMIT ?1 OFFSET ?2",
         )?;
@@ -368,14 +659,14 @@ impl Db {
         Ok(rows)
     }
 
-    pub(crate) fn name_count(&self) -> rusqlite::Result<u64> {
+    fn name_count(&self) -> rusqlite::Result<u64> {
         let n: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
         Ok(n as u64)
     }
 
-    pub(crate) fn events(
+    fn events(
         &self,
         name: Option<&str>,
         action: Option<Action>,
@@ -561,7 +852,7 @@ fn rebuild_name_tip(tx: &rusqlite::Transaction<'_>, name: &str) -> rusqlite::Res
 
 #[allow(clippy::too_many_arguments)]
 fn insert_event(
-    conn: &Connection,
+    conn: &rusqlite::Transaction<'_>,
     name: &str,
     ua: &str,
     prev_rcm: &[u8; 32],

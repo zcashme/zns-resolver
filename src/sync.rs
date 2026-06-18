@@ -9,7 +9,7 @@ use seer_sync::BlockHash;
 use tokio::sync::watch;
 use zcash_protocol::consensus::Network;
 
-use crate::registry::{Cursor, Db};
+use crate::registry::{Cursor, Registry};
 use crate::orchard::observe_batch;
 
 pub(crate) const RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -53,7 +53,7 @@ pub(crate) async fn run_tip_watcher(
 
 pub(crate) async fn run_sync_loop(
     session: LwdSession,
-    db_path: &'static str,
+    registry: Registry,
     network: Network,
     scan_birthday: u32,
     ivk: PreparedIncomingViewingKey,
@@ -62,19 +62,10 @@ pub(crate) async fn run_sync_loop(
     let mut rewind_by = 1u32;
 
     loop {
-        let db = match Db::open_for_indexer(db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                eprintln!("database: {e}");
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
-        };
-
-        let checkpoint = match db.checkpoint() {
+        let checkpoint = match registry.checkpoint() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("checkpoint: {e}");
+                tracing::warn!(error = %e, "checkpoint read failed");
                 tokio::time::sleep(RETRY_DELAY).await;
                 continue;
             }
@@ -83,7 +74,7 @@ pub(crate) async fn run_sync_loop(
         let client = match chain::connect(session.url()).await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("lightwalletd: {e}");
+                tracing::warn!(error = %e, "lightwalletd connect failed");
                 tokio::time::sleep(RETRY_DELAY).await;
                 continue;
             }
@@ -103,7 +94,7 @@ pub(crate) async fn run_sync_loop(
 
         if live.0 == 0 || start > live.0 {
             if tip_rx.changed().await.is_err() {
-                eprintln!("tip watcher stopped");
+                tracing::error!("tip watcher stopped");
                 break;
             }
             continue;
@@ -119,24 +110,28 @@ pub(crate) async fn run_sync_loop(
                         continue;
                     };
                     let scanned = (last.height as u32, last.hash[..].try_into().ok());
+                    let live = *tip_rx.borrow_and_update();
 
                     match observe_batch(&mut fetch_client, &network, &ivk, &batch).await {
-                        Ok(decrypted) => match db.apply_batch(&network, scanned, live, &decrypted) {
-                            Ok(indexed) => {
-                                rewind_by = 1;
-                                tracing::info!(
-                                    height = scanned.0,
-                                    tip = live.0,
-                                    decrypted = decrypted.len(),
-                                    indexed = indexed.len(),
-                                    "batch applied"
-                                );
+                        Ok(decrypted) => {
+                            let n_decrypt = decrypted.len();
+                            match registry.apply_batch(network, scanned, live, decrypted) {
+                                Ok(indexed) => {
+                                    rewind_by = 1;
+                                    tracing::info!(
+                                        height = scanned.0,
+                                        tip = live.0,
+                                        decrypted = n_decrypt,
+                                        indexed = indexed.len(),
+                                        "batch applied"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "apply_batch failed");
+                                    break;
+                                }
                             }
-                            Err(e) => {
-                                eprintln!("apply: {e}");
-                                break;
-                            }
-                        },
+                        }
                         Err(e) => {
                             tracing::error!(error = %e, "observe batch failed");
                             break;
@@ -145,21 +140,21 @@ pub(crate) async fn run_sync_loop(
                 }
                 Some(Err(ChainError::Reorg(at))) => {
                     let rewind_to = at.saturating_sub(rewind_by);
-                    let scanned = db
+                    let scanned = registry
                         .checkpoint()
                         .ok()
                         .flatten()
                         .map(|c| c.scanned_height)
                         .unwrap_or(0);
-                    eprintln!("reorg at {at}, rewind to {rewind_to}");
-                    if let Err(e) = db.rewind(rewind_to, scanned) {
-                        eprintln!("rewind: {e}");
+                    tracing::warn!(at, rewind_to, "chain reorg");
+                    if let Err(e) = registry.rewind(rewind_to, scanned) {
+                        tracing::error!(error = %e, "rewind failed");
                     }
                     rewind_by = rewind_by.saturating_mul(2);
                     break;
                 }
                 Some(Err(e)) => {
-                    eprintln!("scan: {e}");
+                    tracing::warn!(error = %e, "block stream failed");
                     break;
                 }
             }
