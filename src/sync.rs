@@ -138,7 +138,7 @@ pub(crate) async fn run_sync_loop(
                             }
                         },
                         Err(e) => {
-                            eprintln!("observe: {e}");
+                            tracing::error!(error = %e, "observe batch failed");
                             break;
                         }
                     }
