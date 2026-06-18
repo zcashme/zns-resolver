@@ -134,12 +134,6 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(SCHEMA_SQL)?;
-        // One-time: older DBs briefly stored uivk on scan_state.
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO registry_account (id, uivk)
-             SELECT 0, uivk FROM scan_state WHERE id = 0 AND uivk IS NOT NULL",
-            [],
-        );
         Ok(Self { conn })
     }
 
