@@ -9,69 +9,15 @@ use std::thread::JoinHandle;
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use zcash_protocol::consensus::{Network, Parameters};
-use zns_verify::{
-    chain::prev_rcm_for, parse_memo_validated, Action, ParsedMemo, Tip,
-};
+use zns_verify::{Action, Tip};
 
-use crate::orchard::{verify_binding, DecryptedNote};
+use crate::orchard::DecryptedNote;
+
+mod lifecycle;
+mod names;
 
 const QUEUE_CAP: usize = 256;
 const REORG_SHALLOW_MAX: u32 = 30;
-
-// SQLite schema:
-//   registry_account — singleton: registry inbox UIVK (set once at create, not scan state)
-//   scan_state       — checkpoint after commit (how far we've scanned)
-//   name_events      — append-only history of every verified lifecycle event
-//   names            — materialized current tip per name (fast resolve)
-const SCHEMA_SQL: &str = r#"
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS registry_account (
-    id   INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
-    uivk TEXT    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS scan_state (
-    id               INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
-    height           INTEGER NOT NULL,
-    hash             BLOB,
-    chain_tip_height INTEGER,
-    chain_tip_hash   BLOB
-);
-
-CREATE TABLE IF NOT EXISTS name_events (
-    name         TEXT    NOT NULL,
-    height       INTEGER NOT NULL,
-    action       TEXT    NOT NULL CHECK (action IN ('claim', 'update', 'release')),
-    ua           TEXT    NOT NULL,
-    prev_rcm     BLOB    NOT NULL,
-    rcm          BLOB    NOT NULL,
-    psi          BLOB    NOT NULL,
-    cmx          BLOB    NOT NULL,
-    txid         BLOB    NOT NULL,
-    action_index INTEGER NOT NULL,
-    raw_tx       BLOB    NOT NULL,
-    PRIMARY KEY (name, height)
-);
-CREATE INDEX IF NOT EXISTS idx_name_events_height ON name_events (height);
-CREATE INDEX IF NOT EXISTS idx_name_events_txid ON name_events (txid);
-
-CREATE TABLE IF NOT EXISTS names (
-    name         TEXT    NOT NULL PRIMARY KEY,
-    height       INTEGER NOT NULL,
-    action       TEXT    NOT NULL CHECK (action IN ('claim', 'update', 'release')),
-    ua           TEXT    NOT NULL,
-    prev_rcm     BLOB    NOT NULL,
-    rcm          BLOB    NOT NULL,
-    psi          BLOB    NOT NULL,
-    cmx          BLOB    NOT NULL,
-    txid         BLOB    NOT NULL,
-    action_index INTEGER NOT NULL,
-    raw_tx       BLOB    NOT NULL
-);
-"#;
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -445,7 +391,7 @@ fn run_db_thread(db: &mut DbConn, rx: Receiver<Op>) {
 impl DbConn {
     fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA_SQL)?;
+        conn.execute_batch(names::SCHEMA_SQL)?;
         Ok(Self { conn })
     }
 
@@ -498,15 +444,15 @@ impl DbConn {
         let mut indexed = Vec::new();
 
         for n in decrypted {
-            let Some(claim) = lifecycle_claim_from_memo(n.memo.as_slice(), network) else {
+            let Some(claim) = lifecycle::lifecycle_claim_from_memo(n.memo.as_slice(), network) else {
                 continue;
             };
 
             let tip = self.name_tip_in_tx(&tx, &claim.name)?;
             let Some((prev_rcm, psi, rcm)) =
-                try_admit_name_note(&claim, n, tip.as_ref())
+                lifecycle::try_admit_name_note(&claim, n, tip.as_ref())
             else {
-                warn_registry_fork(&claim, n, tip.as_ref());
+                lifecycle::warn_registry_fork(&claim, n, tip.as_ref());
                 continue;
             };
 
@@ -910,85 +856,4 @@ fn action_str(a: Action) -> &'static str {
     }
 }
 
-/// Candidate fields parsed from a canonical lifecycle memo — **untrusted** until binding passes.
-struct LifecycleClaim {
-    action: Action,
-    name: String,
-    ua: String,
-    /// Optional memo witness; transition uses index tip `prev_rcm`, not this field.
-    memo_prev_rcm: Option<[u8; 32]>,
-}
-
-/// Extract indexing claims from memo. Does not admit a name note (see [`try_admit_name_note`]).
-fn lifecycle_claim_from_memo(memo: &[u8], network: &impl Parameters) -> Option<LifecycleClaim> {
-    let Ok(ParsedMemo::Lifecycle {
-        action,
-        name,
-        ua,
-        prev_rcm,
-    }) = parse_memo_validated(memo, network)
-    else {
-        return None;
-    };
-    if shadows_ua_namespace(name) {
-        return None;
-    }
-    Some(LifecycleClaim {
-        action,
-        name: name.to_string(),
-        ua: ua.to_string(),
-        memo_prev_rcm: prev_rcm,
-    })
-}
-
-/// Admission gate: legal transition on our per-name chain + ZNS binding to on-chain `cmx`.
-fn try_admit_name_note(
-    claim: &LifecycleClaim,
-    n: &DecryptedNote,
-    tip: Option<&Tip>,
-) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
-    let prev_rcm = prev_rcm_for(tip, claim.action)?;
-    let (psi, rcm) = verify_binding(
-        &n.note,
-        n.cmx,
-        claim.action,
-        &claim.name,
-        &claim.ua,
-        &prev_rcm,
-    )?;
-    Some((prev_rcm, psi, rcm))
-}
-
-/// If binding failed but memo's `prev_rcm` witness would verify, log a possible fork.
-fn warn_registry_fork(claim: &LifecycleClaim, n: &DecryptedNote, tip: Option<&Tip>) {
-    let Some(prev_rcm) = prev_rcm_for(tip, claim.action) else {
-        return;
-    };
-    let Some(claimed) = claim.memo_prev_rcm.filter(|p| {
-        *p != prev_rcm
-            && verify_binding(
-                &n.note,
-                n.cmx,
-                claim.action,
-                &claim.name,
-                &claim.ua,
-                p,
-            )
-            .is_some()
-    }) else {
-        return;
-    };
-    tracing::warn!(
-        name = %claim.name,
-        height = n.height,
-        claimed = hex::encode(claimed),
-        tip = hex::encode(prev_rcm),
-        "registry fork: note extends a different predecessor than our tip"
-    );
-}
-
-/// Reject names that could be mistaken for Zcash unified addresses.
-fn shadows_ua_namespace(name: &str) -> bool {
-    name.starts_with("u1") || name.starts_with("utest1")
-}
 
