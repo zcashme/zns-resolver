@@ -16,7 +16,7 @@ publish = false
 
 [dependencies]
 seer-sync = { path = "../seer-sync" }
-zns-verify = { path = "../zns-verify", features = ["decrypt", "proof", "address"] }
+zns-verify = { path = "../zns-verify", features = ["decrypt"] }
 orchard = { path = "../zns-orchard", default-features = false, features = ["unsafe-zns"] }
 zcash_protocol = { version = "0.9", default-features = false, features = ["std"] }
 zcash_keys = { version = "0.14", default-features = false, features = ["orchard"] }
