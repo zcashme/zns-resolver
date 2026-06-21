@@ -39,7 +39,6 @@ pub struct StatusResult {
     last_error: Option<String>,
     uivk: String,
     registered: u64,
-    admin_pubkey: String,
     listed: u64,
 }
 
@@ -153,7 +152,6 @@ impl ZnsApiServer for Registry {
             last_error: sync_status.last_error,
             uivk,
             registered: self.name_count().map_err(rpc_err)?,
-            admin_pubkey: String::new(),
             listed: 0,
         })
     }
