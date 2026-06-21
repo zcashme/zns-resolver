@@ -14,7 +14,7 @@ mod sync;
 
 use std::path::PathBuf;
 
-use orchard::orchard_ivk;
+use seer_sync::ViewKey;
 use sync::run_sync_loop;
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
@@ -36,7 +36,8 @@ async fn main() {
         .with_max_level(LevelFilter::INFO)
         .init();
 
-    let ivk = orchard_ivk(&NETWORK, UIVK).expect("registry UIVK must decode for NETWORK");
+    let view_key = ViewKey::decode(&NETWORK, UIVK)
+        .expect("registry viewing key (UFVK or UIVK) must decode for NETWORK");
 
     let (registry, db_join) = Registry::start(PathBuf::from(DB_PATH)).unwrap_or_else(|e| {
         tracing::error!(error = %e, "registry database failed to open");
@@ -63,7 +64,7 @@ async fn main() {
             registry.clone(),
             NETWORK,
             SCAN_BIRTHDAY,
-            ivk,
+            &view_key,
         ) => {}
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutdown requested");

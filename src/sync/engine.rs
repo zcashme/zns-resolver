@@ -3,10 +3,10 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use orchard::keys::PreparedIncomingViewingKey;
 use seer_sync::chain::{ChainError, DEFAULT_CHUNK_OUTPUTS};
 use seer_sync::proto::CompactBlock;
 use seer_sync::BlockHash;
+use seer_sync::ViewKey;
 use zcash_protocol::consensus::Network;
 
 use crate::orchard::observe_batch;
@@ -22,7 +22,7 @@ pub(crate) async fn run_sync_loop(
     registry: Registry,
     network: Network,
     scan_birthday: u32,
-    ivk: PreparedIncomingViewingKey,
+    keys: &ViewKey,
 ) {
     let mut lwd = Lwd::connect(lightwalletd).await;
     let mut rewind_by = REORG_REWIND_INITIAL;
@@ -53,7 +53,7 @@ pub(crate) async fn run_sync_loop(
             &mut lwd,
             &registry,
             network,
-            &ivk,
+            keys,
             start,
             seam,
             tip,
@@ -124,7 +124,7 @@ async fn drive_range(
     lwd: &mut Lwd,
     registry: &Registry,
     network: Network,
-    ivk: &PreparedIncomingViewingKey,
+    keys: &ViewKey,
     start: u32,
     seam: Option<BlockHash>,
     tip: Cursor,
@@ -142,7 +142,7 @@ async fn drive_range(
                     lwd,
                     registry,
                     network,
-                    ivk,
+                    keys,
                     &mut fetch_client,
                     &batch,
                     rewind_by,
@@ -165,7 +165,7 @@ async fn process_batch(
     lwd: &mut Lwd,
     registry: &Registry,
     network: Network,
-    ivk: &PreparedIncomingViewingKey,
+    keys: &ViewKey,
     fetch_client: &mut seer_sync::chain::LwdClient,
     batch: &[CompactBlock],
     rewind_by: &mut u32,
@@ -183,7 +183,7 @@ async fn process_batch(
         }
     };
 
-    match observe_batch(fetch_client, &network, ivk, batch).await {
+    match observe_batch(fetch_client, &network, keys, batch).await {
         Ok(decrypted) => {
             let n_decrypt = decrypted.len();
             match registry.apply_batch(network, scanned, live, decrypted) {

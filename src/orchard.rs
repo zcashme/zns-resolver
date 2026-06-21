@@ -8,7 +8,7 @@ use orchard::keys::PreparedIncomingViewingKey;
 use pasta_curves::pallas;
 use seer_sync::chain::{self, LwdClient};
 use seer_sync::proto::CompactBlock;
-use seer_sync::{parse_orchard, BlockHeight, TxId};
+use seer_sync::{parse_orchard, BlockHeight, TxId, ViewKey};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BranchId, Parameters};
 use zcash_protocol::memo::MemoBytes;
@@ -70,15 +70,20 @@ pub(crate) fn verify_binding(
 }
 
 /// Compact-block batch: trial-decrypt candidates, fetch raw tx, full decrypt.
+/// Uses the IVKs derived from the ViewKey (supports UFVK for future OVK checks).
 pub(crate) async fn observe_batch(
     client: &mut LwdClient,
     network: &impl Parameters,
-    ivk: &PreparedIncomingViewingKey,
+    keys: &ViewKey,
     blocks: &[CompactBlock],
 ) -> Result<Vec<DecryptedNote>> {
     type Fetched = Option<(Transaction, u32, Vec<u8>)>;
     let mut fetched: HashMap<[u8; 32], Fetched> = HashMap::new();
     let mut out = Vec::new();
+
+    // Extract all prepared IVKs from the ViewKey (supports UFVK).
+    // We try them all so the relaxed ZNS decrypt works for either scope.
+    let orchard_ivks = keys.orchard_prepared_ivks();
 
     for block in blocks {
         for tx in &block.vtx {
@@ -89,7 +94,15 @@ pub(crate) async fn observe_batch(
                 let Some(action) = parse_orchard(act) else {
                     continue;
                 };
-                if zns_verify::decrypt::try_compact_orchard(ivk, &action).is_none() {
+                // Try relaxed compact decrypt against all IVKs from the ViewKey
+                let mut compact_hit = false;
+                for ivk in &orchard_ivks {
+                    if zns_verify::decrypt::try_compact_orchard(ivk, &action).is_some() {
+                        compact_hit = true;
+                        break;
+                    }
+                }
+                if !compact_hit {
                     continue;
                 }
 
@@ -117,9 +130,15 @@ pub(crate) async fn observe_batch(
                 let Some(action) = bundle.actions().get(action_index) else {
                     continue;
                 };
-                let Some((note, _recipient, memo)) =
-                    zns_verify::decrypt::try_decrypt_orchard(action, ivk)
-                else {
+                // Try relaxed full decrypt against all IVKs from the ViewKey
+                let mut decrypted = None;
+                for ivk in &orchard_ivks {
+                    if let Some(d) = zns_verify::decrypt::try_decrypt_orchard(action, ivk) {
+                        decrypted = Some(d);
+                        break;
+                    }
+                }
+                let Some((note, _recipient, memo)) = decrypted else {
                     continue;
                 };
 
