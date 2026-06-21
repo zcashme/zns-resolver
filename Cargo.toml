@@ -15,7 +15,7 @@ keywords = ["zcash", "zns", "name-service", "resolver"]
 publish = false
 
 [dependencies]
-seer-sync = { path = "../seer-sync" }
+seer-sync = { path = "../seer-sync", features = ["zns-decrypt"] }
 zns-verify = { path = "../zns-verify", features = ["decrypt"] }
 orchard = { path = "../zns-orchard", default-features = false, features = ["unsafe-zns"] }
 zcash_protocol = { version = "0.9", default-features = false, features = ["std"] }
