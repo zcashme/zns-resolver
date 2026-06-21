@@ -22,9 +22,6 @@ struct RegistrationEntry {
     txid: String,
     height: u64,
     last_action: String,
-    nonce: u64,
-    signature: Option<String>,
-    listing: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,13 +36,6 @@ pub struct StatusResult {
     last_error: Option<String>,
     uivk: String,
     registered: u64,
-    listed: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ListingsResult {
-    listings: Vec<Value>,
-    total: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,10 +47,6 @@ struct EventEntry {
     height: u64,
     action_index: u64,
     ua: Option<String>,
-    price: Option<u64>,
-    nonce: u64,
-    signature: Option<String>,
-    pubkey: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,10 +66,6 @@ trait ZnsApi {
     /// Sync progress: scanned height vs chain tip, registration count.
     #[method(name = "status", blocking)]
     fn status(&self) -> RpcResult<StatusResult>;
-
-    /// Placeholder for marketplace listings (not implemented in resolver).
-    #[method(name = "listings", blocking)]
-    fn listings(&self, limit: Option<u64>, offset: Option<u64>) -> RpcResult<ListingsResult>;
 
     /// Paginated lifecycle event log with optional filters.
     #[method(name = "events", blocking)]
@@ -152,14 +134,6 @@ impl ZnsApiServer for Registry {
             last_error: sync_status.last_error,
             uivk,
             registered: self.name_count().map_err(rpc_err)?,
-            listed: 0,
-        })
-    }
-
-    fn listings(&self, _limit: Option<u64>, _offset: Option<u64>) -> RpcResult<ListingsResult> {
-        Ok(ListingsResult {
-            listings: Vec::new(),
-            total: 0,
         })
     }
 
@@ -202,9 +176,6 @@ fn entry(r: Registration) -> RegistrationEntry {
         txid: hex::encode(r.txid),
         height: r.height as u64,
         last_action: action_name(r.last_action).to_string(),
-        nonce: 0,
-        signature: None,
-        listing: None,
     }
 }
 
@@ -221,10 +192,6 @@ fn event_entry(e: Event) -> EventEntry {
         height: e.height as u64,
         action_index: e.action_index as u64,
         ua: (!e.ua.is_empty()).then_some(e.ua),
-        price: None,
-        nonce: 0,
-        signature: None,
-        pubkey: None,
     }
 }
 
