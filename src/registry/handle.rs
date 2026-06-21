@@ -31,7 +31,6 @@ enum Op {
         reply: Sender<Result<(), rusqlite::Error>>,
     },
     ApplyBatch {
-        network: Network,
         scanned: Cursor,
         live: Cursor,
         decrypted: Vec<DecryptedNote>,
@@ -152,7 +151,6 @@ impl Registry {
 
     pub(crate) fn apply_batch(
         &self,
-        network: Network,
         scanned: Cursor,
         live: Cursor,
         decrypted: Vec<DecryptedNote>,
@@ -160,7 +158,6 @@ impl Registry {
         let (reply, rx) = mpsc::channel();
         self.tx
             .send(Op::ApplyBatch {
-                network,
                 scanned,
                 live,
                 decrypted,
@@ -294,13 +291,12 @@ fn run_db_thread(db: &mut core::DbConn, rx: Receiver<Op>) {
                 let _ = reply.send(db.install_registry_config(&uivk, &network, birthday));
             }
             Op::ApplyBatch {
-                network,
                 scanned,
                 live,
                 decrypted,
                 reply,
             } => {
-                let _ = reply.send(db.apply_batch(&network, scanned, live, &decrypted));
+                let _ = reply.send(db.apply_batch(scanned, live, &decrypted));
             }
             Op::Rewind {
                 fork_height,

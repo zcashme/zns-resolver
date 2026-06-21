@@ -4,11 +4,11 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use group::ff::PrimeField;
-use orchard::keys::PreparedIncomingViewingKey;
+use orchard::keys::FullViewingKey;
 use pasta_curves::pallas;
 use seer_sync::chain::{self, LwdClient};
 use seer_sync::proto::CompactBlock;
-use seer_sync::{parse_orchard, BlockHeight, TxId, ViewKey};
+use seer_sync::{parse_orchard, BlockHeight, TxId};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BranchId, Parameters};
 use zcash_protocol::memo::MemoBytes;
@@ -26,29 +26,6 @@ pub(crate) struct DecryptedNote {
     /// Index of this Orchard action within the transaction's action list.
     pub(crate) action_index: usize,
     pub(crate) raw_tx: Vec<u8>,
-}
-
-/// Parse UIVK/UFVK encoding into a prepared Orchard IVK for trial decryption.
-pub(crate) fn orchard_ivk(
-    network: &impl Parameters,
-    encoding: &str,
-) -> Result<PreparedIncomingViewingKey> {
-    use orchard::keys::Scope;
-    use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedIncomingViewingKey};
-
-    if let Ok(ufvk) = UnifiedFullViewingKey::decode(network, encoding) {
-        if let Some(fvk) = ufvk.orchard() {
-            return Ok(PreparedIncomingViewingKey::new(
-                &fvk.to_ivk(Scope::External),
-            ));
-        }
-    }
-    if let Ok(uivk) = UnifiedIncomingViewingKey::decode(network, encoding) {
-        if let Some(ivk) = uivk.orchard() {
-            return Ok(PreparedIncomingViewingKey::new(ivk));
-        }
-    }
-    anyhow::bail!("no Orchard incoming viewing key in the provided encoding")
 }
 
 /// Returns `(psi, rcm)` byte reprs if the note commitment matches on-chain cmx.
@@ -70,20 +47,16 @@ pub(crate) fn verify_binding(
 }
 
 /// Compact-block batch: trial-decrypt candidates, fetch raw tx, full decrypt.
-/// Uses the IVKs derived from the ViewKey (supports UFVK for future OVK checks).
+/// Uses the account's FullViewingKey (for both receive and send/OVK self-send proof).
 pub(crate) async fn observe_batch(
     client: &mut LwdClient,
     network: &impl Parameters,
-    keys: &ViewKey,
+    fvk: &FullViewingKey,
     blocks: &[CompactBlock],
 ) -> Result<Vec<DecryptedNote>> {
     type Fetched = Option<(Transaction, u32, Vec<u8>)>;
     let mut fetched: HashMap<[u8; 32], Fetched> = HashMap::new();
     let mut out = Vec::new();
-
-    // Extract all prepared IVKs from the ViewKey (supports UFVK).
-    // We try them all so the relaxed ZNS decrypt works for either scope.
-    let orchard_ivks = keys.orchard_prepared_ivks();
 
     for block in blocks {
         for tx in &block.vtx {
@@ -94,15 +67,7 @@ pub(crate) async fn observe_batch(
                 let Some(action) = parse_orchard(act) else {
                     continue;
                 };
-                // Try relaxed compact decrypt against all IVKs from the ViewKey
-                let mut compact_hit = false;
-                for ivk in &orchard_ivks {
-                    if zns_verify::decrypt::try_compact_orchard(ivk, &action).is_some() {
-                        compact_hit = true;
-                        break;
-                    }
-                }
-                if !compact_hit {
+                if zns_verify::decrypt::try_compact_orchard(fvk, &action).is_none() {
                     continue;
                 }
 
@@ -130,17 +95,24 @@ pub(crate) async fn observe_batch(
                 let Some(action) = bundle.actions().get(action_index) else {
                     continue;
                 };
-                // Try relaxed full decrypt against all IVKs from the ViewKey
-                let mut decrypted = None;
-                for ivk in &orchard_ivks {
-                    if let Some(d) = zns_verify::decrypt::try_decrypt_orchard(action, ivk) {
-                        decrypted = Some(d);
-                        break;
-                    }
-                }
-                let Some((note, _recipient, memo)) = decrypted else {
+                let Some((note, _recipient, memo)) =
+                    zns_verify::decrypt::try_decrypt_orchard(action, fvk)
+                else {
                     continue;
                 };
+
+                // Self-send proof using the FVK (OVK side). For ZNS name notes
+                // (which must be 0-value self-sends), we require a matching send
+                // recovery with the same memo.
+                let has_self_send_proof =
+                    zns_verify::decrypt::try_decrypt_orchard_sent(action, fvk).is_some();
+                if memo.as_slice().starts_with(b"ZNS:") && !has_self_send_proof {
+                    tracing::debug!(
+                        txid = %hex::encode(txid),
+                        "ZNS name note candidate had incoming view but no matching OVK send proof — ignoring"
+                    );
+                    continue;
+                }
 
                 out.push(DecryptedNote {
                     note,

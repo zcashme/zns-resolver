@@ -1,7 +1,6 @@
 //! Memo parsing and admission control for ZNS name lifecycle events.
 
-use zcash_protocol::consensus::Parameters;
-use zns_verify::{chain::prev_rcm_for, parse_memo_validated, Action, ParsedMemo, Tip};
+use zns_verify::{parse_name_note, prev_rcm_for, Action, NameNote, Tip};
 
 use crate::orchard::{verify_binding, DecryptedNote};
 
@@ -17,14 +16,13 @@ pub(super) struct LifecycleClaim {
 /// Extract indexing claims from memo. Does not admit a name note (see [`try_admit_name_note`]).
 pub(super) fn lifecycle_claim_from_memo(
     memo: &[u8],
-    network: &impl Parameters,
 ) -> Option<LifecycleClaim> {
-    let Ok(ParsedMemo::Lifecycle {
+    let Ok(NameNote {
         action,
         name,
         ua,
         prev_rcm,
-    }) = parse_memo_validated(memo, network)
+    }) = parse_name_note(memo)
     else {
         return None;
     };
@@ -35,7 +33,7 @@ pub(super) fn lifecycle_claim_from_memo(
         action,
         name: name.to_string(),
         ua: ua.to_string(),
-        memo_prev_rcm: prev_rcm,
+        memo_prev_rcm: Some(prev_rcm),
     })
 }
 

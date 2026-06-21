@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
-use zcash_protocol::consensus::Parameters;
 
 use zns_verify::{Action, Tip};
 
@@ -95,7 +94,6 @@ impl DbConn {
     /// happens inside one transaction.
     pub(super) fn apply_batch(
         &self,
-        network: &impl Parameters,
         scanned: Cursor,
         live: Cursor,
         decrypted: &[DecryptedNote],
@@ -104,7 +102,7 @@ impl DbConn {
         let mut indexed = Vec::new();
 
         for n in decrypted {
-            let Some(claim) = lifecycle::lifecycle_claim_from_memo(n.memo.as_slice(), network)
+            let Some(claim) = lifecycle::lifecycle_claim_from_memo(n.memo.as_slice())
             else {
                 continue;
             };

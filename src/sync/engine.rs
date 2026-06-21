@@ -3,10 +3,10 @@
 use std::time::Duration;
 
 use futures::StreamExt;
+use orchard::keys::FullViewingKey;
 use seer_sync::chain::{ChainError, DEFAULT_CHUNK_OUTPUTS};
 use seer_sync::proto::CompactBlock;
 use seer_sync::BlockHash;
-use seer_sync::ViewKey;
 use zcash_protocol::consensus::Network;
 
 use crate::orchard::observe_batch;
@@ -22,7 +22,7 @@ pub(crate) async fn run_sync_loop(
     registry: Registry,
     network: Network,
     scan_birthday: u32,
-    keys: &ViewKey,
+    fvk: &FullViewingKey,
 ) {
     let mut lwd = Lwd::connect(lightwalletd).await;
     let mut rewind_by = REORG_REWIND_INITIAL;
@@ -53,7 +53,7 @@ pub(crate) async fn run_sync_loop(
             &mut lwd,
             &registry,
             network,
-            keys,
+            fvk,
             start,
             seam,
             tip,
@@ -124,7 +124,7 @@ async fn drive_range(
     lwd: &mut Lwd,
     registry: &Registry,
     network: Network,
-    keys: &ViewKey,
+    fvk: &FullViewingKey,
     start: u32,
     seam: Option<BlockHash>,
     tip: Cursor,
@@ -142,7 +142,7 @@ async fn drive_range(
                     lwd,
                     registry,
                     network,
-                    keys,
+                    fvk,
                     &mut fetch_client,
                     &batch,
                     rewind_by,
@@ -165,7 +165,7 @@ async fn process_batch(
     lwd: &mut Lwd,
     registry: &Registry,
     network: Network,
-    keys: &ViewKey,
+    fvk: &FullViewingKey,
     fetch_client: &mut seer_sync::chain::LwdClient,
     batch: &[CompactBlock],
     rewind_by: &mut u32,
@@ -183,10 +183,10 @@ async fn process_batch(
         }
     };
 
-    match observe_batch(fetch_client, &network, keys, batch).await {
+    match observe_batch(fetch_client, &network, fvk, batch).await {
         Ok(decrypted) => {
             let n_decrypt = decrypted.len();
-            match registry.apply_batch(network, scanned, live, decrypted) {
+            match registry.apply_batch(scanned, live, decrypted) {
                 Ok(indexed) => {
                     *rewind_by = REORG_REWIND_INITIAL;
                     registry.set_sync_status(SyncStatus::catching_up(scanned.0, live.0));
