@@ -1,89 +1,83 @@
 # ZNS Resolver — Pending Work
 
-This document tracks what is still missing to make `zns-resolver` a complete, production-grade ZNS indexer/resolver that matches the expectations of the TypeScript SDK, the web app, and the full protocol.
+This resolver focuses on **Orchard binding verification**: it watches the registry UIVK, verifies deterministic `(ψ, rcm)` bindings against on-chain `cmx`, and maintains a name index.
+
+It deliberately does **not** implement the full signed-action ZNS model (no admin Ed25519 key, no nonces/signatures on actions, no marketplace).
+
+Hard-coded deployment configuration is currently acceptable.
 
 ## Currently Implemented (core binding verification)
 
 - Scans Orchard notes via registry UIVK using lightwalletd + seer-sync
-- Parses `ZNS:claim` / `update` / `release` memos
+- Parses `ZNS:claim` / `update` / `release` memos only
 - Verifies deterministic `(ψ, rcm)` bindings against on-chain `cmx`
+- Stores binding material (`psi`, `rcm`, `prev_rcm`, `cmx`) + `raw_tx` + `action_index` for every event
 - Maintains current name tips + full event history in SQLite
-- Basic JSON-RPC: `resolve`, `status`, `events`
+- Basic JSON-RPC: `resolve`, `status` (with `uivk` + sync details), `events` (and a stub `listings`)
 - Reorg handling (shallow + full reset)
 
-## High-Priority Gaps (API Compatibility)
+## High-Leverage Gaps (builds on existing verification)
 
 - [ ] **Expose binding material in the public API**
-  - Currently `psi`, `rcm`, `prev_rcm`, and `cmx` are computed and stored but never returned.
-  - Clients (wallets, light clients) want these values for fast, direct verification of the current tip without fetching full proof bundles.
-  - Consider adding fields to `Registration` / `Event` responses (and possibly a `raw_binding` or similar object).
+  - `psi`, `rcm`, `prev_rcm`, `cmx`, `raw_tx`, and `action_index` are already computed and stored.
+  - Clients should be able to get the current tip's binding values directly so they can perform their own verification with `zns-verify`.
+  - Add fields to the `resolve` and `events` responses.
 
-- [ ] **`listings` is a stub**
-  - Always returns empty. Marketplace listings are not indexed or served.
+## API Surface Cleanup
 
-- [ ] **Status response is incomplete**
-  - `listed` is always `0`
-  - Missing entirely: `pricing`, `address` (registry payment address)
+- [ ] **`listings` endpoint and `listed` count are dead weight**
+  - Always empty / 0. Marketplace support is not planned for this resolver.
 
-- [ ] **Registration objects are incomplete**
-  - `nonce`, `signature`, `pubkey`, and `listing` are always zero/None.
-  - This breaks SDK expectations for `Registration`, sovereign names, and listing state.
+- [ ] **Dead fields in responses**
+  - `RegistrationEntry` and `EventEntry` contain `nonce`, `signature`, `pubkey`, `listing`, and `price`.
+  - All are always zero/None because this resolver does not track signed actions.
+  - Either remove the fields or clearly mark them as unused.
 
-## Verifiability Features (the big missing pieces)
+## Verifiability Features
 
-- [ ] **Merkle proofs from a trusted state root**
-  - No Merkle tree is maintained over the set of current registrations.
-  - No state root is computed or stored at heights.
-  - The SDK's `resolveNameWithProof()` + `verifyProof()` cannot be supported.
-  - See the implementation in `../zns-zecnames/src/merkle.rs` + `rpc.rs` (sorted leaves, `hash_leaf`, `merkle_root`, `merkle_path`, `state_root` table) for the expected shape.
+These are large and mostly out of scope for this focused binding verifier:
 
-- [ ] **Proof bundle support (raw artifacts)**
-  - The resolver already stores `raw_tx`.
-  - It does not currently serve the full `ProofLink` structures expected by `zns-verify::proof` (raw tx + block header + tx Merkle branch + action_index + claims).
-  - Reference: `zns-verify/src/proof.rs` and the contract described in `PROOFS.md` (when it exists).
+- [ ] **Merkle proofs / state roots**
+  - No Merkle tree or state roots. See sibling `zns-zecnames` for a reference implementation.
 
-- [ ] **Lightweight tip verification path**
-  - Many clients will want just the latest `(psi, rcm, cmx, height, action_index)` for a name so they can call `zns_verify` functions directly.
-  - Currently there is no supported way to get this data from the resolver.
+- [ ] **Full proof bundle support**
+  - Only `raw_tx` is stored. No block headers, tx Merkle branches, or `ProofLink` structures.
+
+- [ ] **Lightweight tip verification**
+  - Once binding material is exposed (see above), clients can already get what they need for direct `zns-verify` calls on the tip. Historical access may still be useful.
 
 ## Configuration & Operations
 
-- [ ] Remove all hard-coded values from `main.rs`:
-  - UIVK
-  - Network (currently forced to TestNetwork)
-  - lightwalletd URL
-  - Scan birthday
-  - Database path
-  - RPC listen address
-- [ ] Support mainnet (via features, config file, or env vars)
-- [ ] Better structured logging and metrics for a real indexer
+- [ ] Better structured logging and metrics
+  - Current logging is minimal (`tracing_subscriber::fmt()` at INFO).
 
-## Richer Protocol Support
+- [ ] Mainnet support
+  - Currently hardcoded to testnet values. May be acceptable as hard-coded per-deployment.
 
-- [ ] Index and surface marketplace actions:
-  - LIST, DELIST, BUY
-  - SETPRICE (for dynamic pricing tiers)
-- [ ] Track nonce advancement and signatures on actions
-- [ ] Distinguish admin-signed registrations vs sovereign (user-signed) registrations
-- [ ] Store and return pricing configuration (tiers + nonce + height)
+## Intentionally Not Pursued (different scope)
+
+This resolver focuses on binding verification only. The following are not planned:
+
+- Marketplace actions (LIST, DELIST, BUY, SETPRICE)
+- Nonces, signatures, or pubkeys on actions
+- Admin Ed25519 key / admin-signed vs sovereign distinction
+- Pricing tiers
+- `address` (registry payment address) in status
 
 ## Nice-to-Have / Longer Term
 
-- [ ] Optional `with_proof` flag on `resolve` (or a dedicated method)
-- [ ] Serve historical proof bundles for any past name event (not just the tip)
-- [ ] Cross-check / pin known good state roots (or support multiple independent roots)
-- [ ] Pagination + filtering improvements to match the current OpenRPC spec
-- [ ] Prometheus / health endpoint beyond the current minimal status
-- [ ] Proper handling of deep reorgs (currently limited)
+- [ ] Expose binding material for historical events (not just current tips)
+- [ ] Optional `with_proof` / raw binding data on `resolve`
+- [ ] Pagination + filtering improvements
+- [ ] Prometheus / health endpoint
+- [ ] Better deep reorg handling (current full reset on >30 blocks is blunt)
 
 ## References
 
-- `zns-verify` — the verification kernel (especially `proof.rs` and `chain.rs`)
-- `zns-zecnames` (sibling crate) — contains a working Merkle state root + proof implementation
-- TypeScript SDK (`zcashname-sdk`) — `resolveNameWithProof`, `Status`, `Registration`, `MerkleProof`
-- `zcashname/lib/zns/` and the web app — expected shapes for listings, pricing, events
-- Running an indexer docs in the web app (`content/indexer/running.mdx`)
+- `zns-verify` — the binding verification kernel (especially `zns_psi_rcm`, `verify_binding`, memo parsing)
+- `zns-zecnames` — reference for Merkle proofs / state roots (intentionally not implemented here)
+- Sibling crates for lightwalletd access (`seer-sync`)
 
 ---
 
-This file should be updated as items are implemented. When the major gaps above are closed, the resolver should be able to serve as a drop-in or self-hosted equivalent to the public endpoints (`light.zcash.me/zns-*`).
+Update this file as the scope and priorities evolve. This resolver is intentionally narrower than the full public ZNS indexer.
