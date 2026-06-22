@@ -12,7 +12,7 @@ use zns_verify::Action;
 
 use crate::registry::Registry;
 
-use super::types::{to_name_event, to_name_record, NameEvent, Paginated, Status};
+use super::models::{to_name_event, to_name_record, NameEvent, Paginated, Status};
 
 /// Public JSON-RPC API for the ZNS resolver.
 ///
@@ -89,9 +89,11 @@ impl ZnsApiServer for JsonRpcApi {
     }
 
     fn status(&self) -> RpcResult<Status> {
-        let snap = self.registry.status_snapshot().map_err(rpc_err)?;
+        let checkpoint = self.registry.checkpoint().map_err(rpc_err)?;
+        let viewing_key = self.registry.registry_ufvk().map_err(rpc_err)?;
+        let registered = self.registry.name_count().map_err(rpc_err)?;
 
-        let (synced_height, chain_tip_height, synced, blocks_behind) = match snap.checkpoint {
+        let (synced_height, chain_tip_height, synced, blocks_behind) = match checkpoint {
             Some(c) => {
                 let sh = c.scanned_height as u64;
                 match c.chain_tip_height {
@@ -115,8 +117,8 @@ impl ZnsApiServer for JsonRpcApi {
             chain_tip_height,
             synced,
             blocks_behind,
-            viewing_key: snap.uivk.unwrap_or_default(),
-            registered: snap.name_count,
+            viewing_key: viewing_key.unwrap_or_default(),
+            registered,
         })
     }
 

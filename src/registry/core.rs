@@ -18,7 +18,7 @@ use zns_verify::{Action, Tip};
 
 use super::lifecycle;
 use super::storage;
-use super::{Checkpoint, Cursor, Event, NameNote, Registration, StatusSnapshot};
+use super::{Checkpoint, Cursor, Event, NameNote, Registration};
 use crate::orchard::DecryptedNote;
 
 pub(super) struct WriterConn {
@@ -34,15 +34,15 @@ impl WriterConn {
 
     pub(super) fn install_registry_config(
         &self,
-        uivk: &str,
+        ufvk: &str,
         network: &str,
         birthday: u32,
     ) -> rusqlite::Result<()> {
-        if let Some((stored_uivk, stored_net, stored_birthday)) = registry_config(&self.conn)? {
-            if stored_uivk != uivk {
+        if let Some((stored_ufvk, stored_net, stored_birthday)) = registry_config(&self.conn)? {
+            if stored_ufvk != ufvk {
                 tracing::warn!(
-                    stored = %stored_uivk,
-                    "registry_account uivk already set; not changing"
+                    stored = %stored_ufvk,
+                    "registry_account ufvk already set; not changing"
                 );
             }
             if stored_net != network {
@@ -61,8 +61,8 @@ impl WriterConn {
         }
 
         self.conn.execute(
-            "INSERT INTO registry_account (id, uivk, network, birthday) VALUES (0, ?1, ?2, ?3)",
-            params![uivk, network, birthday as i64],
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, ?1, ?2, ?3)",
+            params![ufvk, network, birthday as i64],
         )?;
         Ok(())
     }
@@ -241,9 +241,9 @@ pub(super) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoin
     .optional()
 }
 
-pub(super) fn registry_uivk(conn: &Connection) -> rusqlite::Result<Option<String>> {
+pub(super) fn registry_ufvk(conn: &Connection) -> rusqlite::Result<Option<String>> {
     conn.query_row(
-        "SELECT uivk FROM registry_account WHERE id = 0",
+        "SELECT ufvk FROM registry_account WHERE id = 0",
         [],
         |row| row.get(0),
     )
@@ -253,20 +253,6 @@ pub(super) fn registry_uivk(conn: &Connection) -> rusqlite::Result<Option<String
 pub(super) fn name_count(conn: &Connection) -> rusqlite::Result<u64> {
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
     Ok(n as u64)
-}
-
-/// Atomic snapshot of (checkpoint, uivk, name_count) from a single read
-/// transaction. Call this from a checked-out reader connection so the three
-/// reads are consistent relative to each other.
-pub(super) fn status_snapshot(conn: &Connection) -> rusqlite::Result<StatusSnapshot> {
-    let tx = conn.unchecked_transaction()?;
-    let snap = StatusSnapshot {
-        checkpoint: checkpoint(&tx)?,
-        uivk: registry_uivk(&tx)?,
-        name_count: name_count(&tx)?,
-    };
-    drop(tx);
-    Ok(snap)
 }
 
 pub(super) fn resolve_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option<Registration>> {
@@ -346,7 +332,7 @@ pub(super) fn events(
 
 fn registry_config(conn: &Connection) -> rusqlite::Result<Option<(String, String, i64)>> {
     conn.query_row(
-        "SELECT uivk, network, birthday FROM registry_account WHERE id = 0",
+        "SELECT ufvk, network, birthday FROM registry_account WHERE id = 0",
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )

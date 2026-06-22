@@ -15,6 +15,7 @@ mod sync; // long-running sync loop streaming blocks from lightwalletd
 use std::path::PathBuf;
 
 use sync::run_sync_loop;
+use sync::SyncError;
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
@@ -23,11 +24,15 @@ use registry::Registry;
 
 /// Registry name-note account **full viewing key** (UFVK).
 ///
+/// Must be a *full* viewing key (ufvk...), not a UIVK. The OVK self-send proof
+/// performed in observe_batch requires the outgoing viewing key material that
+/// only a UFVK provides.
+///
 /// This viewing key is the lens through which the resolver observes notes that
 /// land in the ZNS registry's "name-note" account. With it we can decrypt every
 /// note destined for that account *without* spending authority — enough to read
 /// name→address bindings encoded in note memos.
-const UFVK: &str = "uivktest18a7ht78cymvm3sxdw9myrr04nrnj8nvrqdjhadj8dp3cv8pm2dqszuxnjrjyp6xyf0svtzjxnq3976l5sxzd09mmx9g6sj9xpp67ympwsrv6wen5ye25jhvq0l8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8jja5vlzday32pgq4cccqd2rjvtlsfnn9lne9cchrcfgn87jlx9";
+const UFVK: &str = "ufvktest18a7ht78cymvm3sxdw9myrr04nrnj8nvrqdjhadj8dp3cv8pm2dqszuxnjrjyp6xyf0svtzjxnq3976l5sxzd09mmx9g6sj9xpp67ympwsrv6wen5ye25jhvq0l8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8jja5vlzday32pgq4cccqd2rjvtlsfnn9lne9cchrcfgn87jlx9";
 const NETWORK: Network = Network::TestNetwork; // which chain rules + address prefixes to use
 const LIGHTWALLETD: &str = "https://testnet.zec.rocks:443"; // upstream gRPC stream of compact blocks
 const DB_PATH: &str = "zns.sqlite"; // persisted index of verified name tips
@@ -39,7 +44,7 @@ const SCAN_BIRTHDAY: u32 = 4_000_000; // skip all blocks before this height on f
 // the consts and rebuild.
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), SyncError> {
     // --- Logging ---
     // Single global subscriber; INFO level keeps disk/UX manageable but hides
     // per-block chatter (which lives at DEBUG/TRACE inside sync::run_sync_loop).
@@ -48,8 +53,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // --- Viewing key materialization ---
-    // Decode the bech32-encoded UFVK into a strongly-typed structure. The expect
-    // here is a "panic at boot" — if the key is malformed we have nothing to do.
+    // Decode the bech32-encoded UFVK into a strongly-typed structure.
+    // Must be a full viewing key (not UIVK) because observe_batch performs
+    // an OVK self-send proof using try_decrypt_orchard_sent.
     let fvk = zcash_keys::keys::UnifiedFullViewingKey::decode(&NETWORK, UFVK)
         .expect("registry name-note UFVK must decode for NETWORK");
     // ZNS encodes every binding as an Orchard note. If this UFVK has no Orchard
@@ -70,6 +76,10 @@ async fn main() -> anyhow::Result<()> {
     // restart it will verify the stored config matches these consts and refuse
     // to start if they disagree (a safety net against pointing the same DB at
     // a different network or key).
+    //
+    // The string stored in registry_account.ufvk must be a full viewing key
+    // (ufvk...), not a UIVK. The OVK self-send proof performed in observe_batch
+    // requires the outgoing viewing key material that only a UFVK provides.
     registry
         .install_registry_config(UFVK, NETWORK, SCAN_BIRTHDAY)
         .await

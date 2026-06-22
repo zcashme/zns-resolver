@@ -42,6 +42,9 @@ pub(crate) struct DecryptedNote {
 
 /// Compact-block batch: trial-decrypt candidates, fetch raw tx, full decrypt.
 /// Uses the account's FullViewingKey (for both receive and send/OVK self-send proof).
+///
+/// The `fvk` here must be derived from a full viewing key (UFVK). An incoming
+/// viewing key is not sufficient for the mandatory OVK self-send check on ZNS memos.
 pub(crate) async fn observe_batch(
     client: &mut LwdClient,
     network: &impl Parameters,
@@ -105,6 +108,9 @@ pub(crate) async fn observe_batch(
                 // Self-send proof using the FVK (OVK side). For ZNS name notes
                 // (which must be 0-value self-sends), we require a matching send
                 // recovery with the same memo.
+                //
+                // This only works if `fvk` came from a *full* viewing key (UFVK),
+                // not a UIVK. The registry account must be configured with a UFVK.
                 let has_self_send_proof =
                     zns_verify::decrypt::try_decrypt_orchard_sent(action, fvk).is_some();
                 if memo.as_slice().starts_with(b"ZNS:") && !has_self_send_proof {
