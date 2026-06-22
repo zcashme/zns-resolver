@@ -7,10 +7,10 @@
 //! indexes name tips, and serves names using a JSON-RPC HTTP API.
 //
 
-mod jsonrpc;   // JSON-RPC HTTP server (read-only queries against the DB)
-mod orchard;   // Orchard note parsing / verification helpers
-mod registry;  // SQLite-backed store + background writer pool
-mod sync;      // long-running sync loop streaming blocks from lightwalletd
+mod jsonrpc; // JSON-RPC API implementation (owns the public contract)
+mod orchard; // Orchard note parsing / verification helpers
+mod registry; // SQLite-backed store + background writer pool
+mod sync; // long-running sync loop streaming blocks from lightwalletd
 
 use std::path::PathBuf;
 
@@ -28,11 +28,11 @@ use registry::Registry;
 /// note destined for that account *without* spending authority — enough to read
 /// name→address bindings encoded in note memos.
 const UFVK: &str = "uivktest18a7ht78cymvm3sxdw9myrr04nrnj8nvrqdjhadj8dp3cv8pm2dqszuxnjrjyp6xyf0svtzjxnq3976l5sxzd09mmx9g6sj9xpp67ympwsrv6wen5ye25jhvq0l8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8jja5vlzday32pgq4cccqd2rjvtlsfnn9lne9cchrcfgn87jlx9";
-const NETWORK: Network = Network::TestNetwork;     // which chain rules + address prefixes to use
+const NETWORK: Network = Network::TestNetwork; // which chain rules + address prefixes to use
 const LIGHTWALLETD: &str = "https://testnet.zec.rocks:443"; // upstream gRPC stream of compact blocks
-const DB_PATH: &str = "zns.sqlite";                  // persisted index of verified name tips
-const RPC_ADDR: &str = "127.0.0.1:8080";             // where clients send JSON-RPC name queries
-const SCAN_BIRTHDAY: u32 = 4_000_000;                // skip all blocks before this height on first sync
+const DB_PATH: &str = "zns.sqlite"; // persisted index of verified name tips
+const RPC_ADDR: &str = "127.0.0.1:8080"; // where clients send JSON-RPC name queries
+const SCAN_BIRTHDAY: u32 = 4_000_000; // skip all blocks before this height on first sync
 
 // NOTE: everything above is constant. This binary is statically configured at
 // compile time — there is no CLI, env, or config file. To change behavior, edit
@@ -79,35 +79,26 @@ async fn main() -> anyhow::Result<()> {
         });
 
     // --- RPC server ---
-    // Started *before* the sync loop begins: clients can connect immediately and
+    // Started *before* the sync loop so clients can connect immediately and
     // query whatever the DB already knows. Empty results are valid until sync
-    // catches up. The handle lets us shut the listener down gracefully later.
-    let rpc_handle = serve_rpc(RPC_ADDR, registry.clone())
+    // catches up. The handle is kept alive for the scope of this function
+    // (renamed `_rpc_handle`) — dropping a `ServerHandle` stops the server, and
+    // we intentionally want it to live as long as the process does.
+    let _rpc_handle = serve_rpc(RPC_ADDR, registry.clone())
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, "rpc server failed to start");
             std::process::exit(1);
         });
 
-    // --- Steady-state ---
-    // The sync loop is the core long-running service. It only returns on
-    // unrecoverable fatal error (or very rarely on clean voluntary exit).
-    // Transient issues (LWD disconnects, reorgs) are retried internally.
-    let loop_result = run_sync_loop(
+    run_sync_loop(
         LIGHTWALLETD,
         registry.clone(),
         NETWORK,
         SCAN_BIRTHDAY,
         orchard_fvk,
     )
-    .await;
+    .await?;
 
-    // --- Ordered shutdown (best-effort on both clean and fatal exit paths) ---
-    // Reverse order of startup.
-    let _ = rpc_handle.stop();
-    rpc_handle.stopped().await;
-    registry.shutdown().await;
-
-    loop_result?;
     Ok(())
 }
