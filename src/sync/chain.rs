@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use seer_sync::chain::{self, ChainError, LwdClient};
 
-use crate::registry::Cursor;
+
 
 async fn connect_with_retry(url: &'static str, what: &str) -> LwdClient {
     loop {
@@ -37,7 +37,7 @@ impl Lwd {
         self.client.clone()
     }
 
-    pub(crate) async fn tip(&mut self) -> Result<Cursor, ChainError> {
+    pub(crate) async fn tip(&mut self) -> Result<(u32, Option<[u8; 32]>), ChainError> {
         chain::tip(&mut self.client).await
     }
 }

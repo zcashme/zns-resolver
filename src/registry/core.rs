@@ -1,224 +1,197 @@
 //! Transactional core of the registry.
 
 use std::collections::HashMap;
-use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use tokio_rusqlite::rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
 
 use zns_verify::{Action, Tip};
 
-use super::lifecycle;
-use super::storage;
-use super::{Checkpoint, Cursor, Event, NameNote, Registration};
-use crate::orchard::DecryptedNote;
+use super::notes;
+use super::{ChainPosition, Checkpoint, Event, NameNote, Registration};
+use crate::sync::DecryptedNote;
 
-pub(super) struct WriterConn {
-    conn: Connection,
+/// Standalone version of the logic (will be called from the tokio-rusqlite writer closure).
+pub(super) fn install_registry_config(
+    conn: &Connection,
+    ufvk: &str,
+    network: &str,
+    birthday: u32,
+) -> rusqlite::Result<()> {
+    if let Some((stored_ufvk, stored_net, stored_birthday)) = registry_config(conn)? {
+        if stored_ufvk != ufvk {
+            tracing::warn!(
+                stored = %stored_ufvk,
+                "registry_account ufvk already set; not changing"
+            );
+        }
+        if stored_net != network {
+            tracing::warn!(
+                stored = %stored_net,
+                "registry_account network already set; not changing"
+            );
+        }
+        if stored_birthday != birthday as i64 {
+            tracing::warn!(
+                stored = stored_birthday,
+                "registry_account birthday already set; not changing"
+            );
+        }
+        return Ok(());
+    }
+
+    conn.execute(
+        "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, ?1, ?2, ?3)",
+        params![ufvk, network, birthday as i64],
+    )?;
+    Ok(())
 }
 
-impl WriterConn {
-    pub(super) fn open(path: &Path) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(storage::SCHEMA_SQL)?;
-        Ok(Self { conn })
+/// The main write path.
+///
+/// Phase 1 (no transaction): for each decrypted note, read the name's tip
+/// (from the in-batch `pending_tips` map, or from the committed DB state via
+/// a plain `SELECT`) and run `notes::try_admit_name_note` (which parses
+/// the memo, performs the ZNS binding verification directly via zns-verify,
+/// and returns a fully constructed `NameNote` on success). Admitted notes are
+/// collected and their new tips recorded in `pending_tips` so a later note
+/// for the same name in the same batch sees the updated tip.
+///
+/// Phase 2 (one transaction): write all admitted events, upsert/delete the
+/// per-name tip rows, and advance `scan_state` in the same transaction.
+/// Readers see either the pre-batch or post-batch state — never partial
+/// (WAL snapshot isolation + atomic commit).
+///
+/// SAFETY (TOCTOU on the tip): the offline tip read in Phase 1 and the tx
+/// write in Phase 2 are consistent because the serialized execution inside
+/// the Registry impl is the sole mutator. No other code path can write to
+/// `names` between Phase 1 and Phase 2.
+///
+/// The body will run inside a single tokio-rusqlite .call closure.
+pub(super) fn apply_batch(
+    conn: &Connection,
+    scanned: ChainPosition,
+    live: ChainPosition,
+    decrypted: &[DecryptedNote],
+) -> rusqlite::Result<Vec<NameNote>> {
+    let mut pending_tips: HashMap<String, Tip> = HashMap::new();
+    let mut admitted: Vec<NameNote> = Vec::new();
+
+    for n in decrypted {
+        let Some(name) = notes::name_from_memo(n.memo.as_slice()) else {
+            continue;
+        };
+
+        let tip: Option<Tip> = match pending_tips.get(&name) {
+            Some(t) => Some(*t),
+            None => read_tip_offline(conn, &name)?,
+        };
+
+        let Some(name_note) = notes::try_admit_name_note(n.memo.as_slice(), n, tip.as_ref())
+        else {
+            notes::warn_registry_fork(n.memo.as_slice(), n, tip.as_ref());
+            continue;
+        };
+
+        pending_tips.insert(
+            name_note.name.clone(),
+            Tip {
+                action: name_note.action,
+                rcm: name_note.rcm,
+            },
+        );
+        admitted.push(name_note);
     }
 
-    pub(super) fn install_registry_config(
-        &self,
-        ufvk: &str,
-        network: &str,
-        birthday: u32,
-    ) -> rusqlite::Result<()> {
-        if let Some((stored_ufvk, stored_net, stored_birthday)) = registry_config(&self.conn)? {
-            if stored_ufvk != ufvk {
-                tracing::warn!(
-                    stored = %stored_ufvk,
-                    "registry_account ufvk already set; not changing"
-                );
-            }
-            if stored_net != network {
-                tracing::warn!(
-                    stored = %stored_net,
-                    "registry_account network already set; not changing"
-                );
-            }
-            if stored_birthday != birthday as i64 {
-                tracing::warn!(
-                    stored = stored_birthday,
-                    "registry_account birthday already set; not changing"
-                );
-            }
-            return Ok(());
-        }
 
-        self.conn.execute(
-            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, ?1, ?2, ?3)",
-            params![ufvk, network, birthday as i64],
+    let tx = conn.unchecked_transaction()?;
+    for nn in &admitted {
+        insert_event(
+            &tx,
+            &nn.name,
+            &nn.ua,
+            &nn.prev_rcm,
+            &nn.rcm,
+            &nn.psi,
+            &nn.cmx,
+            &nn.txid,
+            nn.height,
+            nn.action,
+            nn.action_index,
+            &nn.raw_tx,
         )?;
-        Ok(())
-    }
 
-    /// The main write path.
-    ///
-    /// Phase 1 (no transaction): for each decrypted note, read the name's tip
-    /// (from the in-batch `pending_tips` map, or from the committed DB state via
-    /// a plain `SELECT`) and run `lifecycle::try_admit_name_note` (which performs
-    /// the ZNS binding verification directly via zns-verify). Admitted notes are
-    /// collected and their new tips recorded in `pending_tips` so a later note
-    /// for the same name in the same batch sees the updated tip.
-    ///
-    /// Phase 2 (one transaction): write all admitted events, upsert/delete the
-    /// per-name tip rows, and advance `scan_state` in the same transaction.
-    /// Readers see either the pre-batch or post-batch state — never partial
-    /// (WAL snapshot isolation + atomic commit).
-    ///
-    /// SAFETY (TOCTOU on the tip): the offline tip read in Phase 1 and the tx
-    /// write in Phase 2 are consistent because `WriterConn` is owned by a
-    /// single thread and is the only mutator. No other code path can write to
-    /// `names` between Phase 1 and Phase 2.
-    pub(super) fn apply_batch(
-        &self,
-        scanned: Cursor,
-        live: Cursor,
-        decrypted: &[DecryptedNote],
-    ) -> rusqlite::Result<Vec<NameNote>> {
-        let mut pending_tips: HashMap<String, Tip> = HashMap::new();
-        let mut admitted: Vec<NameNote> = Vec::new();
-
-        for n in decrypted {
-            let Some(claim) = lifecycle::lifecycle_claim_from_memo(n.memo.as_slice()) else {
-                continue;
-            };
-
-            let tip: Option<Tip> = match pending_tips.get(&claim.name) {
-                Some(t) => Some(*t),
-                None => read_tip_offline(&self.conn, &claim.name)?,
-            };
-
-            let Some((prev_rcm, psi, rcm)) =
-                lifecycle::try_admit_name_note(&claim, n, tip.as_ref())
-            else {
-                lifecycle::warn_registry_fork(&claim, n, tip.as_ref());
-                continue;
-            };
-
-            let name_note = NameNote {
-                name: claim.name.clone(),
-                ua: claim.ua.clone(),
-                action: claim.action,
-                prev_rcm,
-                rcm,
-                psi,
-                cmx: n.cmx,
-                txid: n.txid,
-                height: n.height,
-                action_index: n.action_index,
-                raw_tx: n.raw_tx.clone(),
-            };
-
-            pending_tips.insert(
-                name_note.name.clone(),
-                Tip {
-                    action: name_note.action,
-                    rcm: name_note.rcm,
-                },
-            );
-            admitted.push(name_note);
-        }
-
-        let tx = self.conn.unchecked_transaction()?;
-        for nn in &admitted {
-            insert_event(
-                &tx,
-                &nn.name,
-                &nn.ua,
-                &nn.prev_rcm,
-                &nn.rcm,
-                &nn.psi,
-                &nn.cmx,
-                &nn.txid,
-                nn.height,
-                nn.action,
-                nn.action_index,
-                &nn.raw_tx,
+        if nn.action == Action::Release {
+            tx.execute("DELETE FROM names WHERE name = ?1", params![nn.name])?;
+        } else {
+            tx.execute(
+                "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index, raw_tx)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT (name) DO UPDATE SET
+                   height = excluded.height, action = excluded.action, ua = excluded.ua,
+                   prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
+                   cmx = excluded.cmx, txid = excluded.txid, action_index = excluded.action_index,
+                   raw_tx = excluded.raw_tx",
+                params![
+                    nn.name,
+                    nn.height as i64,
+                    action_str(nn.action),
+                    nn.ua,
+                    nn.prev_rcm.as_slice(),
+                    nn.rcm.as_slice(),
+                    nn.psi.as_slice(),
+                    nn.cmx.as_slice(),
+                    nn.txid.as_slice(),
+                    nn.action_index as i64,
+                    nn.raw_tx,
+                ],
             )?;
-
-            if nn.action == Action::Release {
-                tx.execute("DELETE FROM names WHERE name = ?1", params![nn.name])?;
-            } else {
-                tx.execute(
-                    "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index, raw_tx)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                     ON CONFLICT (name) DO UPDATE SET
-                       height = excluded.height, action = excluded.action, ua = excluded.ua,
-                       prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
-                       cmx = excluded.cmx, txid = excluded.txid, action_index = excluded.action_index,
-                       raw_tx = excluded.raw_tx",
-                    params![
-                        nn.name,
-                        nn.height as i64,
-                        action_str(nn.action),
-                        nn.ua,
-                        nn.prev_rcm.as_slice(),
-                        nn.rcm.as_slice(),
-                        nn.psi.as_slice(),
-                        nn.cmx.as_slice(),
-                        nn.txid.as_slice(),
-                        nn.action_index as i64,
-                        nn.raw_tx,
-                    ],
-                )?;
-            }
         }
-
-        set_checkpoint_in_tx(
-            &tx,
-            Checkpoint {
-                scanned_height: scanned.0,
-                scanned_hash: scanned.1,
-                chain_tip_height: Some(live.0),
-                chain_tip_hash: live.1,
-            },
-        )?;
-        tx.commit()?;
-        Ok(admitted)
     }
 
-    /// Roll back to `fork_height`: delete events past the fork, rebuild each
-    /// affected name's tip from surviving history, and write a checkpoint at
-    /// `fork_height`. Always shallow (no nuke path) — the shallow logic is
-    /// correct for any depth and avoids a silent full rescan from birthday.
-    pub(super) fn rewind(&self, fork_height: u32, _scanned_height: u32) -> rusqlite::Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+    set_checkpoint_in_tx(
+        &tx,
+        Checkpoint {
+            scanned_height: scanned.height,
+            scanned_hash: scanned.hash,
+            chain_tip_height: Some(live.height),
+            chain_tip_hash: live.hash,
+        },
+    )?;
+    tx.commit()?;
+    Ok(admitted)
+}
 
-        let mut stmt = tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
-        let affected: Vec<String> = stmt
-            .query_map(params![fork_height as i64], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        drop(stmt);
+/// Standalone version.
+pub(super) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
 
-        tx.execute(
-            "DELETE FROM name_events WHERE height > ?1",
-            params![fork_height as i64],
-        )?;
+    let mut stmt = tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
+    let affected: Vec<String> = stmt
+        .query_map(params![fork_height as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
 
-        for name in &affected {
-            rebuild_name_tip(&tx, name)?;
-        }
+    tx.execute(
+        "DELETE FROM name_events WHERE height > ?1",
+        params![fork_height as i64],
+    )?;
 
-        set_checkpoint_in_tx(
-            &tx,
-            Checkpoint {
-                scanned_height: fork_height,
-                scanned_hash: None,
-                chain_tip_height: None,
-                chain_tip_hash: None,
-            },
-        )?;
-
-        tx.commit()?;
-        Ok(())
+    for name in &affected {
+        rebuild_name_tip(&tx, name)?;
     }
+
+    set_checkpoint_in_tx(
+        &tx,
+        Checkpoint {
+            scanned_height: fork_height,
+            scanned_hash: None,
+            chain_tip_height: None,
+            chain_tip_hash: None,
+        },
+    )?;
+
+    tx.commit()?;
+    Ok(())
 }
 
 // ── reads (free functions; callable from any &Connection under WAL) ──────────
@@ -334,8 +307,8 @@ fn registry_config(conn: &Connection) -> rusqlite::Result<Option<(String, String
 }
 
 /// Plain `SELECT` of a name's tip — no transaction. Used by `apply_batch`
-/// Phase 1. Safe alongside the Phase 2 tx because the writer thread is the
-/// sole mutator (see `WriterConn::apply_batch` SAFETY note).
+/// Phase 1. Safe alongside the Phase 2 tx because the serialized execution
+/// inside the Registry impl is the sole mutator.
 fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<Tip>> {
     conn.query_row(
         "SELECT action, rcm FROM names WHERE name = ?1",

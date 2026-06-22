@@ -1,9 +1,4 @@
 //! Durable representation of the ZNS name index.
-//
-// WAL is set by the writer's first open and persisted on the DB file; reader
-// connections inherit it. `busy_timeout` is set on every connection so the
-// writer's `commit` retries with backoff if a reader holds a read lock during
-// a WAL checkpoint, instead of returning `SQLITE_BUSY`.
 
 /// The SQL to create the name index tables (and supporting state).
 /// Run once by the writer connection at startup.

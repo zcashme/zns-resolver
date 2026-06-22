@@ -8,21 +8,25 @@
 //! is enforced inside the implementation. Callers outside this module should
 //! only use the high-level operations and types defined here.
 
+use tokio_rusqlite::rusqlite;
 use zns_verify::Action;
 
 mod core;
 mod handle;
-mod lifecycle;
+mod notes;
 mod storage;
 
-// The boundary type for the rest of the crate.
+// `Registry` (the handle) plus the types below form the public boundary
+// for the name index.
 //
-// Implementation details (threading, pools, Op dispatch) live in handle.rs
-// so the concurrency rules stay isolated. Prefer the methods and types
-// defined in this file when using the registry from sync or jsonrpc.
+// All implementation details live inside `Registry`:
+// - one tokio-rusqlite writer connection (serialized writes)
+// - a small pool of rusqlite connections for synchronous reads (WAL)
+// Callers only see the high-level API and these types.
+
 pub(crate) use handle::Registry;
 
-// ── boundary types for sync + readers ─────────────────────────────────────────
+// ── supporting types (part of the boundary) ───────────────────────────────────
 
 /// A position on chain (height + optional hash).
 /// Used for scan progress and chain tip when talking to the index.
@@ -56,10 +60,6 @@ pub(crate) struct ResumeInfo {
 pub(crate) struct BatchOutcome {
     pub indexed: usize,
 }
-
-// Legacy tuple alias used internally by the chain layer.
-// Prefer ChainPosition when interacting with the registry boundary.
-pub(crate) type Cursor = (u32, Option<[u8; 32]>);
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -116,3 +116,5 @@ pub(crate) struct Event {
 #[derive(thiserror::Error, Debug)]
 #[error(transparent)]
 pub(crate) struct RegistryError(#[from] rusqlite::Error);
+
+

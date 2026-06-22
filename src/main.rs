@@ -8,8 +8,7 @@
 //
 
 mod jsonrpc; // JSON-RPC API implementation (owns the public contract)
-mod orchard; // Orchard note parsing / verification helpers
-mod registry; // SQLite-backed store + background writer pool
+mod registry; // SQLite-backed name index (tokio-rusqlite writer + reader pool)
 mod sync; // long-running sync loop streaming blocks from lightwalletd
 
 use std::path::PathBuf;
@@ -66,9 +65,9 @@ async fn main() -> Result<(), SyncError> {
 
     // --- Persistent layer bootstrap ---
     // `Registry::start` creates the name index (the boundary on top of the
-    // SQLite store). It owns the writer thread + reader pool internally.
+    // SQLite store). It owns the tokio-rusqlite writer + reader pool internally.
     // The handle is cheap to `.clone()` (Arc) and shared by sync + RPC.
-    let registry = Registry::start(PathBuf::from(DB_PATH)).unwrap_or_else(|e| {
+    let registry = Registry::start(PathBuf::from(DB_PATH)).await.unwrap_or_else(|e| {
         tracing::error!(error = %e, "registry database failed to open");
         std::process::exit(1);
     });

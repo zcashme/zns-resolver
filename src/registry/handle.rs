@@ -1,117 +1,113 @@
-//! Internal implementation of the registry boundary (writer thread + reader pool).
+//! Concrete `Registry` implementation using tokio-rusqlite.
 //!
-//! This module contains the concurrency machinery that enforces the core
-//! invariant (single writer for safe per-name chain verification + atomic
-//! commits). Callers should go through the high-level API and types in
-//! `registry.rs` instead of reaching into here.
+//! - Writes (`install`, `apply_batch`, `rewind`) are serialized through a single
+//!   `tokio_rusqlite::Connection` (the single-writer guarantee for per-name
+//!   chain integrity and atomic checkpoints lives here).
+//! - Reads are synchronous and go through a small fixed-size pool of plain
+//!   `rusqlite::Connection`s (WAL snapshot isolation).
+//! - The handle is cheap to clone (Arc<Inner>).
+//! - Startup opens the writer, runs schema, then opens the reader pool.
 
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
-use tokio::sync::oneshot;
 use zcash_protocol::consensus::Network;
 
-use super::core::{self, WriterConn};
+use tokio_rusqlite::rusqlite::{self, Connection};
+use tokio_rusqlite::Connection as AsyncConnection;
+
+use super::core::{self};
 use super::storage;
 use super::{
-    BatchOutcome, ChainPosition, Checkpoint, Cursor, Event, NameNote, Registration, RegistryError,
-    ResumeInfo,
+    BatchOutcome, ChainPosition, Checkpoint, Event, Registration, RegistryError, ResumeInfo,
 };
-use crate::orchard::DecryptedNote;
+use crate::sync::DecryptedNote;
 use zns_verify::Action;
+
+/// Turn a non-application error from the tokio-rusqlite layer (connection
+/// closed, executor panic, etc.) into a RegistryError. Real rusqlite errors
+/// from inside closures are propagated directly.
+fn map_call_err(ctx: &str, e: impl std::fmt::Display) -> RegistryError {
+    RegistryError::from(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+        Some(format!("{}: {}", ctx, e)),
+    ))
+}
 
 const DEFAULT_READER_POOL_SIZE: usize = 8;
 
-/// Cloneable handle to the registry index.
 #[derive(Clone)]
 pub(crate) struct Registry {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    writer_tx: Sender<Op>,
+    writer: AsyncConnection,
     reader_pool: ReaderPool,
 }
 
-// ── write ops (sent to the writer thread) ────────────────────────────────────
-
-enum Op {
-    InstallRegistryConfig {
-        ufvk: String,
-        network: String,
-        birthday: u32,
-        reply: oneshot::Sender<Result<(), rusqlite::Error>>,
-    },
-    ApplyBatch {
-        scanned: Cursor,
-        live: Cursor,
-        decrypted: Vec<DecryptedNote>,
-        reply: oneshot::Sender<Result<Vec<NameNote>, rusqlite::Error>>,
-    },
-    Rewind {
-        fork_height: u32,
-        scanned_height: u32,
-        reply: oneshot::Sender<Result<(), rusqlite::Error>>,
-    },
-}
-
 impl Registry {
-    pub(crate) fn start(path: PathBuf) -> Result<Self, RegistryError> {
-        Self::start_with(path, DEFAULT_READER_POOL_SIZE)
+    /// Open the registry (name index) at the given path.
+    ///
+    /// This is async because the writer connection is backed by tokio-rusqlite.
+    /// On first open it creates the DB file (if needed) and applies the schema.
+    pub(crate) async fn start(path: PathBuf) -> Result<Self, RegistryError> {
+        Self::start_with(path, DEFAULT_READER_POOL_SIZE).await
     }
 
-    pub(crate) fn start_with(path: PathBuf, pool_size: usize) -> Result<Self, RegistryError> {
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (op_tx, op_rx) = mpsc::channel();
+    pub(crate) async fn start_with(path: PathBuf, pool_size: usize) -> Result<Self, RegistryError> {
+        // Open writer first (this is the serialized execution path).
+        let writer = AsyncConnection::open(&path).await?;
 
-        let path_for_pool = path.clone();
-        // The writer thread `JoinHandle` is intentionally dropped here: the
-        // thread runs for the process lifetime. If it panics, the `Op` channel
-        // disconnects and callers receive a RegistryError (wrapping a synthesized
-        // rusqlite error); the sync loop treats registry failures as fatal.
-        std::thread::Builder::new()
-            .name("registry-writer".into())
-            .spawn(move || match WriterConn::open(&path) {
-                Ok(conn) => {
-                    let _ = ready_tx.send(Ok(()));
-                    run_writer_thread(conn, op_rx);
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                }
-            })
-            .expect("spawn registry-writer");
+        // Run schema (CREATEs are IF NOT EXISTS; also sets WAL mode etc.).
+        writer
+            .call(|conn| conn.execute_batch(storage::SCHEMA_SQL))
+            .await
+            .map_err(|e| match e {
+                tokio_rusqlite::Error::Error(inner) => RegistryError::from(inner),
+                other => map_call_err("schema initialization", other),
+            })?;
 
-        match ready_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                return Err(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
-                    Some("registry writer thread exited before ready".into()),
-                ).into())
-            }
-        }
-
+        // Open the reader pool *after* the writer so WAL is configured and
+        // the DB file exists.
         let mut reader_conns = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
-            let c = Connection::open(&path_for_pool)?;
+            let c = Connection::open(&path)?;
             c.execute_batch(storage::READER_PRAGMAS)?;
             reader_conns.push(c);
         }
 
         Ok(Self {
             inner: Arc::new(Inner {
-                writer_tx: op_tx,
+                writer,
                 reader_pool: ReaderPool::new(reader_conns),
             }),
         })
     }
 
-    // ── writes (async; serialized on the writer thread) ──
+    /// Helper for serialized calls on the writer connection.
+    /// Turns background execution / connection errors into RegistryError.
+    async fn with_writer<F, T>(&self, f: F) -> Result<T, RegistryError>
+    where
+        F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.inner
+            .writer
+            .call(f)
+            .await
+            .map_err(|e| match e {
+                // Real error returned by the closure (e.g. a failed INSERT,
+                // constraint violation, etc.) — preserve it.
+                tokio_rusqlite::Error::Error(inner) => RegistryError::from(inner),
+                // Connection/executor problems — turn into synthetic error.
+                other => map_call_err("writer call", other),
+            })
+    }
+
+    // ── writes (async; serialized via tokio-rusqlite writer connection) ──
 
     pub(crate) async fn install_registry_config(
         &self,
@@ -119,19 +115,17 @@ impl Registry {
         network: Network,
         birthday: u32,
     ) -> Result<(), RegistryError> {
+        let ufvk = ufvk.to_owned();
         let net_str = network_to_str(network);
-        let (reply, rx) = oneshot::channel();
-        self.send_op(Op::InstallRegistryConfig {
-            ufvk: ufvk.to_string(),
-            network: net_str.to_string(),
-            birthday,
-            reply,
-        })?;
-        await_reply(rx).await
+        self.with_writer(move |conn| {
+            core::install_registry_config(conn, &ufvk, &net_str, birthday)
+        })
+        .await?;
+        Ok(())
     }
 
     /// High-level boundary API for the sync loop.
-    /// Performs verification + admission inside the safe single-writer context
+    /// Performs verification and note construction inside the safe single-writer context
     /// and advances the atomic checkpoint.
     pub(crate) async fn apply_batch(
         &self,
@@ -139,17 +133,11 @@ impl Registry {
         scanned: ChainPosition,
         tip: ChainPosition,
     ) -> Result<BatchOutcome, RegistryError> {
-        let scanned_cur: Cursor = scanned.into();
-        let live_cur: Cursor = tip.into();
-
-        let (reply, rx) = oneshot::channel();
-        self.send_op(Op::ApplyBatch {
-            scanned: scanned_cur,
-            live: live_cur,
-            decrypted,
-            reply,
-        })?;
-        let indexed_notes = await_reply(rx).await?;
+        let indexed_notes = self
+            .with_writer(move |conn| {
+                core::apply_batch(conn, scanned, tip, &decrypted)
+            })
+            .await?;
         Ok(BatchOutcome {
             indexed: indexed_notes.len(),
         })
@@ -158,16 +146,16 @@ impl Registry {
     /// High-level boundary API for reorg handling.
     /// Rewinds the name index to the given fork height.
     pub(crate) async fn rewind(&self, fork_height: u32) -> Result<(), RegistryError> {
-        let (reply, rx) = oneshot::channel();
-        self.send_op(Op::Rewind {
-            fork_height,
-            scanned_height: 0, // no longer used by the implementation
-            reply,
-        })?;
-        await_reply(rx).await
+        self.with_writer(move |conn| core::rewind(conn, fork_height))
+            .await?;
+        Ok(())
     }
 
-    // ── reads (sync; concurrent via the pool; WAL snapshot per call) ──
+    // ── reads (sync via reader pool; WAL snapshot isolation per call) ──
+    // Readers run on a small pool of plain rusqlite connections (concurrent
+    // with the single writer thanks to WAL). The pool uses mpsc checkout so
+    // only a limited number of readers are active at once.
+    // Writes are fully serialized on the tokio-rusqlite writer connection.
 
     /// Returns the information the sync loop needs to decide where to resume.
     /// `birthday` is used only when there is no persisted checkpoint yet.
@@ -236,79 +224,24 @@ impl Registry {
 
     // ── private helpers ──
 
-    fn send_op(&self, op: Op) -> Result<(), RegistryError> {
-        // send() returns Err only if the writer thread has disconnected its
-        // receiver (panic or process exit). We synthesize a rusqlite error
-        // (which then becomes a RegistryError) so the whole surface is uniform.
-        self.inner
-            .writer_tx
-            .send(op)
-            .map_err(|_| internal_failure("registry writer thread channel closed"))?;
-        Ok(())
-    }
-
     fn read<T, F>(&self, f: F) -> Result<T, RegistryError>
     where
         F: FnOnce(&Connection) -> rusqlite::Result<T>,
     {
+        // Use the reader pool for synchronous reads. Each checkout gets a
+        // dedicated rusqlite connection (WAL gives snapshot isolation).
         let conn = self.inner.reader_pool.get()?;
         Ok(f(&conn)?)
     }
 }
 
-// ── writer thread ────────────────────────────────────────────────────────────
-
-fn run_writer_thread(conn: WriterConn, rx: Receiver<Op>) {
-    // This thread runs for the process lifetime. The `Sender` lives in
-    // `Arc<Inner>` for as long as any `Registry` handle exists, so under normal
-    // operation `rx.recv()` never returns Err — the loop only exits if the
-    // thread panics (in which case senders get an error) or the process is killed.
-    while let Ok(op) = rx.recv() {
-        match op {
-            Op::InstallRegistryConfig {
-                ufvk,
-                network,
-                birthday,
-                reply,
-            } => {
-                let _ = reply.send(conn.install_registry_config(&ufvk, &network, birthday));
-            }
-            Op::ApplyBatch {
-                scanned,
-                live,
-                decrypted,
-                reply,
-            } => {
-                let _ = reply.send(conn.apply_batch(scanned, live, &decrypted));
-            }
-            Op::Rewind {
-                fork_height,
-                scanned_height,
-                reply,
-            } => {
-                let _ = reply.send(conn.rewind(fork_height, scanned_height));
-            }
-        }
-    }
-    // Only reachable via panic in the writer thread. conn drops, closing the
-    // writer connection. Any in-flight oneshot replies are dropped; callers will
-    // receive a RegistryError from await_reply.
-}
-
-async fn await_reply<T>(
-    rx: oneshot::Receiver<Result<T, rusqlite::Error>>,
-) -> Result<T, RegistryError> {
-    rx.await
-        .map_err(|_| internal_failure("registry writer thread reply channel closed"))?
-        .map_err(Into::into)
-}
-
 // ── reader pool ──────────────────────────────────────────────────────────────
 //
-// Hand-rolled fixed-size pool. N connections are pre-opened and sent into an
-// mpsc channel. `get()` recv()s one (blocking if all are checked out — the
-// channel itself is the semaphore). `PooledConn` returns the connection to the
-// channel on Drop, so a panic or early return never leaks a connection.
+// Fixed-size pool of plain rusqlite connections for synchronous reads.
+// Connections are pre-opened and parked in an mpsc channel. `get()` takes
+// one (blocking if the pool is exhausted; the channel acts as a semaphore).
+// `PooledConn` returns the connection to the pool on Drop.
+
 
 struct ReaderPool {
     return_tx: Sender<Connection>,
@@ -371,9 +304,8 @@ fn network_to_str(network: Network) -> &'static str {
     }
 }
 
-/// Turn an internal communication failure (mpsc channel, oneshot, pool) into
-/// a rusqlite::Error. It then gets wrapped into RegistryError at the API boundary
-/// so callers only ever see the tiny wrapper (which surfaces the rusqlite error).
+/// Turn an internal pool/communication failure into a rusqlite::Error so it
+/// becomes a RegistryError at the call site.
 fn internal_failure(msg: &str) -> rusqlite::Error {
     rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
