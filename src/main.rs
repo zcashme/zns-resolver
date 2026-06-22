@@ -65,9 +65,9 @@ async fn main() -> Result<(), SyncError> {
         .expect("name-note UFVK must have an Orchard component");
 
     // --- Persistent layer bootstrap ---
-    // `Registry::start` opens the SQLite file (creating if absent) and spins up
-    // the background writer pool. Returns a handle that is cheap to `.clone()`
-    // (Arc) and shared by the sync loop and the RPC server.
+    // `Registry::start` creates the name index (the boundary on top of the
+    // SQLite store). It owns the writer thread + reader pool internally.
+    // The handle is cheap to `.clone()` (Arc) and shared by sync + RPC.
     let registry = Registry::start(PathBuf::from(DB_PATH)).unwrap_or_else(|e| {
         tracing::error!(error = %e, "registry database failed to open");
         std::process::exit(1);

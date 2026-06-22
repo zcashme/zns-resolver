@@ -1,13 +1,4 @@
 //! Transactional core of the registry.
-//!
-//! Split into:
-//! - [`WriterConn`] — owned exclusively by the writer thread; the only connection
-//!   that mutates the DB. `apply_batch` runs binding verification (crypto)
-//!   *outside* the transaction in Phase 1, then writes everything in one tx in
-//!   Phase 2. Safe because the writer thread is the sole mutator — no other
-//!   thread can change a name's tip between the offline read and the tx write.
-//! - free read functions taking `&Connection` — callable from any reader
-//!   connection in the pool under WAL snapshot isolation.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -255,7 +246,10 @@ pub(super) fn name_count(conn: &Connection) -> rusqlite::Result<u64> {
     Ok(n as u64)
 }
 
-pub(super) fn resolve_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option<Registration>> {
+pub(super) fn resolve_by_name(
+    conn: &Connection,
+    name: &str,
+) -> rusqlite::Result<Option<Registration>> {
     conn.query_row(
         "SELECT name, ua, txid, height, action FROM names WHERE name = ?1",
         params![name],

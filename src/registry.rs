@@ -1,4 +1,12 @@
-//! ZNS name index in SQLite
+//! ZNS name index in SQLite.
+//!
+//! This module provides the boundary between the rest of the resolver
+//! (sync loop + JSON-RPC) and the underlying persistent store.
+//!
+//! The important invariant (single writer for per-name chain integrity during
+//! verification + write, atomic checkpoints, safe concurrent reads via WAL)
+//! is enforced inside the implementation. Callers outside this module should
+//! only use the high-level operations and types defined here.
 
 use zns_verify::Action;
 
@@ -7,13 +15,53 @@ mod handle;
 mod lifecycle;
 mod storage;
 
-// The main public (pub(crate)) surface for the rest of the crate.
+// The boundary type for the rest of the crate.
+//
+// Implementation details (threading, pools, Op dispatch) live in handle.rs
+// so the concurrency rules stay isolated. Prefer the methods and types
+// defined in this file when using the registry from sync or jsonrpc.
 pub(crate) use handle::Registry;
 
-// ── types ─────────────────────────────────────────────────────────────────────
+// ── boundary types for sync + readers ─────────────────────────────────────────
 
-/// Ephemeral scan `(height, hash)` — live tip from watcher or batch end before commit.
+/// A position on chain (height + optional hash).
+/// Used for scan progress and chain tip when talking to the index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChainPosition {
+    pub height: u32,
+    pub hash: Option<[u8; 32]>,
+}
+
+impl From<(u32, Option<[u8; 32]>)> for ChainPosition {
+    fn from((height, hash): (u32, Option<[u8; 32]>)) -> Self {
+        Self { height, hash }
+    }
+}
+
+impl From<ChainPosition> for (u32, Option<[u8; 32]>) {
+    fn from(pos: ChainPosition) -> Self {
+        (pos.height, pos.hash)
+    }
+}
+
+/// Information needed by the sync loop to resume scanning.
+#[derive(Clone, Debug)]
+pub(crate) struct ResumeInfo {
+    pub start_height: u32,
+    pub seam_hash: Option<[u8; 32]>,
+}
+
+/// Outcome of applying one batch of name notes.
+#[derive(Clone, Debug)]
+pub(crate) struct BatchOutcome {
+    pub indexed: usize,
+}
+
+// Legacy tuple alias used internally by the chain layer.
+// Prefer ChainPosition when interacting with the registry boundary.
 pub(crate) type Cursor = (u32, Option<[u8; 32]>);
+
+// ── types ─────────────────────────────────────────────────────────────────────
 
 /// Persisted `scan_state` row.
 pub(crate) struct Checkpoint {

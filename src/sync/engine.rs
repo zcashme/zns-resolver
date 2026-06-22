@@ -10,7 +10,7 @@ use seer_sync::BlockHash;
 use zcash_protocol::consensus::Network;
 
 use crate::orchard::observe_batch;
-use crate::registry::{Cursor, Registry};
+use crate::registry::{BatchOutcome, ChainPosition, Cursor, Registry};
 use crate::sync::chain::Lwd;
 use crate::sync::SyncError;
 
@@ -61,20 +61,14 @@ pub(crate) async fn run_sync_loop(
 
             Ok(RangeOutcome::Reorg { at }) => {
                 let rewind_to = at.saturating_sub(rewind_by);
-                let scanned = registry
-                    .checkpoint()
-                    .ok()
-                    .flatten()
-                    .map(|c| c.scanned_height)
-                    .unwrap_or(0);
 
                 tracing::warn!(at, rewind_to, "chain reorg");
 
-                if let Err(e) = registry.rewind(rewind_to, scanned).await {
+                if let Err(e) = registry.rewind(rewind_to).await {
                     tracing::error!(error = %e, "rewind failed");
                     // Registry errors during rewind are logged; we double the rewind step
                     // and continue. A permanent registry failure will surface on the
-                    // next apply_batch instead.
+                    // next batch instead.
                 }
 
                 rewind_by = rewind_by.saturating_mul(2);
@@ -92,13 +86,9 @@ fn resume_from_checkpoint(
     registry: &Registry,
     scan_birthday: u32,
 ) -> Result<(u32, Option<BlockHash>), crate::registry::RegistryError> {
-    let checkpoint = registry.checkpoint()?;
-    let start = checkpoint
-        .as_ref()
-        .map(|c| c.scanned_height.saturating_add(1))
-        .unwrap_or(scan_birthday);
-    let seam = checkpoint.and_then(|c| c.scanned_hash.map(BlockHash));
-    Ok((start, seam))
+    let info = registry.get_resume_info(scan_birthday)?;
+    let seam = info.seam_hash.map(BlockHash);
+    Ok((info.start_height, seam))
 }
 
 async fn wait_for_tip(lwd: &mut Lwd, start: u32) -> Result<Cursor, ChainError> {
@@ -175,27 +165,28 @@ async fn process_batch(
     let Some(last) = batch.last() else {
         return Ok(());
     };
-    let scanned = (last.height as u32, last.hash[..].try_into().ok());
+    let scanned: ChainPosition = (last.height as u32, last.hash[..].try_into().ok()).into();
 
-    let live = match lwd.tip().await {
+    let live_cursor = match lwd.tip().await {
         Ok(tip) => tip,
         Err(e) => {
             tracing::warn!(error = %e, "tip poll failed during sync");
             return Err(RangeOutcome::Reconnect);
         }
     };
+    let live: ChainPosition = live_cursor.into();
 
     match observe_batch(fetch_client, &network, fvk, batch).await {
         Ok(decrypted) => {
             let n_decrypt = decrypted.len();
-            match registry.apply_batch(scanned, live, decrypted).await {
-                Ok(indexed) => {
+            match registry.apply_batch(decrypted, scanned, live).await {
+                Ok(BatchOutcome { indexed }) => {
                     *rewind_by = REORG_REWIND_INITIAL;
                     tracing::info!(
-                        height = scanned.0,
-                        tip = live.0,
+                        height = scanned.height,
+                        tip = live.height,
                         decrypted = n_decrypt,
-                        indexed = indexed.len(),
+                        indexed,
                         "batch applied"
                     );
                 }

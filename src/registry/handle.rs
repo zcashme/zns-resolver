@@ -1,18 +1,9 @@
-//! Registry handle: writer thread + reader pool.
+//! Internal implementation of the registry boundary (writer thread + reader pool).
 //!
-//! Concurrency model: single-writer / multiple-reader.
-//! - One dedicated OS thread owns the single writer `Connection` (via
-//!   [`WriterConn`]) and processes write ops from an mpsc channel. It is the
-//!   only mutator, which guarantees per-name chain integrity (no TOCTOU on the
-//!   tip read used for binding verification).
-//! - A pool of N reader `Connection`s (default 8) lives behind an mpsc checkout
-//!   channel. Each RPC read borrows a connection, runs one query (or one read
-//!   transaction) under a WAL snapshot, and returns it. WAL permits all N
-//!   readers to run concurrently with each other and with an in-progress writer
-//!   transaction.
-//! - Writes are async: the caller sends an [`Op`] then `.await`s a
-//!   `tokio::sync::oneshot` reply, yielding the tokio worker while the writer
-//!   thread does the work.
+//! This module contains the concurrency machinery that enforces the core
+//! invariant (single writer for safe per-name chain verification + atomic
+//! commits). Callers should go through the high-level API and types in
+//! `registry.rs` instead of reaching into here.
 
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -25,7 +16,10 @@ use zcash_protocol::consensus::Network;
 
 use super::core::{self, WriterConn};
 use super::storage;
-use super::{Checkpoint, Cursor, Event, NameNote, Registration, RegistryError};
+use super::{
+    BatchOutcome, ChainPosition, Checkpoint, Cursor, Event, NameNote, Registration, RegistryError,
+    ResumeInfo,
+};
 use crate::orchard::DecryptedNote;
 use zns_verify::Action;
 
@@ -136,37 +130,62 @@ impl Registry {
         await_reply(rx).await
     }
 
+    /// High-level boundary API for the sync loop.
+    /// Performs verification + admission inside the safe single-writer context
+    /// and advances the atomic checkpoint.
     pub(crate) async fn apply_batch(
         &self,
-        scanned: Cursor,
-        live: Cursor,
         decrypted: Vec<DecryptedNote>,
-    ) -> Result<Vec<NameNote>, RegistryError> {
+        scanned: ChainPosition,
+        tip: ChainPosition,
+    ) -> Result<BatchOutcome, RegistryError> {
+        let scanned_cur: Cursor = scanned.into();
+        let live_cur: Cursor = tip.into();
+
         let (reply, rx) = oneshot::channel();
         self.send_op(Op::ApplyBatch {
-            scanned,
-            live,
+            scanned: scanned_cur,
+            live: live_cur,
             decrypted,
             reply,
         })?;
-        await_reply(rx).await
+        let indexed_notes = await_reply(rx).await?;
+        Ok(BatchOutcome {
+            indexed: indexed_notes.len(),
+        })
     }
 
-    pub(crate) async fn rewind(
-        &self,
-        fork_height: u32,
-        scanned_height: u32,
-    ) -> Result<(), RegistryError> {
+    /// High-level boundary API for reorg handling.
+    /// Rewinds the name index to the given fork height.
+    pub(crate) async fn rewind(&self, fork_height: u32) -> Result<(), RegistryError> {
         let (reply, rx) = oneshot::channel();
         self.send_op(Op::Rewind {
             fork_height,
-            scanned_height,
+            scanned_height: 0, // no longer used by the implementation
             reply,
         })?;
         await_reply(rx).await
     }
 
     // ── reads (sync; concurrent via the pool; WAL snapshot per call) ──
+
+    /// Returns the information the sync loop needs to decide where to resume.
+    /// `birthday` is used only when there is no persisted checkpoint yet.
+    pub(crate) fn get_resume_info(
+        &self,
+        birthday: u32,
+    ) -> Result<ResumeInfo, RegistryError> {
+        let cp = self.checkpoint()?;
+        let start_height = cp
+            .as_ref()
+            .map(|c| c.scanned_height.saturating_add(1))
+            .unwrap_or(birthday);
+        let seam_hash = cp.and_then(|c| c.scanned_hash);
+        Ok(ResumeInfo {
+            start_height,
+            seam_hash,
+        })
+    }
 
     pub(crate) fn checkpoint(&self) -> Result<Option<Checkpoint>, RegistryError> {
         self.read(core::checkpoint)
