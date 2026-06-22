@@ -12,7 +12,6 @@ use zcash_protocol::consensus::Network;
 use crate::orchard::observe_batch;
 use crate::registry::{Cursor, Registry};
 use crate::sync::chain::Lwd;
-use crate::sync::status::SyncStatus;
 use crate::sync::SyncError;
 
 const TIP_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -33,7 +32,6 @@ pub(crate) async fn run_sync_loop(
             Ok(resume) => resume,
             Err(e) => {
                 tracing::warn!(error = %e, "checkpoint read failed");
-                registry.set_sync_status(SyncStatus::error("checkpoint read failed"));
                 continue;
             }
         };
@@ -42,13 +40,10 @@ pub(crate) async fn run_sync_loop(
             Ok(tip) => tip,
             Err(e) => {
                 tracing::warn!(error = %e, "tip poll failed");
-                registry.set_sync_status(SyncStatus::error(format!("tip poll failed: {e}")));
                 lwd.reconnect().await;
                 continue;
             }
         };
-
-        registry.set_sync_status(SyncStatus::catching_up(start, tip.0));
 
         match drive_range(
             &mut lwd,
@@ -62,9 +57,8 @@ pub(crate) async fn run_sync_loop(
         )
         .await
         {
-            Ok(RangeOutcome::Done) => {
-                registry.set_sync_status(SyncStatus::caught_up(tip.0));
-            }
+            Ok(RangeOutcome::Done) => {}
+
             Ok(RangeOutcome::Reorg { at }) => {
                 let rewind_to = at.saturating_sub(rewind_by);
                 let scanned = registry
@@ -75,20 +69,17 @@ pub(crate) async fn run_sync_loop(
                     .unwrap_or(0);
 
                 tracing::warn!(at, rewind_to, "chain reorg");
-                registry.set_sync_status(SyncStatus::catching_up(rewind_to, tip.0));
 
                 if let Err(e) = registry.rewind(rewind_to, scanned).await {
                     tracing::error!(error = %e, "rewind failed");
-                    if matches!(e, crate::registry::RegistryError::WriterDead) {
-                        return Err(SyncError::WriterDead);
-                    }
-                    registry.set_sync_status(SyncStatus::error(format!("rewind failed: {e}")));
+                    // Registry errors during rewind are logged; we double the rewind step
+                    // and continue. A permanent registry failure will surface on the
+                    // next apply_batch instead.
                 }
 
                 rewind_by = rewind_by.saturating_mul(2);
             }
             Ok(RangeOutcome::Reconnect) => {
-                registry.set_sync_status(SyncStatus::error("block stream failed, reconnecting"));
                 lwd.reconnect().await;
             }
             Err(e) => return Err(e),
@@ -200,7 +191,6 @@ async fn process_batch(
             match registry.apply_batch(scanned, live, decrypted).await {
                 Ok(indexed) => {
                     *rewind_by = REORG_REWIND_INITIAL;
-                    registry.set_sync_status(SyncStatus::catching_up(scanned.0, live.0));
                     tracing::info!(
                         height = scanned.0,
                         tip = live.0,
@@ -211,10 +201,9 @@ async fn process_batch(
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "apply_batch failed");
-                    if matches!(e, crate::registry::RegistryError::WriterDead) {
-                        return Err(RangeOutcome::Fatal(SyncError::WriterDead));
-                    }
-                    return Err(RangeOutcome::Reconnect);
+                    // Any failure talking to the registry (including the writer thread
+                    // exiting) is fatal; we surface it via the tiny RegistryError wrapper.
+                    return Err(RangeOutcome::Fatal(SyncError::Registry(e)));
                 }
             }
         }
