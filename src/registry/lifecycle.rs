@@ -1,8 +1,10 @@
 //! Memo parsing and admission control for ZNS name lifecycle events.
 
-use zns_verify::{parse_name_note, prev_rcm_for, Action, NameNote, Tip};
+use zns_verify::pallas;
+use zns_verify::verify::verify_name_note_with_witness;
+use zns_verify::{parse_name_note, prev_rcm_for, Action, NameNote, PrimeField, Tip};
 
-use crate::orchard::{verify_binding, DecryptedNote};
+use crate::orchard::DecryptedNote;
 
 /// Candidate fields parsed from a canonical lifecycle memo — **untrusted** until binding passes.
 pub(super) struct LifecycleClaim {
@@ -38,21 +40,32 @@ pub(super) fn lifecycle_claim_from_memo(
 }
 
 /// Admission gate: legal transition on our per-name chain + ZNS binding to on-chain `cmx`.
+///
+/// The binding check is performed directly with the zns-verify kernel using
+/// material extracted from the decrypted note.
 pub(super) fn try_admit_name_note(
     claim: &LifecycleClaim,
     n: &DecryptedNote,
     tip: Option<&Tip>,
 ) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
     let prev_rcm = prev_rcm_for(tip, claim.action)?;
-    let (psi, rcm) = verify_binding(
-        &n.note,
-        n.cmx,
-        claim.action,
-        &claim.name,
-        &claim.ua,
+
+    let rho = pallas::Base::from_repr(n.rho).into_option()?;
+    let expected = pallas::Base::from_repr(n.cmx).into_option()?;
+
+    let (psi, rcm) = verify_name_note_with_witness(
+        claim.action.as_bytes(),
+        claim.name.as_bytes(),
+        claim.ua.as_bytes(),
         &prev_rcm,
+        n.g_d,
+        n.pk_d,
+        n.value,
+        rho,
+        expected,
     )?;
-    Some((prev_rcm, psi, rcm))
+
+    Some((prev_rcm, psi.to_repr(), rcm.to_repr()))
 }
 
 /// If binding failed but memo's `prev_rcm` witness would verify, log a possible fork.
@@ -60,12 +73,32 @@ pub(super) fn warn_registry_fork(claim: &LifecycleClaim, n: &DecryptedNote, tip:
     let Some(prev_rcm) = prev_rcm_for(tip, claim.action) else {
         return;
     };
-    let Some(claimed) = claim.memo_prev_rcm.filter(|p| {
-        *p != prev_rcm
-            && verify_binding(&n.note, n.cmx, claim.action, &claim.name, &claim.ua, p).is_some()
+
+    let Some(claimed) = claim.memo_prev_rcm.and_then(|p| {
+        if p == prev_rcm {
+            return None;
+        }
+        let rho = pallas::Base::from_repr(n.rho).into_option()?;
+        let expected = pallas::Base::from_repr(n.cmx).into_option()?;
+
+        let matches = verify_name_note_with_witness(
+            claim.action.as_bytes(),
+            claim.name.as_bytes(),
+            claim.ua.as_bytes(),
+            &p,
+            n.g_d,
+            n.pk_d,
+            n.value,
+            rho,
+            expected,
+        )
+        .is_some();
+
+        matches.then_some(p)
     }) else {
         return;
     };
+
     tracing::warn!(
         name = %claim.name,
         height = n.height,

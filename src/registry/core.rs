@@ -1,5 +1,15 @@
 //! Transactional core of the registry.
+//!
+//! Split into:
+//! - [`WriterConn`] — owned exclusively by the writer thread; the only connection
+//!   that mutates the DB. `apply_batch` runs binding verification (crypto)
+//!   *outside* the transaction in Phase 1, then writes everything in one tx in
+//!   Phase 2. Safe because the writer thread is the sole mutator — no other
+//!   thread can change a name's tip between the offline read and the tx write.
+//! - free read functions taking `&Connection` — callable from any reader
+//!   connection in the pool under WAL snapshot isolation.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
@@ -8,16 +18,14 @@ use zns_verify::{Action, Tip};
 
 use super::lifecycle;
 use super::storage;
-use super::{Checkpoint, Cursor, Event, NameNote, Registration}; // types live in parent for now
+use super::{Checkpoint, Cursor, Event, NameNote, Registration, StatusSnapshot};
 use crate::orchard::DecryptedNote;
 
-const REORG_SHALLOW_MAX: u32 = 30;
-
-pub(super) struct DbConn {
+pub(super) struct WriterConn {
     conn: Connection,
 }
 
-impl DbConn {
+impl WriterConn {
     pub(super) fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(storage::SCHEMA_SQL)?;
@@ -30,7 +38,7 @@ impl DbConn {
         network: &str,
         birthday: u32,
     ) -> rusqlite::Result<()> {
-        if let Some((stored_uivk, stored_net, stored_birthday)) = self.registry_config()? {
+        if let Some((stored_uivk, stored_net, stored_birthday)) = registry_config(&self.conn)? {
             if stored_uivk != uivk {
                 tracing::warn!(
                     stored = %stored_uivk,
@@ -59,55 +67,43 @@ impl DbConn {
         Ok(())
     }
 
-    pub(super) fn registry_uivk(&self) -> rusqlite::Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT uivk FROM registry_account WHERE id = 0",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-    }
-
-    fn registry_config(&self) -> rusqlite::Result<Option<(String, String, i64)>> {
-        self.conn
-            .query_row(
-                "SELECT uivk, network, birthday FROM registry_account WHERE id = 0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-    }
-
-    pub(super) fn checkpoint(&self) -> rusqlite::Result<Option<Checkpoint>> {
-        self.conn
-            .query_row(
-                "SELECT height, hash, chain_tip_height, chain_tip_hash FROM scan_state WHERE id = 0",
-                [],
-                row_to_checkpoint,
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    /// The main write path. Everything for the batch + the checkpoint advance
-    /// happens inside one transaction.
+    /// The main write path.
+    ///
+    /// Phase 1 (no transaction): for each decrypted note, read the name's tip
+    /// (from the in-batch `pending_tips` map, or from the committed DB state via
+    /// a plain `SELECT`) and run `lifecycle::try_admit_name_note` (which performs
+    /// the ZNS binding verification directly via zns-verify). Admitted notes are
+    /// collected and their new tips recorded in `pending_tips` so a later note
+    /// for the same name in the same batch sees the updated tip.
+    ///
+    /// Phase 2 (one transaction): write all admitted events, upsert/delete the
+    /// per-name tip rows, and advance `scan_state` in the same transaction.
+    /// Readers see either the pre-batch or post-batch state — never partial
+    /// (WAL snapshot isolation + atomic commit).
+    ///
+    /// SAFETY (TOCTOU on the tip): the offline tip read in Phase 1 and the tx
+    /// write in Phase 2 are consistent because `WriterConn` is owned by a
+    /// single thread and is the only mutator. No other code path can write to
+    /// `names` between Phase 1 and Phase 2.
     pub(super) fn apply_batch(
         &self,
         scanned: Cursor,
         live: Cursor,
         decrypted: &[DecryptedNote],
     ) -> rusqlite::Result<Vec<NameNote>> {
-        let tx = self.conn.unchecked_transaction()?;
-        let mut indexed = Vec::new();
+        let mut pending_tips: HashMap<String, Tip> = HashMap::new();
+        let mut admitted: Vec<NameNote> = Vec::new();
 
         for n in decrypted {
-            let Some(claim) = lifecycle::lifecycle_claim_from_memo(n.memo.as_slice())
-            else {
+            let Some(claim) = lifecycle::lifecycle_claim_from_memo(n.memo.as_slice()) else {
                 continue;
             };
 
-            let tip = self.name_tip_in_tx(&tx, &claim.name)?;
+            let tip: Option<Tip> = match pending_tips.get(&claim.name) {
+                Some(t) => Some(*t),
+                None => read_tip_offline(&self.conn, &claim.name)?,
+            };
+
             let Some((prev_rcm, psi, rcm)) =
                 lifecycle::try_admit_name_note(&claim, n, tip.as_ref())
             else {
@@ -129,24 +125,35 @@ impl DbConn {
                 raw_tx: n.raw_tx.clone(),
             };
 
+            pending_tips.insert(
+                name_note.name.clone(),
+                Tip {
+                    action: name_note.action,
+                    rcm: name_note.rcm,
+                },
+            );
+            admitted.push(name_note);
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        for nn in &admitted {
             insert_event(
                 &tx,
-                &name_note.name,
-                &name_note.ua,
-                &name_note.prev_rcm,
-                &name_note.rcm,
-                &name_note.psi,
-                &name_note.cmx,
-                &name_note.txid,
-                name_note.height,
-                name_note.action,
-                name_note.action_index,
-                &name_note.raw_tx,
+                &nn.name,
+                &nn.ua,
+                &nn.prev_rcm,
+                &nn.rcm,
+                &nn.psi,
+                &nn.cmx,
+                &nn.txid,
+                nn.height,
+                nn.action,
+                nn.action_index,
+                &nn.raw_tx,
             )?;
 
-            // Release removes the name from the live index; event stays in history.
-            if name_note.action == Action::Release {
-                tx.execute("DELETE FROM names WHERE name = ?1", params![name_note.name])?;
+            if nn.action == Action::Release {
+                tx.execute("DELETE FROM names WHERE name = ?1", params![nn.name])?;
             } else {
                 tx.execute(
                     "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index, raw_tx)
@@ -157,25 +164,23 @@ impl DbConn {
                        cmx = excluded.cmx, txid = excluded.txid, action_index = excluded.action_index,
                        raw_tx = excluded.raw_tx",
                     params![
-                        name_note.name,
-                        name_note.height as i64,
-                        action_str(name_note.action),
-                        name_note.ua,
-                        name_note.prev_rcm.as_slice(),
-                        name_note.rcm.as_slice(),
-                        name_note.psi.as_slice(),
-                        name_note.cmx.as_slice(),
-                        name_note.txid.as_slice(),
-                        name_note.action_index as i64,
-                        name_note.raw_tx,
+                        nn.name,
+                        nn.height as i64,
+                        action_str(nn.action),
+                        nn.ua,
+                        nn.prev_rcm.as_slice(),
+                        nn.rcm.as_slice(),
+                        nn.psi.as_slice(),
+                        nn.cmx.as_slice(),
+                        nn.txid.as_slice(),
+                        nn.action_index as i64,
+                        nn.raw_tx,
                     ],
                 )?;
             }
-
-            indexed.push(name_note);
         }
 
-        self.set_checkpoint_in_tx(
+        set_checkpoint_in_tx(
             &tx,
             Checkpoint {
                 scanned_height: scanned.0,
@@ -185,169 +190,202 @@ impl DbConn {
             },
         )?;
         tx.commit()?;
-        Ok(indexed)
+        Ok(admitted)
     }
 
-    pub(super) fn rewind(&self, fork_height: u32, scanned_height: u32) -> rusqlite::Result<()> {
-        let depth = scanned_height.saturating_sub(fork_height);
+    /// Roll back to `fork_height`: delete events past the fork, rebuild each
+    /// affected name's tip from surviving history, and write a checkpoint at
+    /// `fork_height`. Always shallow (no nuke path) — the shallow logic is
+    /// correct for any depth and avoids a silent full rescan from birthday.
+    pub(super) fn rewind(&self, fork_height: u32, _scanned_height: u32) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
 
-        if depth > REORG_SHALLOW_MAX {
-            tx.execute("DELETE FROM name_events", [])?;
-            tx.execute("DELETE FROM names", [])?;
-            tx.execute("DELETE FROM scan_state", [])?;
-        } else {
-            let mut stmt = tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
-            let affected: Vec<String> = stmt
-                .query_map(params![fork_height as i64], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            drop(stmt);
+        let mut stmt = tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
+        let affected: Vec<String> = stmt
+            .query_map(params![fork_height as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
 
-            tx.execute(
-                "DELETE FROM name_events WHERE height > ?1",
-                params![fork_height as i64],
-            )?;
+        tx.execute(
+            "DELETE FROM name_events WHERE height > ?1",
+            params![fork_height as i64],
+        )?;
 
-            for name in &affected {
-                rebuild_name_tip(&tx, name)?;
-            }
-
-            self.set_checkpoint_in_tx(
-                &tx,
-                Checkpoint {
-                    scanned_height: fork_height,
-                    scanned_hash: None,
-                    chain_tip_height: None,
-                    chain_tip_hash: None,
-                },
-            )?;
+        for name in &affected {
+            rebuild_name_tip(&tx, name)?;
         }
+
+        set_checkpoint_in_tx(
+            &tx,
+            Checkpoint {
+                scanned_height: fork_height,
+                scanned_hash: None,
+                chain_tip_height: None,
+                chain_tip_hash: None,
+            },
+        )?;
 
         tx.commit()?;
         Ok(())
     }
+}
 
-    // --- read methods also exposed via the actor, but implemented on conn ---
-    pub(super) fn resolve_by_name(&self, name: &str) -> rusqlite::Result<Option<Registration>> {
-        self.conn
-            .query_row(
-                "SELECT name, ua, txid, height, action FROM names WHERE name = ?1",
-                params![name],
-                row_to_registration,
-            )
-            .optional()
-            .map_err(Into::into)
-    }
+// ── reads (free functions; callable from any &Connection under WAL) ──────────
 
-    pub(super) fn registrations_by_ua(
-        &self,
-        ua: &str,
-        limit: u32,
-        offset: u32,
-    ) -> rusqlite::Result<Vec<Registration>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, ua, txid, height, action FROM names
-             WHERE ua = ?1 ORDER BY name LIMIT ?2 OFFSET ?3",
-        )?;
-        let rows = stmt
-            .query_map(params![ua, limit, offset], row_to_registration)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
+pub(super) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoint>> {
+    conn.query_row(
+        "SELECT height, hash, chain_tip_height, chain_tip_hash FROM scan_state WHERE id = 0",
+        [],
+        row_to_checkpoint,
+    )
+    .optional()
+}
 
-    pub(super) fn list_registrations(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> rusqlite::Result<Vec<Registration>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, ua, txid, height, action FROM names ORDER BY name LIMIT ?1 OFFSET ?2",
-        )?;
-        let rows = stmt
-            .query_map(params![limit, offset], row_to_registration)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
+pub(super) fn registry_uivk(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT uivk FROM registry_account WHERE id = 0",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+}
 
-    pub(super) fn name_count(&self) -> rusqlite::Result<u64> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
-        Ok(n as u64)
-    }
+pub(super) fn name_count(conn: &Connection) -> rusqlite::Result<u64> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
+    Ok(n as u64)
+}
 
-    pub(super) fn events(
-        &self,
-        name: Option<&str>,
-        action: Option<Action>,
-        since_height: Option<u32>,
-        limit: u32,
-        offset: u32,
-    ) -> rusqlite::Result<(Vec<Event>, u64)> {
-        const WHERE: &str = "WHERE (?1 IS NULL OR name = ?1)
-                             AND (?2 IS NULL OR action = ?2)
-                             AND (?3 IS NULL OR height > ?3)";
-        let p = params![
-            name,
-            action.map(action_str),
-            since_height.map(|h| h as i64),
-            limit,
-            offset
-        ];
+/// Atomic snapshot of (checkpoint, uivk, name_count) from a single read
+/// transaction. Call this from a checked-out reader connection so the three
+/// reads are consistent relative to each other.
+pub(super) fn status_snapshot(conn: &Connection) -> rusqlite::Result<StatusSnapshot> {
+    let tx = conn.unchecked_transaction()?;
+    let snap = StatusSnapshot {
+        checkpoint: checkpoint(&tx)?,
+        uivk: registry_uivk(&tx)?,
+        name_count: name_count(&tx)?,
+    };
+    drop(tx);
+    Ok(snap)
+}
 
-        let total: i64 = self.conn.query_row(
-            &format!("SELECT COUNT(*) FROM name_events {WHERE}"),
-            &p[..3],
-            |r| r.get(0),
-        )?;
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT rowid, name, action, ua, txid, height, action_index FROM name_events {WHERE}
-             ORDER BY height DESC, rowid DESC LIMIT ?4 OFFSET ?5"
-        ))?;
-        let events = stmt
-            .query_map(p, |r| row_to_event(r))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((events, total as u64))
-    }
+pub(super) fn resolve_by_name(conn: &Connection, name: &str) -> rusqlite::Result<Option<Registration>> {
+    conn.query_row(
+        "SELECT name, ua, txid, height, action FROM names WHERE name = ?1",
+        params![name],
+        row_to_registration,
+    )
+    .optional()
+}
 
-    // --- helpers that must be called inside a transaction ---
+pub(super) fn registrations_by_ua(
+    conn: &Connection,
+    ua: &str,
+    limit: u32,
+    offset: u32,
+) -> rusqlite::Result<Vec<Registration>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, ua, txid, height, action FROM names
+         WHERE ua = ?1 ORDER BY name LIMIT ?2 OFFSET ?3",
+    )?;
+    let rows = stmt
+        .query_map(params![ua, limit, offset], row_to_registration)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
 
-    fn name_tip_in_tx(&self, tx: &Transaction<'_>, name: &str) -> rusqlite::Result<Option<Tip>> {
-        tx.query_row(
-            "SELECT action, rcm FROM names WHERE name = ?1",
-            params![name],
-            |row| {
-                let action = parse_action(&row.get::<_, String>(0)?)?;
-                let rcm: Vec<u8> = row.get(1)?;
-                let rcm: [u8; 32] = rcm
-                    .try_into()
-                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?;
-                Ok(Tip { action, rcm })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
-    }
+pub(super) fn list_registrations(
+    conn: &Connection,
+    limit: u32,
+    offset: u32,
+) -> rusqlite::Result<Vec<Registration>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, ua, txid, height, action FROM names ORDER BY name LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![limit, offset], row_to_registration)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
 
-    fn set_checkpoint_in_tx(
-        &self,
-        tx: &Transaction<'_>,
-        state: Checkpoint,
-    ) -> rusqlite::Result<()> {
-        tx.execute(
-            "INSERT INTO scan_state (id, height, hash, chain_tip_height, chain_tip_hash)
-             VALUES (0, ?1, ?2, ?3, ?4)
-             ON CONFLICT (id) DO UPDATE SET
-               height = ?1, hash = ?2, chain_tip_height = ?3, chain_tip_hash = ?4",
-            params![
-                state.scanned_height,
-                state.scanned_hash,
-                state.chain_tip_height.map(|h| h as i64),
-                state.chain_tip_hash,
-            ],
-        )?;
-        Ok(())
-    }
+pub(super) fn events(
+    conn: &Connection,
+    name: Option<&str>,
+    action: Option<Action>,
+    since_height: Option<u32>,
+    limit: u32,
+    offset: u32,
+) -> rusqlite::Result<(Vec<Event>, u64)> {
+    const WHERE: &str = "WHERE (?1 IS NULL OR name = ?1)
+                         AND (?2 IS NULL OR action = ?2)
+                         AND (?3 IS NULL OR height > ?3)";
+    let p = params![
+        name,
+        action.map(action_str),
+        since_height.map(|h| h as i64),
+        limit,
+        offset
+    ];
+
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM name_events {WHERE}"),
+        &p[..3],
+        |r| r.get(0),
+    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT rowid, name, action, ua, txid, height, action_index FROM name_events {WHERE}
+         ORDER BY height DESC, rowid DESC LIMIT ?4 OFFSET ?5"
+    ))?;
+    let events = stmt
+        .query_map(p, row_to_event)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((events, total as u64))
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+fn registry_config(conn: &Connection) -> rusqlite::Result<Option<(String, String, i64)>> {
+    conn.query_row(
+        "SELECT uivk, network, birthday FROM registry_account WHERE id = 0",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+}
+
+/// Plain `SELECT` of a name's tip — no transaction. Used by `apply_batch`
+/// Phase 1. Safe alongside the Phase 2 tx because the writer thread is the
+/// sole mutator (see `WriterConn::apply_batch` SAFETY note).
+fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<Tip>> {
+    conn.query_row(
+        "SELECT action, rcm FROM names WHERE name = ?1",
+        params![name],
+        |row| {
+            let action = parse_action(&row.get::<_, String>(0)?)?;
+            let rcm: Vec<u8> = row.get(1)?;
+            let rcm: [u8; 32] = rcm
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?;
+            Ok(Tip { action, rcm })
+        },
+    )
+    .optional()
+}
+
+fn set_checkpoint_in_tx(tx: &Transaction<'_>, state: Checkpoint) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO scan_state (id, height, hash, chain_tip_height, chain_tip_hash)
+         VALUES (0, ?1, ?2, ?3, ?4)
+         ON CONFLICT (id) DO UPDATE SET
+           height = ?1, hash = ?2, chain_tip_height = ?3, chain_tip_hash = ?4",
+        params![
+            state.scanned_height,
+            state.scanned_hash,
+            state.chain_tip_height.map(|h| h as i64),
+            state.chain_tip_hash,
+        ],
+    )?;
+    Ok(())
 }
 
 /// After deleting post-fork events, set `names` to the highest surviving event

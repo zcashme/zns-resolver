@@ -1,24 +1,36 @@
-//! Registry Orchard decrypt and `cmx` binding verification.
+//! Observes the ZNS registry account on chain.
+//!
+//! This module is responsible for streaming compact blocks, trial-decrypting
+//! candidate name notes, performing the self-send (OVK) check, and extracting
+//! the raw material needed for later binding verification.
+//!
+//! Binding verification itself is performed using `zns_verify` in the
+//! registry lifecycle module.
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
-use group::ff::PrimeField;
 use orchard::keys::FullViewingKey;
-use pasta_curves::pallas;
-use seer_sync::chain::{self, LwdClient};
+use seer_sync::chain::{self, ChainError, LwdClient};
 use seer_sync::proto::CompactBlock;
 use seer_sync::{parse_orchard, BlockHeight, TxId};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BranchId, Parameters};
 use zcash_protocol::memo::MemoBytes;
-use zns_verify::{note_commitment_cmx, zns_psi_rcm, Action};
 
-/// A registry Orchard note we decrypted — carries the note (for binding
-/// verification) and memo (untrusted, parsed separately).
+/// A decrypted ZNS name note candidate.
+///
+/// We immediately extract the raw `(g_d, pk_d, rho, value)` material from the
+/// `orchard::Note` (using the ZNS-patched orchard) so that binding verification
+/// can be done directly against `zns_verify` without threading the full note
+/// object through the rest of the system.
 pub(crate) struct DecryptedNote {
-    pub(crate) note: orchard::Note,
-    /// On-chain note commitment (cmx) from the action; must match our recomputation.
+    /// Raw inputs required by `zns_verify` to recompute the note commitment.
+    pub(crate) g_d: [u8; 32],
+    pub(crate) pk_d: [u8; 32],
+    pub(crate) rho: [u8; 32],
+    pub(crate) value: u64,
+
+    /// On-chain note commitment (cmx) observed in the compact block.
     pub(crate) cmx: [u8; 32],
     pub(crate) memo: MemoBytes,
     pub(crate) txid: [u8; 32],
@@ -28,24 +40,6 @@ pub(crate) struct DecryptedNote {
     pub(crate) raw_tx: Vec<u8>,
 }
 
-/// Returns `(psi, rcm)` byte reprs if the note commitment matches on-chain cmx.
-pub(crate) fn verify_binding(
-    note: &orchard::Note,
-    on_chain_cmx: [u8; 32],
-    action: Action,
-    name: &str,
-    ua: &str,
-    prev_rcm: &[u8; 32],
-) -> Option<([u8; 32], [u8; 32])> {
-    let (g_d, pk_d) = note.recipient().zns_commitment_keys();
-    let rho = pallas::Base::from_repr(note.rho().to_bytes()).into_option()?;
-    let expected = pallas::Base::from_repr(on_chain_cmx).into_option()?;
-
-    let (psi, rcm) = zns_psi_rcm(action.as_bytes(), name.as_bytes(), ua.as_bytes(), prev_rcm);
-    let cmx = note_commitment_cmx(g_d, pk_d, note.value().inner(), rho, psi, rcm)?;
-    (cmx == expected).then(|| (psi.to_repr(), rcm.to_repr()))
-}
-
 /// Compact-block batch: trial-decrypt candidates, fetch raw tx, full decrypt.
 /// Uses the account's FullViewingKey (for both receive and send/OVK self-send proof).
 pub(crate) async fn observe_batch(
@@ -53,7 +47,7 @@ pub(crate) async fn observe_batch(
     network: &impl Parameters,
     fvk: &FullViewingKey,
     blocks: &[CompactBlock],
-) -> Result<Vec<DecryptedNote>> {
+) -> Result<Vec<DecryptedNote>, ChainError> {
     type Fetched = Option<(Transaction, u32, Vec<u8>)>;
     let mut fetched: HashMap<[u8; 32], Fetched> = HashMap::new();
     let mut out = Vec::new();
@@ -74,7 +68,14 @@ pub(crate) async fn observe_batch(
                 if let std::collections::hash_map::Entry::Vacant(e) = fetched.entry(txid) {
                     let raw = chain::fetch_raw_transaction(client, &TxId::from_bytes(txid))
                         .await
-                        .with_context(|| format!("fetch tx {}", hex::encode(txid)))?;
+                        .map_err(|e| {
+                            tracing::warn!(
+                                txid = %hex::encode(txid),
+                                error = %e,
+                                "fetch raw transaction failed"
+                            );
+                            e
+                        })?;
                     let height = raw.height as u32;
                     let parsed = Transaction::read(
                         &raw.data[..],
@@ -114,8 +115,18 @@ pub(crate) async fn observe_batch(
                     continue;
                 }
 
+                // Extract the raw commitment inputs once. This lets us delegate
+                // the actual binding check to zns-verify without threading the
+                // full orchard::Note through the rest of the pipeline.
+                let (g_d, pk_d) = note.recipient().zns_commitment_keys();
+                let rho = note.rho().to_bytes();
+                let value = note.value().inner();
+
                 out.push(DecryptedNote {
-                    note,
+                    g_d,
+                    pk_d,
+                    rho,
+                    value,
                     cmx: action.cmx().to_bytes(),
                     memo,
                     txid,
