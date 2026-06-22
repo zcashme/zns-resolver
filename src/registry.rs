@@ -23,6 +23,14 @@ pub(crate) struct Checkpoint {
     pub(crate) chain_tip_hash: Option<[u8; 32]>,
 }
 
+/// Atomic snapshot of the three DB fields read by the `status` RPC, taken from
+/// a single read transaction so they are consistent relative to each other.
+pub(crate) struct StatusSnapshot {
+    pub(crate) checkpoint: Option<Checkpoint>,
+    pub(crate) uivk: Option<String>,
+    pub(crate) name_count: u64,
+}
+
 /// A verified ZNS name note: Transition + Binding passed for one decrypted note.
 pub(crate) struct NameNote {
     pub(crate) name: String,
@@ -64,6 +72,10 @@ pub(crate) struct Event {
 pub(crate) enum RegistryError {
     Db(rusqlite::Error),
     Disconnected,
+    ShuttingDown,
+    /// The background writer thread has exited (typically via panic). No further
+    /// writes are possible; this is fatal for the resolver.
+    WriterDead,
 }
 
 impl From<rusqlite::Error> for RegistryError {
@@ -72,11 +84,15 @@ impl From<rusqlite::Error> for RegistryError {
     }
 }
 
+impl std::error::Error for RegistryError {}
+
 impl std::fmt::Display for RegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Db(e) => write!(f, "{e}"),
-            Self::Disconnected => write!(f, "registry db thread disconnected"),
+            Self::Disconnected => write!(f, "registry writer thread disconnected"),
+            Self::ShuttingDown => write!(f, "registry is shutting down"),
+            Self::WriterDead => write!(f, "registry writer thread has exited"),
         }
     }
 }

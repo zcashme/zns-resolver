@@ -2798,6 +2798,7 @@ dependencies = [
  "seer-sync",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tonic",
  "tracing",
@@ -2812,7 +2813,6 @@ dependencies = [
 name = "zns-verify"
 version = "0.0.1"
 dependencies = [
- "bitvec",
  "blake2b_simd",
  "chacha20",
  "chacha20poly1305",
