@@ -134,9 +134,8 @@ async fn drive_range(
     tip: (u32, Option<[u8; 32]>),
     rewind_by: &mut u32,
 ) -> Result<RangeOutcome, SyncError> {
-    let mut fetch_client = conn.fork();
     let mut stream =
-        seer_sync::chain::blocks(conn.fork(), start, tip.0, DEFAULT_CHUNK_OUTPUTS, seam);
+        conn.create_block_stream(start, tip.0, DEFAULT_CHUNK_OUTPUTS, seam);
 
     loop {
         match stream.next().await {
@@ -147,7 +146,6 @@ async fn drive_range(
                     registry,
                     network,
                     fvk,
-                    &mut fetch_client,
                     &batch,
                     rewind_by,
                 )
@@ -173,7 +171,6 @@ async fn process_batch(
     registry: &Registry,
     network: Network,
     fvk: &FullViewingKey,
-    fetch_client: &mut seer_sync::chain::LwdClient,
     batch: &[CompactBlock],
     rewind_by: &mut u32,
 ) -> Result<(), RangeOutcome> {
@@ -191,7 +188,7 @@ async fn process_batch(
     };
     let live: ChainPosition = live_cursor.into();
 
-    match observe_batch(fetch_client, &network, fvk, batch).await {
+    match observe_batch(conn, &network, fvk, batch).await {
         Ok(decrypted) => {
             let n_decrypt = decrypted.len();
             match registry.apply_batch(decrypted, scanned, live).await {

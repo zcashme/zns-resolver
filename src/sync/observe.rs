@@ -8,9 +8,11 @@
 use std::collections::HashMap;
 
 use orchard::keys::FullViewingKey;
-use seer_sync::chain::{self, ChainError, LwdClient};
+use seer_sync::chain::ChainError;
 use seer_sync::proto::CompactBlock;
 use seer_sync::{parse_orchard, BlockHeight, TxId};
+
+use crate::sync::chain::Connection;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BranchId, Parameters};
 use zcash_protocol::memo::MemoBytes;
@@ -44,7 +46,7 @@ pub(crate) struct DecryptedNote {
 /// The `fvk` here must be derived from a full viewing key (UFVK). An incoming
 /// viewing key is not sufficient for the mandatory OVK self-send check on ZNS memos.
 pub(crate) async fn observe_batch(
-    client: &mut LwdClient,
+    conn: &Connection,
     network: &impl Parameters,
     fvk: &FullViewingKey,
     blocks: &[CompactBlock],
@@ -67,7 +69,8 @@ pub(crate) async fn observe_batch(
                 }
 
                 if let std::collections::hash_map::Entry::Vacant(e) = fetched.entry(txid) {
-                    let raw = chain::fetch_raw_transaction(client, &TxId::from_bytes(txid))
+                    let raw = conn
+                        .fetch_raw_transaction(&TxId::from_bytes(txid))
                         .await
                         .map_err(|e| {
                             tracing::warn!(
