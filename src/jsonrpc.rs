@@ -2,17 +2,17 @@
 //!
 //! `jsonrpc.rs` + submodules (no mod.rs).
 //!
-//! - models.rs: public DTOs
-//! - handlers.rs: trait + impl
+//! - records.rs: public DTOs
+//! - service.rs: trait + impl
 
-mod handlers;
-mod models;
+mod records;
+mod service;
 
-pub use handlers::JsonRpcApi;
+pub use service::JsonRpcApi;
 #[allow(unused_imports)]
-pub use models::{NameEvent, NameRecord, Paginated, Status};
+pub use records::{NameEvent, NameRecord, Paginated, Status};
 
-use handlers::ZnsApiServer;
+use service::ZnsApiServer;
 use jsonrpsee::server::ServerHandle;
 
 use crate::registry::Registry;
