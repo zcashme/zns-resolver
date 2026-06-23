@@ -26,19 +26,20 @@ use seer_sync::BlockHash;
 use zcash_protocol::consensus::Network;
 
 use crate::registry::{BatchOutcome, ChainPosition, Registry};
-use chain::Lwd;
+use chain::Connection;
 
 const TIP_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const REORG_REWIND_INITIAL: u32 = 1;
 
 pub(crate) async fn run_sync_loop(
-    lightwalletd: &'static str,
     registry: Registry,
     network: Network,
     scan_birthday: u32,
     fvk: &FullViewingKey,
 ) -> Result<(), SyncError> {
-    let mut lwd = Lwd::connect(lightwalletd).await;
+    // Connection management lives inside the sync module.
+    // We ask the chain submodule to give us a managed connection.
+    let mut conn = Connection::connect().await;
     let mut rewind_by = REORG_REWIND_INITIAL;
 
     loop {
@@ -50,17 +51,17 @@ pub(crate) async fn run_sync_loop(
             }
         };
 
-        let tip = match wait_for_tip(&mut lwd, start).await {
+        let tip = match wait_for_tip(&mut conn, start).await {
             Ok(tip) => tip,
             Err(e) => {
                 tracing::warn!(error = %e, "tip poll failed");
-                lwd.reconnect().await;
+                conn.reconnect().await;
                 continue;
             }
         };
 
         match drive_range(
-            &mut lwd,
+            &mut conn,
             &registry,
             network,
             fvk,
@@ -88,7 +89,7 @@ pub(crate) async fn run_sync_loop(
                 rewind_by = rewind_by.saturating_mul(2);
             }
             Ok(RangeOutcome::Reconnect) => {
-                lwd.reconnect().await;
+                conn.reconnect().await;
             }
             Err(e) => return Err(e),
             Ok(RangeOutcome::Fatal(e)) => return Err(e),
@@ -105,11 +106,11 @@ fn resume_from_checkpoint(
     Ok((info.start_height, seam))
 }
 
-async fn wait_for_tip(lwd: &mut Lwd, start: u32) -> Result<(u32, Option<[u8; 32]>), ChainError> {
-    let mut tip = lwd.tip().await?;
+async fn wait_for_tip(conn: &mut Connection, start: u32) -> Result<(u32, Option<[u8; 32]>), ChainError> {
+    let mut tip = conn.tip().await?;
     while tip.0 == 0 || start > tip.0 {
         tokio::time::sleep(TIP_POLL_INTERVAL).await;
-        tip = lwd.tip().await?;
+        tip = conn.tip().await?;
     }
     Ok(tip)
 }
@@ -124,7 +125,7 @@ enum RangeOutcome {
 }
 
 async fn drive_range(
-    lwd: &mut Lwd,
+    conn: &mut Connection,
     registry: &Registry,
     network: Network,
     fvk: &FullViewingKey,
@@ -133,16 +134,16 @@ async fn drive_range(
     tip: (u32, Option<[u8; 32]>),
     rewind_by: &mut u32,
 ) -> Result<RangeOutcome, SyncError> {
-    let mut fetch_client = lwd.fork();
+    let mut fetch_client = conn.fork();
     let mut stream =
-        seer_sync::chain::blocks(lwd.fork(), start, tip.0, DEFAULT_CHUNK_OUTPUTS, seam);
+        seer_sync::chain::blocks(conn.fork(), start, tip.0, DEFAULT_CHUNK_OUTPUTS, seam);
 
     loop {
         match stream.next().await {
             None => return Ok(RangeOutcome::Done),
             Some(Ok(batch)) => {
                 if let Err(outcome) = process_batch(
-                    lwd,
+                    conn,
                     registry,
                     network,
                     fvk,
@@ -168,7 +169,7 @@ async fn drive_range(
 }
 
 async fn process_batch(
-    lwd: &mut Lwd,
+    conn: &mut Connection,
     registry: &Registry,
     network: Network,
     fvk: &FullViewingKey,
@@ -181,7 +182,7 @@ async fn process_batch(
     };
     let scanned: ChainPosition = (last.height as u32, last.hash[..].try_into().ok()).into();
 
-    let live_cursor = match lwd.tip().await {
+    let live_cursor = match conn.tip().await {
         Ok(tip) => tip,
         Err(e) => {
             tracing::warn!(error = %e, "tip poll failed during sync");

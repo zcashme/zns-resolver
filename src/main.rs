@@ -31,16 +31,35 @@ use registry::Registry;
 /// land in the ZNS registry's "name-note" account. With it we can decrypt every
 /// note destined for that account *without* spending authority — enough to read
 /// name→address bindings encoded in note memos.
+#[cfg(feature = "mainnet")]
+const UFVK: &str = "ufvk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"; // TODO: replace with real mainnet registry UFVK before building for mainnet
+#[cfg(feature = "testnet")]
 const UFVK: &str = "ufvktest18a7ht78cymvm3sxdw9myrr04nrnj8nvrqdjhadj8dp3cv8pm2dqszuxnjrjyp6xyf0svtzjxnq3976l5sxzd09mmx9g6sj9xpp67ympwsrv6wen5ye25jhvq0l8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8jja5vlzday32pgq4cccqd2rjvtlsfnn9lne9cchrcfgn87jlx9";
-const NETWORK: Network = Network::TestNetwork; // which chain rules + address prefixes to use
-const LIGHTWALLETD: &str = "https://testnet.zec.rocks:443"; // upstream gRPC stream of compact blocks
+
+#[cfg(all(feature = "mainnet", feature = "testnet"))]
+compile_error!("mainnet and testnet are mutually exclusive");
+
+#[cfg(not(any(feature = "mainnet", feature = "testnet")))]
+compile_error!("enable either mainnet (default) or testnet feature");
+
+#[cfg(feature = "mainnet")]
+const NETWORK: Network = Network::MainNetwork;
+#[cfg(feature = "testnet")]
+const NETWORK: Network = Network::TestNetwork;
+
+// Lightwalletd connection management now lives inside the sync module
+// (see sync/chain.rs for the list of endpoints).
 const DB_PATH: &str = "zns.sqlite"; // persisted index of verified name tips
 const RPC_ADDR: &str = "127.0.0.1:8080"; // where clients send JSON-RPC name queries
-const SCAN_BIRTHDAY: u32 = 4_000_000; // skip all blocks before this height on first sync
+
+#[cfg(feature = "mainnet")]
+const SCAN_BIRTHDAY: u32 = 2_500_000; // skip all blocks before this height on first sync (mainnet)
+#[cfg(feature = "testnet")]
+const SCAN_BIRTHDAY: u32 = 4_000_000; // skip all blocks before this height on first sync (testnet)
 
 // NOTE: everything above is constant. This binary is statically configured at
-// compile time — there is no CLI, env, or config file. To change behavior, edit
-// the consts and rebuild.
+// compile time — there is no CLI, env, or config file. To change behavior,
+// select the network via Cargo feature (mainnet or testnet) and rebuild.
 
 #[tokio::main]
 async fn main() -> Result<(), SyncError> {
@@ -101,7 +120,6 @@ async fn main() -> Result<(), SyncError> {
         });
 
     run_sync_loop(
-        LIGHTWALLETD,
         registry.clone(),
         NETWORK,
         SCAN_BIRTHDAY,
