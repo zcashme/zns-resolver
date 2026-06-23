@@ -4,8 +4,13 @@ use std::time::Duration;
 
 use seer_sync::chain::{self, ChainError};
 
-/// The plain LwdClient from seer-sync. This is the "just the client" type.
-/// Code that only needs to send RPCs or start a blocks() stream should use this.
+/// Re-export / type alias for the raw client from seer-sync.
+///
+/// This is **just a type alias**:
+/// `LwdClient = seer_sync::chain::LwdClient = CompactTxStreamerClient<Channel>`.
+///
+/// We re-export it under a short name so the rest of the sync code can
+/// refer to it cleanly, but it carries no extra behavior.
 pub(crate) type LwdClient = seer_sync::chain::LwdClient;
 
 /// Known lightwalletd endpoints. Connection management responsibility lives here.
@@ -20,7 +25,12 @@ pub(crate) const LIGHTWALLETD_ENDPOINTS: &[&str] = &[
     // Add other reliable testnet lightwalletd servers here.
 ];
 
-/// Just a live connection to lightwalletd.
+/// A managed connection to lightwalletd.
+///
+/// This is the *domain type* used by the sync module.
+/// It wraps a raw `LwdClient` (which is just the seer-sync gRPC client)
+/// and is responsible for establishing and maintaining the connection
+/// using the endpoint list defined in this module.
 pub(crate) struct Connection {
     client: LwdClient,
 }
