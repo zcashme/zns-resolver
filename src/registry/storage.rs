@@ -5,6 +5,7 @@
 pub(super) const SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+PRAGMA wal_autocheckpoint = 5000;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 
@@ -34,7 +35,6 @@ CREATE TABLE IF NOT EXISTS name_events (
     cmx          BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
     action_index INTEGER NOT NULL,
-    raw_tx       BLOB    NOT NULL,
     PRIMARY KEY (name, height, txid, action_index)
 );
 CREATE INDEX IF NOT EXISTS idx_name_events_height ON name_events (height);
@@ -50,16 +50,7 @@ CREATE TABLE IF NOT EXISTS names (
     psi          BLOB    NOT NULL,
     cmx          BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
-    action_index INTEGER NOT NULL,
-    raw_tx       BLOB    NOT NULL
+    action_index INTEGER NOT NULL
 );
 "#;
 
-/// Pragmas applied on every reader connection at open time. `journal_mode`
-/// is omitted because it is persisted on the DB file by the writer's first
-/// open and is a no-op to re-set from a reader.
-pub(super) const READER_PRAGMAS: &str = r#"
-PRAGMA busy_timeout = 5000;
-PRAGMA synchronous = NORMAL;
-PRAGMA foreign_keys = ON;
-"#;
