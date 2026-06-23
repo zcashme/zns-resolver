@@ -39,11 +39,7 @@ pub(crate) struct ResumeInfo {
     pub seam_hash: Option<[u8; 32]>,
 }
 
-/// Outcome of applying one batch of name notes.
-#[derive(Clone, Debug)]
-pub(crate) struct BatchOutcome {
-    pub indexed: usize,
-}
+
 
 // ── types ─────────────────────────────────────────────────────────────────────
 

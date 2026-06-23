@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use seer_sync::chain as seer_chain;
 use seer_sync::{
-    run, Account, AccountError, Batch, BlockHash, BlockHeight, Cursor as SeerCursor, Resume,
-    ShieldedNote, ViewKey,
+    run, Account as SeerAccount, AccountError, Batch, BlockHash, BlockHeight, Cursor as SeerCursor,
+    Resume, ShieldedNote, ViewKey,
 };
 use zcash_protocol::memo::MemoBytes;
 
@@ -57,9 +57,8 @@ async fn connect_client() -> Option<seer_chain::LwdClient> {
 pub(crate) async fn run_sync_loop(registry: Registry) -> Result<(), SyncError> {
     let view_key = ViewKey::decode(&NETWORK, UFVK).expect("registry UFVK must be valid at startup");
 
-    let account = ZnsAccount {
-        registry: registry.clone(),
-    };
+    let account = Account(registry.clone());
+
 
     loop {
         // Obtain a fresh lightwalletd client (connection + failover is handled
@@ -90,19 +89,17 @@ pub(crate) async fn run_sync_loop(registry: Registry) -> Result<(), SyncError> {
     }
 }
 
-/// Thin adapter so we can implement seer_sync::Account.
+/// Newtype adapter so we can implement `seer_sync::Account`.
 ///
-/// seer-sync's engine drives scanning by calling resume/rewind/apply on
-/// something that implements its `Account` trait. This wrapper exists solely
-/// to satisfy that trait while delegating all real work to our `Registry`.
-struct ZnsAccount {
-    registry: Registry,
-}
+/// seer-sync's engine expects something that implements its `Account` trait
+/// (a "fold over the chain"). We provide this tiny wrapper around our
+/// `Registry` rather than making `Registry` itself implement the trait.
+struct Account(Registry);
 
-impl Account for ZnsAccount {
+impl SeerAccount for Account {
     fn resume(&self) -> Result<Resume, AccountError> {
         let info = self
-            .registry
+            .0
             .get_resume_info(SCAN_BIRTHDAY)
             .map_err(|e| Box::new(e) as AccountError)?;
 
@@ -130,7 +127,7 @@ impl Account for ZnsAccount {
     }
 
     fn rewind(&self, to: BlockHeight) -> Result<(), AccountError> {
-        let reg = self.registry.clone();
+        let reg = self.0.clone();
         let height = u32::from(to);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move { reg.rewind(height).await })
@@ -143,7 +140,7 @@ impl Account for ZnsAccount {
 
         let scanned: ChainPosition = (u32::from(at.height), at.hash.map(|h| h.0)).into();
 
-        let reg = self.registry.clone();
+        let reg = self.0.clone();
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()

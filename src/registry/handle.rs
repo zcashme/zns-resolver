@@ -21,7 +21,7 @@ use tokio_rusqlite::Connection as AsyncConnection;
 use super::core::{self};
 use super::storage;
 use super::{
-    BatchOutcome, ChainPosition, Checkpoint, Event, Registration, RegistryError, ResumeInfo,
+    ChainPosition, Checkpoint, Event, Registration, RegistryError, ResumeInfo,
 };
 use crate::sync::DecryptedNote;
 use zns_verify::Action;
@@ -128,13 +128,10 @@ impl Registry {
         decrypted: Vec<DecryptedNote>,
         scanned: ChainPosition,
         tip: ChainPosition,
-    ) -> Result<BatchOutcome, RegistryError> {
-        let indexed_notes = self
-            .with_writer(move |conn| core::apply_batch(conn, scanned, tip, &decrypted))
+    ) -> Result<(), RegistryError> {
+        self.with_writer(move |conn| core::apply_batch(conn, scanned, tip, &decrypted))
             .await?;
-        Ok(BatchOutcome {
-            indexed: indexed_notes.len(),
-        })
+        Ok(())
     }
 
     /// High-level boundary API for reorg handling.
