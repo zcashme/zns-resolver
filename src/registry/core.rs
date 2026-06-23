@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use tokio_rusqlite::rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
+use tokio_rusqlite::rusqlite::{
+    self as rusqlite, params, Connection, OptionalExtension, Row, Transaction,
+};
 
 use zns_verify::{Action, Tip};
 
@@ -86,8 +88,7 @@ pub(super) fn apply_batch(
             None => read_tip_offline(conn, &name)?,
         };
 
-        let Some(name_note) = notes::try_admit_name_note(n.memo.as_slice(), n, tip.as_ref())
-        else {
+        let Some(name_note) = notes::try_admit_name_note(n.memo.as_slice(), n, tip.as_ref()) else {
             notes::warn_registry_fork(n.memo.as_slice(), n, tip.as_ref());
             continue;
         };
@@ -101,7 +102,6 @@ pub(super) fn apply_batch(
         );
         admitted.push(name_note);
     }
-
 
     let tx = conn.unchecked_transaction()?;
     for nn in &admitted {
@@ -117,7 +117,7 @@ pub(super) fn apply_batch(
             nn.height,
             nn.action,
             nn.action_index,
-            &nn.raw_tx,
+            b"", // raw_tx no longer stored
         )?;
 
         if nn.action == Action::Release {
@@ -142,7 +142,7 @@ pub(super) fn apply_batch(
                     nn.cmx.as_slice(),
                     nn.txid.as_slice(),
                     nn.action_index as i64,
-                    nn.raw_tx,
+                    &b""[..],
                 ],
             )?;
         }
@@ -383,7 +383,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
         None => {
             tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
         }
-        Some((name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, raw_tx, action_index)) => {
+        Some((name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, _raw_tx, action_index)) => {
             if action == "release" {
                 tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
             } else {
@@ -406,7 +406,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                         cmx,
                         txid,
                         action_index,
-                        raw_tx
+                        &b""[..]
                     ],
                 )?;
             }
@@ -428,7 +428,7 @@ fn insert_event(
     height: u32,
     action: Action,
     action_index: usize,
-    raw_tx: &[u8],
+    _raw_tx: &[u8], // raw_tx no longer stored
 ) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO name_events (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index, raw_tx)
@@ -444,7 +444,7 @@ fn insert_event(
             cmx.as_slice(),
             txid.as_slice(),
             action_index as i64,
-            raw_tx
+            &b""[..]
         ],
     )?;
     Ok(())

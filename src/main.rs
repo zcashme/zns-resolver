@@ -26,12 +26,6 @@ use crate::network::{DB_PATH, NETWORK, SCAN_BIRTHDAY, UFVK};
 
 const RPC_ADDR: &str = "127.0.0.1:8080"; // where clients send JSON-RPC name queries
 
-// NOTE: The network-specific values (UFVK, NETWORK, DB_PATH, SCAN_BIRTHDAY,
-// lightwalletd endpoints, etc.) live in `network.rs`. They are true `const`s
-// selected by the `mainnet` or `testnet` Cargo feature at build time.
-// There is no CLI, env var, or config file. To target the other network,
-// rebuild with the appropriate feature.
-
 #[tokio::main]
 async fn main() -> Result<(), SyncError> {
     // --- Logging ---
@@ -41,15 +35,12 @@ async fn main() -> Result<(), SyncError> {
         .with_max_level(LevelFilter::INFO)
         .init();
 
-    // --- Viewing key materialization ---
-    // Decode the bech32-encoded UFVK into a strongly-typed structure.
-    // Must be a full viewing key (not UIVK) because observe_batch performs
-    // an OVK self-send proof using try_decrypt_orchard_sent.
+    // --- Viewing key validation ---
+    // We only need to ensure the configured UFVK is valid and has an Orchard component
+    // (ZNS name bindings are Orchard notes). Actual scanning uses seer_sync::ViewKey.
     let fvk = zcash_keys::keys::UnifiedFullViewingKey::decode(&NETWORK, UFVK)
         .expect("registry name-note UFVK must decode for NETWORK");
-    // ZNS encodes every binding as an Orchard note. If this UFVK has no Orchard
-    // component we cannot observe name-notes, so abort.
-    let orchard_fvk = fvk
+    let _orchard_fvk = fvk
         .orchard()
         .expect("name-note UFVK must have an Orchard component");
 
@@ -57,18 +48,20 @@ async fn main() -> Result<(), SyncError> {
     // `Registry::start` creates the name index (the boundary on top of the
     // SQLite store). It owns the tokio-rusqlite writer + reader pool internally.
     // The handle is cheap to `.clone()` (Arc) and shared by sync + RPC.
-    let registry = Registry::start(PathBuf::from(DB_PATH)).await.unwrap_or_else(|e| {
-        tracing::error!(error = %e, "registry database failed to open");
-        std::process::exit(1);
-    });
+    let registry = Registry::start(PathBuf::from(DB_PATH))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "registry database failed to open");
+            std::process::exit(1);
+        });
     // Stamp the immutable registry configuration into the DB. Idempotent: on
     // restart it will verify the stored config matches these consts and refuse
     // to start if they disagree (a safety net against pointing the same DB at
     // a different network or key).
     //
     // The string stored in registry_account.ufvk must be a full viewing key
-    // (ufvk...), not a UIVK. The OVK self-send proof performed in observe_batch
-    // requires the outgoing viewing key material that only a UFVK provides.
+    // (ufvk...), not a UIVK. The scanning process (via seer-sync) requires the
+    // outgoing viewing key material that only a UFVK provides.
     registry
         .install_registry_config(UFVK, NETWORK, SCAN_BIRTHDAY)
         .await
@@ -90,13 +83,7 @@ async fn main() -> Result<(), SyncError> {
             std::process::exit(1);
         });
 
-    run_sync_loop(
-        registry.clone(),
-        NETWORK,
-        SCAN_BIRTHDAY,
-        orchard_fvk,
-    )
-    .await?;
+    run_sync_loop(registry.clone()).await?;
 
     Ok(())
 }

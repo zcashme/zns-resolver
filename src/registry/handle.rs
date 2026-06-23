@@ -94,17 +94,13 @@ impl Registry {
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        self.inner
-            .writer
-            .call(f)
-            .await
-            .map_err(|e| match e {
-                // Real error returned by the closure (e.g. a failed INSERT,
-                // constraint violation, etc.) — preserve it.
-                tokio_rusqlite::Error::Error(inner) => RegistryError::from(inner),
-                // Connection/executor problems — turn into synthetic error.
-                other => map_call_err("writer call", other),
-            })
+        self.inner.writer.call(f).await.map_err(|e| match e {
+            // Real error returned by the closure (e.g. a failed INSERT,
+            // constraint violation, etc.) — preserve it.
+            tokio_rusqlite::Error::Error(inner) => RegistryError::from(inner),
+            // Connection/executor problems — turn into synthetic error.
+            other => map_call_err("writer call", other),
+        })
     }
 
     // ── writes (async; serialized via tokio-rusqlite writer connection) ──
@@ -134,9 +130,7 @@ impl Registry {
         tip: ChainPosition,
     ) -> Result<BatchOutcome, RegistryError> {
         let indexed_notes = self
-            .with_writer(move |conn| {
-                core::apply_batch(conn, scanned, tip, &decrypted)
-            })
+            .with_writer(move |conn| core::apply_batch(conn, scanned, tip, &decrypted))
             .await?;
         Ok(BatchOutcome {
             indexed: indexed_notes.len(),
@@ -159,10 +153,7 @@ impl Registry {
 
     /// Returns the information the sync loop needs to decide where to resume.
     /// `birthday` is used only when there is no persisted checkpoint yet.
-    pub(crate) fn get_resume_info(
-        &self,
-        birthday: u32,
-    ) -> Result<ResumeInfo, RegistryError> {
+    pub(crate) fn get_resume_info(&self, birthday: u32) -> Result<ResumeInfo, RegistryError> {
         let cp = self.checkpoint()?;
         let start_height = cp
             .as_ref()
@@ -241,7 +232,6 @@ impl Registry {
 // Connections are pre-opened and parked in an mpsc channel. `get()` takes
 // one (blocking if the pool is exhausted; the channel acts as a semaphore).
 // `PooledConn` returns the connection to the pool on Drop.
-
 
 struct ReaderPool {
     return_tx: Sender<Connection>,

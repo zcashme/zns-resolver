@@ -12,8 +12,8 @@ pub use handlers::JsonRpcApi;
 #[allow(unused_imports)]
 pub use models::{NameEvent, NameRecord, Paginated, Status};
 
-use jsonrpsee::server::ServerHandle;
 use handlers::ZnsApiServer;
+use jsonrpsee::server::ServerHandle;
 
 use crate::registry::Registry;
 

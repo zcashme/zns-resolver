@@ -103,7 +103,11 @@ impl ZnsApiServer for JsonRpcApi {
                             sh,
                             tip as u64,
                             synced,
-                            if synced { 0 } else { (tip - c.scanned_height) as u64 },
+                            if synced {
+                                0
+                            } else {
+                                (tip - c.scanned_height) as u64
+                            },
                         )
                     }
                     None => (sh, 0, false, 0),

@@ -14,6 +14,16 @@ categories = ["cryptography::cryptocurrencies", "database"]
 keywords = ["zcash", "zns", "name-service", "resolver"]
 publish = false
 
+[features]
+default = ["mainnet"]
+# Build against Zcash mainnet (default).
+mainnet = []
+# Build against Zcash testnet instead of mainnet. A build-time choice so the
+# active network is part of the binary's measurement, not runtime-switchable.
+#
+# To select testnet: cargo build --no-default-features --features testnet
+testnet = []
+
 [dependencies]
 seer-sync = { path = "../seer-sync", features = ["zns-decrypt"] }
 zns-verify = { path = "../zns-verify", features = ["decrypt"] }
@@ -24,7 +34,7 @@ zcash_primitives = { version = "0.28", default-features = false }
 futures = "0.3"
 pasta_curves = "0.5"
 group = "0.13"
-rusqlite = { version = "0.32", features = ["bundled"] }
+tokio-rusqlite = "0.7"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

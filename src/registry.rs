@@ -1,12 +1,5 @@
 //! ZNS name index in SQLite.
 //!
-//! This module provides the boundary between the rest of the resolver
-//! (sync loop + JSON-RPC) and the underlying persistent store.
-//!
-//! The important invariant (single writer for per-name chain integrity during
-//! verification + write, atomic checkpoints, safe concurrent reads via WAL)
-//! is enforced inside the implementation. Callers outside this module should
-//! only use the high-level operations and types defined here.
 
 use tokio_rusqlite::rusqlite;
 use zns_verify::Action;
@@ -16,20 +9,11 @@ mod handle;
 mod notes;
 mod storage;
 
-// `Registry` (the handle) plus the types below form the public boundary
-// for the name index.
-//
-// All implementation details live inside `Registry`:
-// - one tokio-rusqlite writer connection (serialized writes)
-// - a small pool of rusqlite connections for synchronous reads (WAL)
-// Callers only see the high-level API and these types.
-
 pub(crate) use handle::Registry;
 
 // ── supporting types (part of the boundary) ───────────────────────────────────
 
-/// A position on chain (height + optional hash).
-/// Used for scan progress and chain tip when talking to the index.
+/// Chain Cursor (height + optional hash).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChainPosition {
     pub height: u32,
@@ -83,7 +67,7 @@ pub(crate) struct NameNote {
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
     pub(crate) action_index: usize,
-    pub(crate) raw_tx: Vec<u8>,
+    // raw_tx no longer stored (per refactor decision)
 }
 
 /// Current registration: a name's live tip (absent from `names` if released).
@@ -116,5 +100,3 @@ pub(crate) struct Event {
 #[derive(thiserror::Error, Debug)]
 #[error(transparent)]
 pub(crate) struct RegistryError(#[from] rusqlite::Error);
-
-

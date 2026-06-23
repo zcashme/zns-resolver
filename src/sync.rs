@@ -1,9 +1,16 @@
 //! ZNS chain sync module.
 
-mod chain;
-mod observe;
+use std::time::Duration;
 
-pub(crate) use observe::{DecryptedNote, observe_batch};
+use seer_sync::chain as seer_chain;
+use seer_sync::{
+    run, Account, AccountError, Batch, BlockHash, BlockHeight, Cursor as SeerCursor, Resume,
+    ShieldedNote, ViewKey,
+};
+use zcash_protocol::memo::MemoBytes;
+
+use crate::network::{NETWORK, SCAN_BIRTHDAY, UFVK};
+use crate::registry::{ChainPosition, Registry};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SyncError {
@@ -11,210 +18,189 @@ pub enum SyncError {
     Registry(#[from] crate::registry::RegistryError),
 
     #[error("chain I/O failed: {0}")]
-    Chain(#[from] seer_sync::chain::ChainError),
+    Chain(#[from] seer_sync::SyncError),
 }
 
-// --- sync loop implementation ---
+/// A decrypted ZNS name note candidate.
+pub(crate) struct DecryptedNote {
+    /// Raw inputs required by `zns_verify` to recompute the note commitment.
+    pub(crate) g_d: [u8; 32],
+    pub(crate) pk_d: [u8; 32],
+    pub(crate) rho: [u8; 32],
+    pub(crate) value: u64,
 
-use std::time::Duration;
+    /// Note commitment (cmx).
+    pub(crate) cmx: [u8; 32],
+    pub(crate) memo: MemoBytes,
+    pub(crate) txid: [u8; 32],
+    pub(crate) height: u32,
+    /// Index of this Orchard action within the transaction's action list.
+    pub(crate) action_index: usize,
+}
 
-use futures::StreamExt;
-use orchard::keys::FullViewingKey;
-use seer_sync::chain::{ChainError, DEFAULT_CHUNK_OUTPUTS};
-use seer_sync::proto::CompactBlock;
-use seer_sync::BlockHash;
-use zcash_protocol::consensus::Network;
+const RETRY_DELAY: Duration = Duration::from_secs(2);
 
-use crate::registry::{BatchOutcome, ChainPosition, Registry};
-use chain::Connection;
+async fn connect_client() -> Option<seer_chain::LwdClient> {
+    // Delegate to seer-sync's built-in connection manager (with its own
+    // failover to multiple lightwalletd servers).
+    match seer_chain::connect_auto().await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "connect_auto failed, will retry");
+            None
+        }
+    }
+}
 
-const TIP_POLL_INTERVAL: Duration = Duration::from_secs(10);
-const REORG_REWIND_INITIAL: u32 = 1;
+// --- sync loop using seer-sync engine ---
 
-pub(crate) async fn run_sync_loop(
+pub(crate) async fn run_sync_loop(registry: Registry) -> Result<(), SyncError> {
+    let view_key = ViewKey::decode(&NETWORK, UFVK).expect("registry UFVK must be valid at startup");
+
+    let account = ZnsAccount {
+        registry: registry.clone(),
+    };
+
+    loop {
+        // Obtain a fresh lightwalletd client (connection + failover is handled
+        // by seer-sync).
+        let client = match connect_client().await {
+            Some(c) => c,
+            None => {
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
+        };
+
+        match run(client, &view_key, NETWORK, &account).await {
+            Ok(Some(cursor)) => {
+                tracing::debug!(height = u32::from(cursor.height), "sync pass reached tip");
+                // One pass completed. Loop to stay live for future blocks.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Ok(None) => {
+                // Birthday beyond tip; nothing to do yet.
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "seer-sync run returned error; will retry");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+/// Thin adapter so we can implement seer_sync::Account.
+///
+/// seer-sync's engine drives scanning by calling resume/rewind/apply on
+/// something that implements its `Account` trait. This wrapper exists solely
+/// to satisfy that trait while delegating all real work to our `Registry`.
+struct ZnsAccount {
     registry: Registry,
-    network: Network,
-    scan_birthday: u32,
-    fvk: &FullViewingKey,
-) -> Result<(), SyncError> {
-    // Connection management lives inside the sync module.
-    // We ask the chain submodule to give us a managed connection.
-    let mut conn = Connection::connect().await;
-    let mut rewind_by = REORG_REWIND_INITIAL;
+}
 
-    loop {
-        let (start, seam) = match resume_from_checkpoint(&registry, scan_birthday) {
-            Ok(resume) => resume,
-            Err(e) => {
-                tracing::warn!(error = %e, "checkpoint read failed");
-                continue;
-            }
+impl Account for ZnsAccount {
+    fn resume(&self) -> Result<Resume, AccountError> {
+        let info = self
+            .registry
+            .get_resume_info(SCAN_BIRTHDAY)
+            .map_err(|e| Box::new(e) as AccountError)?;
+
+        // Map our ResumeInfo to seer's Resume.
+        // Our info.start_height is already "where to start scanning".
+        // The seam (previous scanned hash) belongs to the *previous* height.
+        let checkpoint = if let Some(seam) = info.seam_hash {
+            // We have a previous scanned position: the height we last fully applied
+            // is start_height - 1.
+            let prev_height = info.start_height.saturating_sub(1);
+            Some(SeerCursor {
+                height: BlockHeight::from_u32(prev_height),
+                hash: Some(BlockHash(seam)),
+            })
+        } else {
+            None
         };
 
-        let tip = match wait_for_tip(&mut conn, start).await {
-            Ok(tip) => tip,
-            Err(e) => {
-                tracing::warn!(error = %e, "tip poll failed");
-                conn.reconnect().await;
-                continue;
-            }
+        Ok(Resume {
+            birthday: BlockHeight::from_u32(SCAN_BIRTHDAY),
+            checkpoint,
+            nullifiers: vec![],
+            outpoints: vec![],
+        })
+    }
+
+    fn rewind(&self, to: BlockHeight) -> Result<(), AccountError> {
+        let reg = self.registry.clone();
+        let height = u32::from(to);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move { reg.rewind(height).await })
+        })
+        .map_err(|e| Box::new(e) as AccountError)
+    }
+
+    fn apply(&self, at: SeerCursor, batch: &Batch) -> Result<(), AccountError> {
+        let decrypted = notes_from_batch(batch);
+
+        let scanned: ChainPosition = (u32::from(at.height), at.hash.map(|h| h.0)).into();
+
+        let reg = self.registry.clone();
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async move { reg.apply_batch(decrypted, scanned, scanned).await })
+        })
+        .map_err(|e| Box::new(e) as AccountError)?;
+
+        Ok(())
+    }
+}
+
+fn notes_from_batch(batch: &Batch) -> Vec<DecryptedNote> {
+    let mut decrypted = Vec::new();
+
+    for note in &batch.notes {
+        // We only care about Orchard notes for ZNS.
+        let ShieldedNote::Orchard(orch_note) = &note.note else {
+            continue;
         };
 
-        match drive_range(
-            &mut conn,
-            &registry,
-            network,
-            fvk,
-            start,
-            seam,
-            tip,
-            &mut rewind_by,
-        )
-        .await
-        {
-            Ok(RangeOutcome::Done) => {}
+        // Rely on the engine: any note delivered for our UFVK that carries
+        // a ZNS: memo is a candidate. (No extra sent-proof check per decision.)
+        let memo_slice = note.memo.as_ref().map(|m| m.as_slice()).unwrap_or(&[]);
 
-            Ok(RangeOutcome::Reorg { at }) => {
-                let rewind_to = at.saturating_sub(rewind_by);
-
-                tracing::warn!(at, rewind_to, "chain reorg");
-
-                if let Err(e) = registry.rewind(rewind_to).await {
-                    tracing::error!(error = %e, "rewind failed");
-                    // Registry errors during rewind are logged; we double the rewind step
-                    // and continue. A permanent registry failure will surface on the
-                    // next batch instead.
-                }
-
-                rewind_by = rewind_by.saturating_mul(2);
-            }
-            Ok(RangeOutcome::Reconnect) => {
-                conn.reconnect().await;
-            }
-            Err(e) => return Err(e),
-            Ok(RangeOutcome::Fatal(e)) => return Err(e),
+        if !memo_slice.starts_with(b"ZNS:") {
+            continue;
         }
-    }
-}
 
-fn resume_from_checkpoint(
-    registry: &Registry,
-    scan_birthday: u32,
-) -> Result<(u32, Option<BlockHash>), crate::registry::RegistryError> {
-    let info = registry.get_resume_info(scan_birthday)?;
-    let seam = info.seam_hash.map(BlockHash);
-    Ok((info.start_height, seam))
-}
+        let (g_d, pk_d) = orch_note.recipient().zns_commitment_keys();
+        let rho = orch_note.rho().to_bytes();
+        let value = orch_note.value().inner();
 
-async fn wait_for_tip(conn: &mut Connection, start: u32) -> Result<(u32, Option<[u8; 32]>), ChainError> {
-    let mut tip = conn.tip().await?;
-    while tip.0 == 0 || start > tip.0 {
-        tokio::time::sleep(TIP_POLL_INTERVAL).await;
-        tip = conn.tip().await?;
-    }
-    Ok(tip)
-}
+        // The commitment (cmx) is derived from the decrypted note.
+        // This matches the on-chain value the note was created with.
+        let commitment = orch_note.commitment();
+        let extracted = orchard::note::ExtractedNoteCommitment::from(commitment);
+        let cmx: [u8; 32] = (&extracted).into();
 
-#[derive(Debug)]
-enum RangeOutcome {
-    Done,
-    Reorg { at: u32 },
-    Reconnect,
-    /// Fatal error that should cause the entire sync loop to terminate.
-    Fatal(SyncError),
-}
+        let memo = note.memo.clone().unwrap_or_else(|| {
+            // Should not happen for ZNS memos, but be defensive
+            MemoBytes::from(zcash_protocol::memo::Memo::Arbitrary(Box::new([0u8; 511])))
+        });
 
-async fn drive_range(
-    conn: &mut Connection,
-    registry: &Registry,
-    network: Network,
-    fvk: &FullViewingKey,
-    start: u32,
-    seam: Option<BlockHash>,
-    tip: (u32, Option<[u8; 32]>),
-    rewind_by: &mut u32,
-) -> Result<RangeOutcome, SyncError> {
-    let mut stream =
-        conn.create_block_stream(start, tip.0, DEFAULT_CHUNK_OUTPUTS, seam);
+        let txid_bytes: [u8; 32] = *note.txid.as_ref();
 
-    loop {
-        match stream.next().await {
-            None => return Ok(RangeOutcome::Done),
-            Some(Ok(batch)) => {
-                if let Err(outcome) = process_batch(
-                    conn,
-                    registry,
-                    network,
-                    fvk,
-                    &batch,
-                    rewind_by,
-                )
-                .await
-                {
-                    match outcome {
-                        RangeOutcome::Fatal(e) => return Err(e),
-                        other => return Ok(other),
-                    }
-                }
-            }
-            Some(Err(ChainError::Reorg(at))) => return Ok(RangeOutcome::Reorg { at }),
-            Some(Err(e)) => {
-                tracing::warn!(error = %e, "block stream failed");
-                return Ok(RangeOutcome::Reconnect);
-            }
-        }
-    }
-}
-
-async fn process_batch(
-    conn: &mut Connection,
-    registry: &Registry,
-    network: Network,
-    fvk: &FullViewingKey,
-    batch: &[CompactBlock],
-    rewind_by: &mut u32,
-) -> Result<(), RangeOutcome> {
-    let Some(last) = batch.last() else {
-        return Ok(());
-    };
-    let scanned: ChainPosition = (last.height as u32, last.hash[..].try_into().ok()).into();
-
-    let live_cursor = match conn.tip().await {
-        Ok(tip) => tip,
-        Err(e) => {
-            tracing::warn!(error = %e, "tip poll failed during sync");
-            return Err(RangeOutcome::Reconnect);
-        }
-    };
-    let live: ChainPosition = live_cursor.into();
-
-    match observe_batch(conn, &network, fvk, batch).await {
-        Ok(decrypted) => {
-            let n_decrypt = decrypted.len();
-            match registry.apply_batch(decrypted, scanned, live).await {
-                Ok(BatchOutcome { indexed }) => {
-                    *rewind_by = REORG_REWIND_INITIAL;
-                    tracing::info!(
-                        height = scanned.height,
-                        tip = live.height,
-                        decrypted = n_decrypt,
-                        indexed,
-                        "batch applied"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "apply_batch failed");
-                    // Any failure talking to the registry (including the writer connection
-                    // closing) is fatal; we surface it via the tiny RegistryError wrapper.
-                    return Err(RangeOutcome::Fatal(SyncError::Registry(e)));
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "observe batch failed");
-            return Err(RangeOutcome::Reconnect);
-        }
+        decrypted.push(DecryptedNote {
+            g_d,
+            pk_d,
+            rho,
+            value,
+            cmx,
+            memo,
+            txid: txid_bytes,
+            height: u32::from(note.height),
+            action_index: note.output_index as usize,
+        });
     }
 
-    Ok(())
+    decrypted
 }
