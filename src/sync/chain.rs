@@ -2,35 +2,19 @@
 
 use std::time::Duration;
 
-use seer_sync::chain::{self, ChainError};
+use futures::Stream;
 
-/// Re-export / type alias for the raw client from seer-sync.
-///
-/// This is **just a type alias**:
-/// `LwdClient = seer_sync::chain::LwdClient = CompactTxStreamerClient<Channel>`.
-///
-/// We re-export it under a short name so the rest of the sync code can
-/// refer to it cleanly, but it carries no extra behavior.
+use seer_sync::chain::{self, ChainError};
+use seer_sync::proto::{CompactBlock, RawTransaction};
+use seer_sync::{BlockHash, TxId};
+
+// Network-selected lightwalletd endpoints (re-exported from crate::network).
+use crate::network::LIGHTWALLETD_ENDPOINTS;
+
+/// CompactBlock client from lightwalletd (just the underlying client).
 pub(crate) type LwdClient = seer_sync::chain::LwdClient;
 
-/// Known lightwalletd endpoints. Connection management responsibility lives here.
-#[cfg(feature = "mainnet")]
-pub(crate) const LIGHTWALLETD_ENDPOINTS: &[&str] = &[
-    "https://zec.rocks:443",
-    // Add other reliable mainnet lightwalletd servers here.
-];
-#[cfg(feature = "testnet")]
-pub(crate) const LIGHTWALLETD_ENDPOINTS: &[&str] = &[
-    "https://testnet.zec.rocks:443",
-    // Add other reliable testnet lightwalletd servers here.
-];
-
 /// A managed connection to lightwalletd.
-///
-/// This is the *domain type* used by the sync module.
-/// It wraps a raw `LwdClient` (which is just the seer-sync gRPC client)
-/// and is responsible for establishing and maintaining the connection
-/// using the endpoint list defined in this module.
 pub(crate) struct Connection {
     client: LwdClient,
 }
@@ -51,9 +35,6 @@ impl Connection {
     }
 
     pub(crate) async fn reconnect(&mut self) {
-        // Use the list of URLs to re-establish a connection.
-        // No stored URL inside the struct. The list is used to always maintain
-        // a connection.
         loop {
             for &url in LIGHTWALLETD_ENDPOINTS {
                 match chain::connect(url).await {
@@ -70,10 +51,25 @@ impl Connection {
         }
     }
 
-    /// Produce a clone of the current client.
-    /// Needed because seer_sync::chain::blocks takes ownership of a client.
-    pub(crate) fn fork(&self) -> LwdClient {
-        self.client.clone()
+    /// Returns a stream of CompactBlock batches.
+    pub(crate) fn create_block_stream(
+        &self,
+        from: u32,
+        to: u32,
+        max_outputs: usize,
+        prev_hash: Option<BlockHash>,
+    ) -> impl Stream<Item = Result<Vec<CompactBlock>, ChainError>> {
+        let client = self.client.clone();
+        seer_sync::chain::blocks(client, from, to, max_outputs, prev_hash)
+    }
+
+    /// Fetches a full raw transaction.
+    pub(crate) async fn fetch_raw_transaction(
+        &self,
+        txid: &TxId,
+    ) -> Result<RawTransaction, ChainError> {
+        let mut client = self.client.clone();
+        chain::fetch_raw_transaction(&mut client, txid).await
     }
 
     pub(crate) async fn tip(&mut self) -> Result<(u32, Option<[u8; 32]>), ChainError> {
