@@ -34,7 +34,7 @@ pub const DB_PATH: &str = "zns-testnet.sqlite";
 
 /// Skip all blocks before this height on first sync (performance).
 #[cfg(feature = "mainnet")]
-pub const SCAN_BIRTHDAY: u32 = 3000000
+pub const SCAN_BIRTHDAY: u32 = 3000000;
 
 #[cfg(feature = "testnet")]
 pub const SCAN_BIRTHDAY: u32 = 4_000_000;

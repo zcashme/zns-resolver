@@ -12,7 +12,8 @@ use super::notes;
 use super::{ChainPosition, Checkpoint, Event, NameNote, Registration};
 use crate::sync::DecryptedNote;
 
-/// Standalone version of the logic (will be called from the tokio-rusqlite writer closure).
+/// Standalone version of the logic (will be called from inside a
+/// tokio_rusqlite::Connection::call closure).
 pub(super) fn install_registry_config(
     conn: &Connection,
     ufvk: &str,
@@ -64,11 +65,8 @@ pub(super) fn install_registry_config(
 /// (WAL snapshot isolation + atomic commit).
 ///
 /// SAFETY (TOCTOU on the tip): the offline tip read in Phase 1 and the tx
-/// write in Phase 2 are consistent because the serialized execution inside
-/// the Registry impl is the sole mutator. No other code path can write to
-/// `names` between Phase 1 and Phase 2.
-///
-/// The body will run inside a single tokio-rusqlite .call closure.
+/// write in Phase 2 run inside the same serialized tokio_rusqlite call.
+/// No other DB operation can interleave.
 pub(super) fn apply_batch(
     conn: &Connection,
     scanned: ChainPosition,
@@ -117,20 +115,18 @@ pub(super) fn apply_batch(
             nn.height,
             nn.action,
             nn.action_index,
-            b"", // raw_tx no longer stored
         )?;
 
         if nn.action == Action::Release {
             tx.execute("DELETE FROM names WHERE name = ?1", params![nn.name])?;
         } else {
             tx.execute(
-                "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index, raw_tx)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT (name) DO UPDATE SET
                    height = excluded.height, action = excluded.action, ua = excluded.ua,
                    prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
-                   cmx = excluded.cmx, txid = excluded.txid, action_index = excluded.action_index,
-                   raw_tx = excluded.raw_tx",
+                   cmx = excluded.cmx, txid = excluded.txid, action_index = excluded.action_index",
                 params![
                     nn.name,
                     nn.height as i64,
@@ -142,7 +138,6 @@ pub(super) fn apply_batch(
                     nn.cmx.as_slice(),
                     nn.txid.as_slice(),
                     nn.action_index as i64,
-                    &b""[..],
                 ],
             )?;
         }
@@ -194,7 +189,7 @@ pub(super) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
     Ok(())
 }
 
-// ── reads (free functions; callable from any &Connection under WAL) ──────────
+// ── reads (free functions; run inside the single serialized connection) ──────
 
 pub(super) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoint>> {
     conn.query_row(
@@ -236,7 +231,12 @@ pub(super) fn registrations_by_ua(
     ua: &str,
     limit: u32,
     offset: u32,
-) -> rusqlite::Result<Vec<Registration>> {
+) -> rusqlite::Result<(Vec<Registration>, u64)> {
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM names WHERE ua = ?1",
+        params![ua],
+        |r| r.get(0),
+    )?;
     let mut stmt = conn.prepare(
         "SELECT name, ua, txid, height, action FROM names
          WHERE ua = ?1 ORDER BY name LIMIT ?2 OFFSET ?3",
@@ -244,21 +244,22 @@ pub(super) fn registrations_by_ua(
     let rows = stmt
         .query_map(params![ua, limit, offset], row_to_registration)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    Ok((rows, total as u64))
 }
 
 pub(super) fn list_registrations(
     conn: &Connection,
     limit: u32,
     offset: u32,
-) -> rusqlite::Result<Vec<Registration>> {
+) -> rusqlite::Result<(Vec<Registration>, u64)> {
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
     let mut stmt = conn.prepare(
         "SELECT name, ua, txid, height, action FROM names ORDER BY name LIMIT ?1 OFFSET ?2",
     )?;
     let rows = stmt
         .query_map(params![limit, offset], row_to_registration)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    Ok((rows, total as u64))
 }
 
 pub(super) fn events(
@@ -354,11 +355,10 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
         Vec<u8>,
         Vec<u8>,
         i64,
-        Vec<u8>,
         i64,
     )> = tx
         .query_row(
-            "SELECT name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, raw_tx, action_index
+            "SELECT name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index
              FROM name_events WHERE name = ?1 ORDER BY height DESC, rowid DESC LIMIT 1",
             params![name],
             |r| {
@@ -373,7 +373,6 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                     r.get(7)?,
                     r.get(8)?,
                     r.get(9)?,
-                    r.get(10)?,
                 ))
             },
         )
@@ -383,18 +382,17 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
         None => {
             tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
         }
-        Some((name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, _raw_tx, action_index)) => {
+        Some((name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index)) => {
             if action == "release" {
                 tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
             } else {
                 tx.execute(
-                    "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index, raw_tx)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                      ON CONFLICT (name) DO UPDATE SET
                        height = excluded.height, action = excluded.action, ua = excluded.ua,
                        prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
-                       cmx = excluded.cmx, txid = excluded.txid, action_index = excluded.action_index,
-                       raw_tx = excluded.raw_tx",
+                       cmx = excluded.cmx, txid = excluded.txid, action_index = excluded.action_index",
                     params![
                         name,
                         height,
@@ -406,7 +404,6 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                         cmx,
                         txid,
                         action_index,
-                        &b""[..]
                     ],
                 )?;
             }
@@ -428,11 +425,10 @@ fn insert_event(
     height: u32,
     action: Action,
     action_index: usize,
-    _raw_tx: &[u8], // raw_tx no longer stored
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO name_events (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index, raw_tx)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO name_events (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             name,
             height as i64,
@@ -444,7 +440,6 @@ fn insert_event(
             cmx.as_slice(),
             txid.as_slice(),
             action_index as i64,
-            &b""[..]
         ],
     )?;
     Ok(())

@@ -1,5 +1,4 @@
-//! ZNS name index in SQLite.
-//!
+//! ZNS name index in SQLite (single-connection architecture).
 
 use tokio_rusqlite::rusqlite;
 use zns_verify::Action;
@@ -39,8 +38,6 @@ pub(crate) struct ResumeInfo {
     pub seam_hash: Option<[u8; 32]>,
 }
 
-
-
 // ── types ─────────────────────────────────────────────────────────────────────
 
 /// Persisted `scan_state` row.
@@ -63,7 +60,6 @@ pub(crate) struct NameNote {
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
     pub(crate) action_index: usize,
-    // raw_tx no longer stored (per refactor decision)
 }
 
 /// Current registration: a name's live tip (absent from `names` if released).
@@ -88,11 +84,11 @@ pub(crate) struct Event {
     pub(crate) action_index: usize,
 }
 
-/// Tiny wrapper around rusqlite errors.
-///
-/// The only purpose of this type today is to give the registry a distinct error
-/// type in public APIs. It transparently surfaces the underlying rusqlite error.
-/// Extra variants or impls can be added later if needed.
+/// Errors surfaced by the registry.
 #[derive(thiserror::Error, Debug)]
-#[error(transparent)]
-pub(crate) struct RegistryError(#[from] rusqlite::Error);
+pub(crate) enum RegistryError {
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Driver(#[from] tokio_rusqlite::Error),
+}

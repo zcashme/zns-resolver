@@ -59,7 +59,6 @@ pub(crate) async fn run_sync_loop(registry: Registry) -> Result<(), SyncError> {
 
     let account = Account(registry.clone());
 
-
     loop {
         // Obtain a fresh lightwalletd client (connection + failover is handled
         // by seer-sync).
@@ -89,19 +88,16 @@ pub(crate) async fn run_sync_loop(registry: Registry) -> Result<(), SyncError> {
     }
 }
 
-/// Newtype adapter so we can implement `seer_sync::Account`.
-///
-/// seer-sync's engine expects something that implements its `Account` trait
-/// (a "fold over the chain"). We provide this tiny wrapper around our
-/// `Registry` rather than making `Registry` itself implement the trait.
 struct Account(Registry);
 
 impl SeerAccount for Account {
     fn resume(&self) -> Result<Resume, AccountError> {
-        let info = self
-            .0
-            .get_resume_info(SCAN_BIRTHDAY)
-            .map_err(|e| Box::new(e) as AccountError)?;
+        let reg = self.0.clone();
+        let info = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async move { reg.get_resume_info(SCAN_BIRTHDAY).await })
+        })
+        .map_err(|e| Box::new(e) as AccountError)?;
 
         // Map our ResumeInfo to seer's Resume.
         // Our info.start_height is already "where to start scanning".

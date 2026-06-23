@@ -1,8 +1,4 @@
-//! Parsing and construction of verified name notes from decrypted memos.
-//!
-//! Takes candidate memos from decrypted notes, validates them, checks the
-//! cryptographic binding against the on-chain commitment and the current
-//! per-name tip, and produces a `NameNote` on success.
+//! Parses and verifies `NameNote`s from decrypted memos.
 
 use zns_verify::pallas;
 use zns_verify::verify::verify_name_note_with_witness;
@@ -14,7 +10,7 @@ use super::NameNote;
 
 /// Parse a candidate name memo (if valid format and does not shadow UA namespace).
 /// The returned note carries the *memo's* `prev_rcm` (untrusted until verified).
-fn parse_memo(memo: &[u8]) -> Option<zns_verify::NameNote> {
+fn parse_memo(memo: &[u8]) -> Option<zns_verify::NameNote<'_>> {
     let Ok(note) = parse_name_note(memo) else {
         return None;
     };

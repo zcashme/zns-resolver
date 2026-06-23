@@ -7,10 +7,10 @@
 //! indexes name tips, and serves names using a JSON-RPC HTTP API.
 //
 
-mod jsonrpc; // JSON-RPC API implementation (owns the public contract)
-mod network; // network selection + all mainnet vs testnet constants (build-time only)
-mod registry; // SQLite-backed name index (tokio-rusqlite writer + reader pool)
-mod sync; // long-running sync loop streaming blocks from lightwalletd
+mod jsonrpc; // API implementation
+mod network; // Network selection
+mod registry; // Name index Database
+mod sync; // Sync Loop
 
 use sync::run_sync_loop;
 use sync::SyncError;
@@ -42,6 +42,7 @@ async fn main() -> Result<(), SyncError> {
             std::process::exit(1);
         });
 
+    // --- Sync loop ---
     run_sync_loop(registry.clone()).await?;
 
     Ok(())
