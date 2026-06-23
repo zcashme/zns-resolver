@@ -29,7 +29,6 @@ seer-sync = { path = "../seer-sync", features = ["zns-decrypt"] }
 zns-verify = { path = "../zns-verify", features = ["decrypt"] }
 orchard = { path = "../zns-orchard", default-features = false, features = ["unsafe-zns"] }
 zcash_protocol = { version = "0.9", default-features = false, features = ["std"] }
-zcash_keys = { version = "0.14", default-features = false, features = ["orchard"] }
 zcash_primitives = { version = "0.28", default-features = false }
 futures = "0.3"
 pasta_curves = "0.5"

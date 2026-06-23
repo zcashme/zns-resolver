@@ -23,6 +23,7 @@ use super::storage;
 use super::{
     ChainPosition, Checkpoint, Event, Registration, RegistryError, ResumeInfo,
 };
+use crate::network::{DB_PATH, NETWORK, SCAN_BIRTHDAY, UFVK};
 use crate::sync::DecryptedNote;
 use zns_verify::Action;
 
@@ -49,14 +50,17 @@ struct Inner {
 }
 
 impl Registry {
-    /// Open the registry (name index) at the given path.
+    /// Open the registry (name index) using the baked-in DB path for this build.
     ///
-    /// This is async because the writer connection is backed by tokio-rusqlite.
-    /// On first open it creates the DB file (if needed) and applies the schema.
-    pub(crate) async fn start(path: PathBuf) -> Result<Self, RegistryError> {
-        Self::start_with(path, DEFAULT_READER_POOL_SIZE).await
+    /// This is the normal production entry point. The DB path, UFVK, network,
+    /// and scan birthday are chosen at compile time via Cargo features and
+    /// installed (idempotently) into the `registry_account` table.
+    pub(crate) async fn start() -> Result<Self, RegistryError> {
+        Self::start_with(PathBuf::from(DB_PATH), DEFAULT_READER_POOL_SIZE).await
     }
 
+    /// Open the registry at an explicit path with a custom reader pool size.
+    /// Intended for tests and special tooling.
     pub(crate) async fn start_with(path: PathBuf, pool_size: usize) -> Result<Self, RegistryError> {
         // Open writer first (this is the serialized execution path).
         let writer = AsyncConnection::open(&path).await?;
@@ -68,6 +72,22 @@ impl Registry {
             .map_err(|e| match e {
                 tokio_rusqlite::Error::Error(inner) => RegistryError::from(inner),
                 other => map_call_err("schema initialization", other),
+            })?;
+
+        // Stamp (or verify) the immutable registry identity using the
+        // compile-time constants. This records the UFVK + network + birthday
+        // that this binary was built for. Idempotent: existing values are
+        // left alone (with a warning on mismatch).
+        let ufvk = UFVK.to_owned();
+        let net_str = network_to_str(NETWORK);
+        writer
+            .call(move |conn| {
+                core::install_registry_config(conn, &ufvk, &net_str, SCAN_BIRTHDAY)
+            })
+            .await
+            .map_err(|e| match e {
+                tokio_rusqlite::Error::Error(inner) => RegistryError::from(inner),
+                other => map_call_err("install registry config", other),
             })?;
 
         // Open the reader pool *after* the writer so WAL is configured and
@@ -104,21 +124,6 @@ impl Registry {
     }
 
     // ── writes (async; serialized via tokio-rusqlite writer connection) ──
-
-    pub(crate) async fn install_registry_config(
-        &self,
-        ufvk: &str,
-        network: Network,
-        birthday: u32,
-    ) -> Result<(), RegistryError> {
-        let ufvk = ufvk.to_owned();
-        let net_str = network_to_str(network);
-        self.with_writer(move |conn| {
-            core::install_registry_config(conn, &ufvk, &net_str, birthday)
-        })
-        .await?;
-        Ok(())
-    }
 
     /// High-level boundary API for the sync loop.
     /// Performs verification and note construction inside the safe single-writer context
