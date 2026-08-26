@@ -1,199 +1,260 @@
-//! ZNS chain sync module.
+//! ZNS-specific persistence on top of seer-sync's generic scan pipeline.
 
+use std::error::Error;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use seer_sync::chain as seer_chain;
-use seer_sync::{
-    run, Account as SeerAccount, AccountError, Batch, BlockHash, BlockHeight, Cursor as SeerCursor,
-    Resume, ShieldedNote, ViewKey,
-};
-use zcash_protocol::memo::MemoBytes;
+use group::{Group, GroupEncoding};
+use orchard::keys::FullViewingKey;
+use orchard::note::Nullifier;
+use pasta_curves::arithmetic::CurveExt;
+use pasta_curves::pallas;
+use seer_sync::sync::scan::WalletTx;
+use seer_sync::{Account, Cursor as SeerCursor, Nullifiers, Resume, UnifiedFullViewingKey};
+use zcash_primitives::block::BlockHash;
+use zcash_primitives::transaction::{Transaction, TxId};
+use zcash_protocol::consensus::BlockHeight;
+use zns_verify::decrypt as zns_decrypt;
 
-use crate::network::{NETWORK, SCAN_BIRTHDAY, UFVK};
+use crate::network::{NETWORK, NETWORK_NAME, SCAN_BIRTHDAY, UFVK};
 use crate::registry::{ChainPosition, Registry};
 
-#[derive(thiserror::Error, Debug)]
-pub enum SyncError {
-    #[error("registry operation failed: {0}")]
-    Registry(#[from] crate::registry::RegistryError),
+use thiserror::Error;
 
-    #[error("chain I/O failed: {0}")]
-    Chain(#[from] seer_sync::SyncError),
+#[derive(Error, Debug)]
+pub(crate) enum SyncError {
+    #[error("seer-sync error: {0}")]
+    SeerSync(#[from] seer_sync::SyncError),
+
+    #[error("invalid registry UFVK: {0}")]
+    InvalidUfvk(String),
+
+    #[error("registry UFVK has no orchard component")]
+    MissingOrchard,
+
+    #[error("registry error: {0}")]
+    Registry(#[from] crate::registry::RegistryError),
 }
 
-/// A decrypted ZNS name note candidate.
 pub(crate) struct DecryptedNote {
-    /// Raw inputs required by `zns_verify` to recompute the note commitment.
     pub(crate) g_d: [u8; 32],
     pub(crate) pk_d: [u8; 32],
     pub(crate) rho: [u8; 32],
     pub(crate) value: u64,
-
-    /// Note commitment (cmx).
     pub(crate) cmx: [u8; 32],
-    pub(crate) memo: MemoBytes,
+    pub(crate) memo: [u8; 512],
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
-    /// Index of this Orchard action within the transaction's action list.
     pub(crate) action_index: usize,
+    pub(crate) nullifier: [u8; 32],
 }
 
-const RETRY_DELAY: Duration = Duration::from_secs(2);
-
-async fn connect_client() -> Option<seer_chain::LwdClient> {
-    // Delegate to seer-sync's built-in connection manager (with its own
-    // failover to multiple lightwalletd servers).
-    match seer_chain::connect_auto().await {
-        Ok(c) => Some(c),
-        Err(e) => {
-            tracing::warn!(error = %e, "connect_auto failed, will retry");
-            None
-        }
-    }
+/// Ephemeral context joining seer-sync's transaction and raw-block callbacks.
+struct PendingBatch {
+    at: SeerCursor,
+    received: Vec<([u8; 32], [u8; 32], u32)>,
+    spent: Vec<([u8; 32], u32)>,
+    name_actions: Vec<([u8; 32], usize)>,
 }
-
-// --- sync loop using seer-sync engine ---
 
 pub(crate) async fn run_sync_loop(registry: Registry) -> Result<(), SyncError> {
-    let view_key = ViewKey::decode(&NETWORK, UFVK).expect("registry UFVK must be valid at startup");
+    let ufvk = UnifiedFullViewingKey::decode(&NETWORK, UFVK)
+        .map_err(|e| SyncError::InvalidUfvk(e.to_string()))?;
+    let fvk = ufvk
+        .orchard()
+        .ok_or(SyncError::MissingOrchard)?
+        .clone();
 
-    let account = Account(registry.clone());
+    tracing::info!(
+        network = NETWORK_NAME,
+        birthday = SCAN_BIRTHDAY,
+        "starting sync"
+    );
+    let account = ZnsAccount {
+        registry,
+        fvk,
+        pending: Mutex::new(None),
+    };
 
     loop {
-        // Obtain a fresh lightwalletd client (connection + failover is handled
-        // by seer-sync).
-        let client = match connect_client().await {
-            Some(c) => c,
-            None => {
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
-        };
-
-        match run(client, &view_key, NETWORK, &account).await {
-            Ok(Some(cursor)) => {
-                tracing::debug!(height = u32::from(cursor.height), "sync pass reached tip");
-                // One pass completed. Loop to stay live for future blocks.
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            Ok(None) => {
-                // Birthday beyond tip; nothing to do yet.
-                tokio::time::sleep(Duration::from_secs(10)).await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "seer-sync run returned error; will retry");
-                tokio::time::sleep(RETRY_DELAY).await;
+        match seer_sync::run(UFVK, NETWORK, &account).await {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(%error, "sync error; reconnecting");
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     }
 }
 
-struct Account(Registry);
+struct ZnsAccount {
+    registry: Registry,
+    fvk: FullViewingKey,
+    pending: Mutex<Option<PendingBatch>>,
+}
 
-impl SeerAccount for Account {
-    fn resume(&self) -> Result<Resume, AccountError> {
-        let reg = self.0.clone();
-        let info = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { reg.get_resume_info(SCAN_BIRTHDAY).await })
-        })
-        .map_err(|e| Box::new(e) as AccountError)?;
-
-        // Map our ResumeInfo to seer's Resume.
-        // Our info.start_height is already "where to start scanning".
-        // The seam (previous scanned hash) belongs to the *previous* height.
-        let checkpoint = if let Some(seam) = info.seam_hash {
-            // We have a previous scanned position: the height we last fully applied
-            // is start_height - 1.
-            let prev_height = info.start_height.saturating_sub(1);
-            Some(SeerCursor {
-                height: BlockHeight::from_u32(prev_height),
-                hash: Some(BlockHash(seam)),
-            })
-        } else {
-            None
-        };
+impl Account for ZnsAccount {
+    fn resume(&self) -> Result<Resume, Box<dyn Error + Send + Sync>> {
+        let registry = self.registry.clone();
+        let info = block_on(async move { registry.get_resume_info(SCAN_BIRTHDAY).await })?;
+        let checkpoint = info.seam_hash.map(|hash| SeerCursor {
+            height: BlockHeight::from_u32(info.start_height.saturating_sub(1)),
+            hash: BlockHash(hash),
+        });
+        let ironwood = info
+            .ironwood_nullifiers
+            .into_iter()
+            .filter_map(|bytes| Option::from(Nullifier::from_bytes(&bytes)))
+            .collect();
 
         Ok(Resume {
             birthday: BlockHeight::from_u32(SCAN_BIRTHDAY),
             checkpoint,
-            nullifiers: vec![],
-            outpoints: vec![],
+            nullifiers: Nullifiers {
+                sapling: vec![],
+                orchard: vec![],
+                ironwood,
+            },
         })
     }
 
-    fn rewind(&self, to: BlockHeight) -> Result<(), AccountError> {
-        let reg = self.0.clone();
-        let height = u32::from(to);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move { reg.rewind(height).await })
-        })
-        .map_err(|e| Box::new(e) as AccountError)
+    fn rewind(&self, to: BlockHeight) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let registry = self.registry.clone();
+        block_on(async move { registry.rewind(u32::from(to)).await })?;
+        Ok(())
     }
 
-    fn apply(&self, at: SeerCursor, batch: &Batch) -> Result<(), AccountError> {
-        let decrypted = notes_from_batch(batch);
+    fn apply_transactions(
+        &self,
+        at: SeerCursor,
+        transactions: &[WalletTx],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut received = Vec::new();
+        let mut spent = Vec::new();
+        let mut name_actions = Vec::new();
 
-        let scanned: ChainPosition = (u32::from(at.height), at.hash.map(|h| h.0)).into();
+        for transaction in transactions {
+            let txid = *transaction.txid.as_ref();
+            let height = u32::from(transaction.height);
+            for output in &transaction.ironwood_outputs {
+                if !output.is_sent {
+                    if let Some(nullifier) = output.nf {
+                        received.push((nullifier.to_bytes(), txid, height));
+                    }
+                }
+                if output.is_sent
+                    && output
+                        .memo
+                        .as_ref()
+                        .is_some_and(|memo| memo.starts_with(b"ZNS:"))
+                {
+                    name_actions.push((txid, output.index as usize));
+                }
+            }
+            spent.extend(
+                transaction
+                    .ironwood_spends
+                    .iter()
+                    .map(|spend| (spend.nf.to_bytes(), height)),
+            );
+        }
 
-        let reg = self.0.clone();
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "pending batch mutex poisoned")?;
+        *pending = Some(PendingBatch {
+            at,
+            received,
+            spent,
+            name_actions,
+        });
+        Ok(())
+    }
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { reg.apply_batch(decrypted, scanned, scanned).await })
-        })
-        .map_err(|e| Box::new(e) as AccountError)?;
+    fn apply_blocks(
+        &self,
+        at: SeerCursor,
+        _blocks: &[seer_sync::proto::CompactBlock],
+        full_txs: &[(TxId, BlockHeight, Transaction)],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| "pending batch mutex poisoned")?
+            .take()
+            .ok_or("missing pending transaction batch")?;
+        if pending.at != at {
+            return Err("mismatched seer-sync callbacks".into());
+        }
 
+        let mut decrypted = Vec::new();
+        for (txid_bytes, action_index) in &pending.name_actions {
+            let txid = TxId::from_bytes(*txid_bytes);
+            let Some((_, height, transaction)) = full_txs.iter().find(|(id, _, _)| *id == txid)
+            else {
+                return Err("selected transaction missing full data".into());
+            };
+            let Some(action) = transaction
+                .ironwood_bundle()
+                .and_then(|bundle| bundle.actions().get(*action_index))
+            else {
+                return Err("selected Ironwood action missing from full transaction".into());
+            };
+
+            // Full outgoing recovery gives the memo and proves Registry authorship.
+            let Some((note, recipient, memo)) =
+                zns_decrypt::try_decrypt_ironwood_sent(action, &self.fvk)
+            else {
+                continue;
+            };
+            let mut memo_bytes = [0u8; 512];
+            memo_bytes.copy_from_slice(memo.as_slice());
+            if !memo_bytes.starts_with(b"ZNS:") {
+                continue;
+            }
+
+            let raw = recipient.to_raw_address_bytes();
+            let diversifier: [u8; 11] = raw[..11].try_into().expect("raw address is 43 bytes");
+            let pk_d: [u8; 32] = raw[11..].try_into().expect("raw address is 43 bytes");
+            let Some(nullifier) = Option::from(note.nullifier(&self.fvk)) else {
+                continue;
+            };
+            decrypted.push(DecryptedNote {
+                g_d: diversify_hash(&diversifier),
+                pk_d,
+                rho: note.rho().to_bytes(),
+                value: note.value().inner(),
+                cmx: action.cmx().to_bytes(),
+                memo: memo_bytes,
+                txid: *txid_bytes,
+                height: u32::from(*height),
+                action_index: *action_index,
+                nullifier: nullifier.to_bytes(),
+            });
+        }
+
+        let scanned: ChainPosition = (u32::from(at.height), Some(at.hash.0)).into();
+        let registry = self.registry.clone();
+        block_on(async move {
+            registry
+                .apply_batch(decrypted, pending.received, pending.spent, scanned, scanned)
+                .await
+        })?;
         Ok(())
     }
 }
 
-fn notes_from_batch(batch: &Batch) -> Vec<DecryptedNote> {
-    let mut decrypted = Vec::new();
-
-    for note in &batch.notes {
-        // We only care about Orchard notes for ZNS.
-        let ShieldedNote::Orchard(orch_note) = &note.note else {
-            continue;
-        };
-
-        // Rely on the engine: any note delivered for our UFVK that carries
-        // a ZNS: memo is a candidate. (No extra sent-proof check per decision.)
-        let memo_slice = note.memo.as_ref().map(|m| m.as_slice()).unwrap_or(&[]);
-
-        if !memo_slice.starts_with(b"ZNS:") {
-            continue;
-        }
-
-        let (g_d, pk_d) = orch_note.recipient().zns_commitment_keys();
-        let rho = orch_note.rho().to_bytes();
-        let value = orch_note.value().inner();
-
-        // The commitment (cmx) is derived from the decrypted note.
-        // This matches the on-chain value the note was created with.
-        let commitment = orch_note.commitment();
-        let extracted = orchard::note::ExtractedNoteCommitment::from(commitment);
-        let cmx: [u8; 32] = (&extracted).into();
-
-        let memo = note.memo.clone().unwrap_or_else(|| {
-            // Should not happen for ZNS memos, but be defensive
-            MemoBytes::from(zcash_protocol::memo::Memo::Arbitrary(Box::new([0u8; 511])))
-        });
-
-        let txid_bytes: [u8; 32] = *note.txid.as_ref();
-
-        decrypted.push(DecryptedNote {
-            g_d,
-            pk_d,
-            rho,
-            value,
-            cmx,
-            memo,
-            txid: txid_bytes,
-            height: u32::from(note.height),
-            action_index: note.output_index as usize,
-        });
+fn diversify_hash(diversifier: &[u8; 11]) -> [u8; 32] {
+    let hash = pallas::Point::hash_to_curve("z.cash:Orchard-gd");
+    let point = hash(diversifier);
+    if bool::from(point.is_identity()) {
+        hash(&[]).to_bytes()
+    } else {
+        point.to_bytes()
     }
+}
 
-    decrypted
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
