@@ -15,7 +15,7 @@ use zcash_protocol::consensus::Network;
 pub const UFVK: &str = "ufvk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"; // TODO: replace with real mainnet registry UFVK before building for mainnet
 
 #[cfg(feature = "testnet")]
-pub const UFVK: &str = "ufvktest18a7ht78cymvm3sxdw9myrr04nrnj8nvrqdjhadj8dp3cv8pm2dqszuxnjrjyp6xyf0svtzjxnq3976l5sxzd09mmx9g6sj9xpp67ympwsrv6wen5ye25jhvq0l8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8zz937hcgtp90rwhjq0m02rf7qk6wmvrny26r2vt0laztqx4kgx0jqtdwu38ld0hx53m0u20rjny20gpxneavfze7aqqft5vs0jraaqed4974avkx4c3qass3prsqq2fdx08jllet4uuxzz8zmrem8xcwaya9v50l046lp2c9uuyrkp0r8jja5vlzday32pgq4cccqd2rjvtlsfnn9lne9cchrcfgn87jlx9";
+pub const UFVK: &str = "uviewtest1m6ttk6khq8gy0s5v5e5c9snavnwzyv9hl9d5g7kc9lczlv36mjj4tpkmqqd5jep4cg0ea79ahqjpz3huv28kp2frtr3vc9wgerseynuntyu92ky6nwd746w8waz7jv34ax32h4uffcj7ky8qphxesmqqzvt7ykdle5lg2vv69we9nz2q89m8pudjzngxk82mh2s3p3uqedjucnca95tzdqqsg7pn5htvulp8hcyhqa8t4qhlxnpqw7elupkeyvzwky4lta26yy4tvgqz5pjx6ew9e3hm4wmu5t4jt7ku450atn83fezs6r5mc6jkxjc4xcptzss3c3e8ldrnj0uru9tnjteelxzzx7mzrwetu965t2z8luz24h9cj37g9q5nclyczp4gnx2g5z4twlkl9mtvdxwdwxza7chztzcgw6e4eye36auh6p5ltzclppxykhmalghf0fk8087jhknjyzxfzkukj4fmt3umm0k27mh44lfxmc8m0kvh";
 
 /// Zcash consensus parameters for the active network.
 #[cfg(feature = "mainnet")]
@@ -23,6 +23,13 @@ pub const NETWORK: Network = Network::MainNetwork;
 
 #[cfg(feature = "testnet")]
 pub const NETWORK: Network = Network::TestNetwork;
+
+/// Short name of the active network for logging.
+#[cfg(feature = "mainnet")]
+pub const NETWORK_NAME: &str = "main";
+
+#[cfg(feature = "testnet")]
+pub const NETWORK_NAME: &str = "test";
 
 /// Persisted name index filename. Distinct per network so mainnet and testnet
 /// builds do not share on-disk state.
