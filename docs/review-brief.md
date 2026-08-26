@@ -1,8 +1,21 @@
 # ZNS Resolver — External Code Review Brief
 
 `zns-resolver` watches a the ZcashName Mint's Name Notes account of Orchard note memos, verifies them, indexes them in SQLite, and serves them
-## Scope of Review: Architecture and Code Quality
 
+## Scope of Review
+
+Architecture & boundaries, plus general code quality.
+
+#### 1. Sync engine — `src/sync.rs` (199 LOC)
+
+---
+
+#### 2. Registry — `src/registry.rs` (94) + `src/registry/{handle,core,notes,storage}.rs`
+
+---
+#### 3. JSON-RPC — `src/jsonrpc.rs` (26) + `src/jsonrpc/{service,records}.rs`
+
+---
 
 ## ZNS Protocol Architecture Overview
 
@@ -53,21 +66,15 @@ lightwalletd ──▶ seer-sync engine ──▶ Batch of decrypted notes
                                     jsonrpc handlers (resolve / events / status)
                                              │
                                              ▼
-                                    JSON-RPC client on 127.0.0.1:8080
+                                     JSON-RPC client on 127.0.0.1:8080
 ```
+## Scope of Review: Architecture & Boundaries and General Code Quality
 
-## Repo layout
+#### 1. Sync engine — `src/sync.rs` (199 LOC)
 
-| File | LOC | Responsibility |
-|---|---|---|
-| `src/main.rs` | 48 | Bootstrap: logging, open registry, start RPC, run sync loop. |
-| `src/network.rs` | 74 | Compile-time mainnet/testnet selection; sole `#[cfg(feature=...)]` site. Exports `UFVK`, `NETWORK`, `DB_PATH`, `SCAN_BIRTHDAY`. |
-| `src/sync.rs` | 206 | Long-running sync loop; `seer_sync::Account` impl adapter; `notes_from_batch` memo filter. |
-| `src/registry.rs` | 98 | Module root + boundary types (`ChainPosition`, `ResumeInfo`, `Checkpoint`, `NameNote`, `Registration`, `Event`, `RegistryError`). |
-| `src/registry/handle.rs` | 165 | `Registry` newtype wrapping one `tokio_rusqlite::AsyncConnection`; async API surface. |
-| `src/registry/core.rs` | 508 | Transactional write path (`apply_batch`, `rewind`) + all read functions + row mappers. |
-| `src/registry/notes.rs` | 130 | Memo parsing + calls into `zns-verify` for binding verification; fork-warning heuristic. |
-| `src/registry/storage.rs` | 57 | SQL schema as a `const &str`. |
-| `src/jsonrpc.rs` | 26 | Module root + `serve_rpc` starter. |
-| `src/jsonrpc/handlers.rs` | 186 | `ZnsApi` trait (jsonrpsee proc macro) + `JsonRpcApi` impl. |
-| `src/jsonrpc/models.rs` | 101 | Public DTOs (`NameRecord`, `NameEvent`, `Paginated`, `Status`) + conversion helpers. |
+---
+
+#### 2. Registry — `src/registry.rs` (94) + `src/registry/{handle,core,notes,storage}.rs`
+
+---
+#### 3. JSON-RPC — `src/jsonrpc.rs` (26) + `src/jsonrpc/{service,records}.rs`
