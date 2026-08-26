@@ -1,6 +1,6 @@
 //! ZNS name index in SQLite (single-connection architecture).
 
-use tokio_rusqlite::rusqlite;
+use rusqlite;
 use zns_verify::Action;
 
 mod core;
@@ -36,6 +36,7 @@ impl From<ChainPosition> for (u32, Option<[u8; 32]>) {
 pub(crate) struct ResumeInfo {
     pub start_height: u32,
     pub seam_hash: Option<[u8; 32]>,
+    pub ironwood_nullifiers: Vec<[u8; 32]>,
 }
 
 // ── types ─────────────────────────────────────────────────────────────────────
@@ -60,6 +61,7 @@ pub(crate) struct NameNote {
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
     pub(crate) action_index: usize,
+    pub(crate) nullifier: [u8; 32],
 }
 
 /// Current registration: a name's live tip (absent from `names` if released).

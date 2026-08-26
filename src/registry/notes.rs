@@ -67,6 +67,7 @@ pub(super) fn try_admit_name_note(
         txid: n.txid,
         height: n.height,
         action_index: n.action_index,
+        nullifier: n.nullifier,
     })
 }
 

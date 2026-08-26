@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS name_events (
     rcm          BLOB    NOT NULL,
     psi          BLOB    NOT NULL,
     cmx          BLOB    NOT NULL,
+    nullifier    BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
     action_index INTEGER NOT NULL,
     PRIMARY KEY (name, height, txid, action_index)
@@ -49,8 +50,16 @@ CREATE TABLE IF NOT EXISTS names (
     rcm          BLOB    NOT NULL,
     psi          BLOB    NOT NULL,
     cmx          BLOB    NOT NULL,
+    nullifier    BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
     action_index INTEGER NOT NULL
 );
-"#;
 
+CREATE TABLE IF NOT EXISTS watched_ironwood_notes (
+    nullifier    BLOB    NOT NULL PRIMARY KEY,
+    txid         BLOB    NOT NULL,
+    height       INTEGER NOT NULL,
+    spent_height INTEGER
+);
+
+"#;

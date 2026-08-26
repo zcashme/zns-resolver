@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use tokio_rusqlite::rusqlite::{self, Connection};
+use rusqlite::{self, Connection};
 use tokio_rusqlite::Connection as AsyncConnection;
 
 use super::core::{self};
@@ -24,7 +24,8 @@ impl Registry {
     pub(crate) async fn start() -> Result<Self, RegistryError> {
         let conn = AsyncConnection::open(PathBuf::from(DB_PATH)).await?;
 
-        conn.call(|c| c.execute_batch(storage::SCHEMA_SQL)).await?;
+        conn.call(|c| Ok(c.execute_batch(storage::SCHEMA_SQL)?))
+            .await?;
 
         let ufvk = UFVK.to_owned();
         let net_str = if NETWORK == zcash_protocol::consensus::Network::MainNetwork {
@@ -33,8 +34,15 @@ impl Registry {
             "test"
         };
 
-        conn.call(move |c| core::install_registry_config(c, &ufvk, net_str, SCAN_BIRTHDAY))
-            .await?;
+        conn.call(move |c| {
+            Ok(core::install_registry_config(
+                c,
+                &ufvk,
+                net_str,
+                SCAN_BIRTHDAY,
+            )?)
+        })
+        .await?;
 
         Ok(Self { conn })
     }
@@ -43,7 +51,7 @@ impl Registry {
     /// Everything is serialized by tokio-rusqlite.
     async fn call<F, T>(&self, f: F) -> Result<T, RegistryError>
     where
-        F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
         T: Send + 'static,
     {
         Ok(self.conn.call(f).await?)
@@ -54,16 +62,27 @@ impl Registry {
     pub(crate) async fn apply_batch(
         &self,
         decrypted: Vec<DecryptedNote>,
+        received_nullifiers: Vec<([u8; 32], [u8; 32], u32)>,
+        spent_nullifiers: Vec<([u8; 32], u32)>,
         scanned: ChainPosition,
         tip: ChainPosition,
     ) -> Result<(), RegistryError> {
-        self.call(move |c| core::apply_batch(c, scanned, tip, &decrypted))
-            .await?;
+        self.call(move |c| {
+            Ok(core::apply_batch(
+                c,
+                scanned,
+                tip,
+                &decrypted,
+                &received_nullifiers,
+                &spent_nullifiers,
+            )?)
+        })
+        .await?;
         Ok(())
     }
 
     pub(crate) async fn rewind(&self, fork_height: u32) -> Result<(), RegistryError> {
-        self.call(move |c| core::rewind(c, fork_height)).await
+        self.call(move |c| Ok(core::rewind(c, fork_height)?)).await
     }
 
     // ── reads (all async; everything serialised on the same connection) ────
@@ -75,22 +94,24 @@ impl Registry {
             .map(|c| c.scanned_height.saturating_add(1))
             .unwrap_or(birthday);
         let seam_hash = cp.and_then(|c| c.scanned_hash);
+        let ironwood_nullifiers = self.call(|c| Ok(core::ironwood_nullifiers(c)?)).await?;
         Ok(ResumeInfo {
             start_height,
             seam_hash,
+            ironwood_nullifiers,
         })
     }
 
     pub(crate) async fn checkpoint(&self) -> Result<Option<Checkpoint>, RegistryError> {
-        self.call(|c| core::checkpoint(c)).await
+        self.call(|c| Ok(core::checkpoint(c)?)).await
     }
 
     pub(crate) async fn registry_ufvk(&self) -> Result<Option<String>, RegistryError> {
-        self.call(|c| core::registry_ufvk(c)).await
+        self.call(|c| Ok(core::registry_ufvk(c)?)).await
     }
 
     pub(crate) async fn name_count(&self) -> Result<u64, RegistryError> {
-        self.call(|c| core::name_count(c)).await
+        self.call(|c| Ok(core::name_count(c)?)).await
     }
 
     pub(crate) async fn resolve_by_name(
@@ -98,7 +119,8 @@ impl Registry {
         name: &str,
     ) -> Result<Option<Registration>, RegistryError> {
         let name = name.to_owned();
-        self.call(move |c| core::resolve_by_name(c, &name)).await
+        self.call(move |c| Ok(core::resolve_by_name(c, &name)?))
+            .await
     }
 
     pub(crate) async fn registrations_by_ua(
@@ -108,7 +130,7 @@ impl Registry {
         offset: u32,
     ) -> Result<(Vec<Registration>, u64), RegistryError> {
         let ua = ua.to_owned();
-        self.call(move |c| core::registrations_by_ua(c, &ua, limit, offset))
+        self.call(move |c| Ok(core::registrations_by_ua(c, &ua, limit, offset)?))
             .await
     }
 
@@ -117,7 +139,7 @@ impl Registry {
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<Registration>, u64), RegistryError> {
-        self.call(move |c| core::list_registrations(c, limit, offset))
+        self.call(move |c| Ok(core::list_registrations(c, limit, offset)?))
             .await
     }
 
@@ -130,7 +152,16 @@ impl Registry {
         offset: u32,
     ) -> Result<(Vec<Event>, u64), RegistryError> {
         let name = name.map(|s| s.to_owned());
-        self.call(move |c| core::events(c, name.as_deref(), action, since_height, limit, offset))
-            .await
+        self.call(move |c| {
+            Ok(core::events(
+                c,
+                name.as_deref(),
+                action,
+                since_height,
+                limit,
+                offset,
+            )?)
+        })
+        .await
     }
 }

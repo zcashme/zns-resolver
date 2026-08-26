@@ -2,9 +2,7 @@
 
 use std::collections::HashMap;
 
-use tokio_rusqlite::rusqlite::{
-    self as rusqlite, params, Connection, OptionalExtension, Row, Transaction,
-};
+use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
 
 use zns_verify::{Action, Tip};
 
@@ -72,6 +70,8 @@ pub(super) fn apply_batch(
     scanned: ChainPosition,
     live: ChainPosition,
     decrypted: &[DecryptedNote],
+    received_nullifiers: &[([u8; 32], [u8; 32], u32)],
+    spent_nullifiers: &[([u8; 32], u32)],
 ) -> rusqlite::Result<Vec<NameNote>> {
     let mut pending_tips: HashMap<String, Tip> = HashMap::new();
     let mut admitted: Vec<NameNote> = Vec::new();
@@ -102,6 +102,26 @@ pub(super) fn apply_batch(
     }
 
     let tx = conn.unchecked_transaction()?;
+    for (nullifier, txid, height) in received_nullifiers {
+        tx.execute(
+            "INSERT OR IGNORE INTO watched_ironwood_notes (nullifier, txid, height, spent_height)
+             VALUES (?1, ?2, ?3, NULL)",
+            params![nullifier.as_slice(), txid.as_slice(), *height as i64],
+        )?;
+    }
+    for (nullifier, height) in spent_nullifiers {
+        tx.execute(
+            "UPDATE watched_ironwood_notes SET spent_height = ?1
+             WHERE nullifier = ?2 AND spent_height IS NULL",
+            params![*height as i64, nullifier.as_slice()],
+        )?;
+        // A consumed live Name Note is no longer resolvable unless this same
+        // transaction supplies a verified successor below.
+        tx.execute(
+            "DELETE FROM names WHERE nullifier = ?1",
+            params![nullifier.as_slice()],
+        )?;
+    }
     for nn in &admitted {
         insert_event(
             &tx,
@@ -111,6 +131,7 @@ pub(super) fn apply_batch(
             &nn.rcm,
             &nn.psi,
             &nn.cmx,
+            &nn.nullifier,
             &nn.txid,
             nn.height,
             nn.action,
@@ -121,12 +142,13 @@ pub(super) fn apply_batch(
             tx.execute("DELETE FROM names WHERE name = ?1", params![nn.name])?;
         } else {
             tx.execute(
-                "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT (name) DO UPDATE SET
                    height = excluded.height, action = excluded.action, ua = excluded.ua,
                    prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
-                   cmx = excluded.cmx, txid = excluded.txid, action_index = excluded.action_index",
+                   cmx = excluded.cmx, nullifier = excluded.nullifier,
+                   txid = excluded.txid, action_index = excluded.action_index",
                 params![
                     nn.name,
                     nn.height as i64,
@@ -136,6 +158,7 @@ pub(super) fn apply_batch(
                     nn.rcm.as_slice(),
                     nn.psi.as_slice(),
                     nn.cmx.as_slice(),
+                    nn.nullifier.as_slice(),
                     nn.txid.as_slice(),
                     nn.action_index as i64,
                 ],
@@ -170,6 +193,14 @@ pub(super) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
         "DELETE FROM name_events WHERE height > ?1",
         params![fork_height as i64],
     )?;
+    tx.execute(
+        "DELETE FROM watched_ironwood_notes WHERE height > ?1",
+        params![fork_height as i64],
+    )?;
+    tx.execute(
+        "UPDATE watched_ironwood_notes SET spent_height = NULL WHERE spent_height > ?1",
+        params![fork_height as i64],
+    )?;
 
     for name in &affected {
         rebuild_name_tip(&tx, name)?;
@@ -198,6 +229,26 @@ pub(super) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoin
         row_to_checkpoint,
     )
     .optional()
+}
+
+pub(super) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
+    let mut out = Vec::new();
+    for query in [
+        "SELECT nullifier FROM watched_ironwood_notes WHERE spent_height IS NULL",
+        "SELECT nullifier FROM names",
+    ] {
+        let mut statement = conn.prepare(query)?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        for row in rows {
+            let bytes: [u8; 32] = row?
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
+            if !out.contains(&bytes) {
+                out.push(bytes);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub(super) fn registry_ufvk(conn: &Connection) -> rusqlite::Result<Option<String>> {
@@ -354,11 +405,12 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
         Vec<u8>,
         Vec<u8>,
         Vec<u8>,
+        Vec<u8>,
         i64,
         i64,
     )> = tx
         .query_row(
-            "SELECT name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index
+            "SELECT name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index
              FROM name_events WHERE name = ?1 ORDER BY height DESC, rowid DESC LIMIT 1",
             params![name],
             |r| {
@@ -373,6 +425,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                     r.get(7)?,
                     r.get(8)?,
                     r.get(9)?,
+                    r.get(10)?,
                 ))
             },
         )
@@ -382,17 +435,30 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
         None => {
             tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
         }
-        Some((name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index)) => {
+        Some((
+            name,
+            height,
+            action,
+            ua,
+            prev_rcm,
+            rcm,
+            psi,
+            cmx,
+            nullifier,
+            txid,
+            action_index,
+        )) => {
             if action == "release" {
                 tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
             } else {
                 tx.execute(
-                    "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                      ON CONFLICT (name) DO UPDATE SET
                        height = excluded.height, action = excluded.action, ua = excluded.ua,
                        prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
-                       cmx = excluded.cmx, txid = excluded.txid, action_index = excluded.action_index",
+                       cmx = excluded.cmx, nullifier = excluded.nullifier,
+                       txid = excluded.txid, action_index = excluded.action_index",
                     params![
                         name,
                         height,
@@ -402,6 +468,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                         rcm,
                         psi,
                         cmx,
+                        nullifier,
                         txid,
                         action_index,
                     ],
@@ -421,14 +488,15 @@ fn insert_event(
     rcm: &[u8; 32],
     psi: &[u8; 32],
     cmx: &[u8; 32],
+    nullifier: &[u8; 32],
     txid: &[u8; 32],
     height: u32,
     action: Action,
     action_index: usize,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO name_events (name, height, action, ua, prev_rcm, rcm, psi, cmx, txid, action_index)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO name_events (name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             name,
             height as i64,
@@ -438,6 +506,7 @@ fn insert_event(
             rcm.as_slice(),
             psi.as_slice(),
             cmx.as_slice(),
+            nullifier.as_slice(),
             txid.as_slice(),
             action_index as i64,
         ],
