@@ -10,35 +10,6 @@ mod storage;
 
 pub(crate) use handle::Registry;
 
-// ── supporting types (part of the boundary) ───────────────────────────────────
-
-/// Chain Cursor (height + optional hash).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ChainPosition {
-    pub height: u32,
-    pub hash: Option<[u8; 32]>,
-}
-
-impl From<(u32, Option<[u8; 32]>)> for ChainPosition {
-    fn from((height, hash): (u32, Option<[u8; 32]>)) -> Self {
-        Self { height, hash }
-    }
-}
-
-impl From<ChainPosition> for (u32, Option<[u8; 32]>) {
-    fn from(pos: ChainPosition) -> Self {
-        (pos.height, pos.hash)
-    }
-}
-
-/// Information needed by the sync loop to resume scanning.
-#[derive(Clone, Debug)]
-pub(crate) struct ResumeInfo {
-    pub start_height: u32,
-    pub seam_hash: Option<[u8; 32]>,
-    pub ironwood_nullifiers: Vec<[u8; 32]>,
-}
-
 // ── types ─────────────────────────────────────────────────────────────────────
 
 /// Persisted `scan_state` row.

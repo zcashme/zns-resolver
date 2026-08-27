@@ -3,12 +3,16 @@
 
 use std::path::PathBuf;
 
+use orchard::note::Nullifier;
 use rusqlite::{self, Connection};
+use seer_sync::{Cursor, Nullifiers, Resume};
 use tokio_rusqlite::Connection as AsyncConnection;
+use zcash_primitives::block::BlockHash;
+use zcash_protocol::consensus::BlockHeight;
 
 use super::core::{self};
 use super::storage;
-use super::{ChainPosition, Checkpoint, Event, Registration, RegistryError, ResumeInfo};
+use super::{Checkpoint, Event, Registration, RegistryError};
 use crate::network::{DB_PATH, NETWORK, SCAN_BIRTHDAY, UFVK};
 use crate::sync::DecryptedNote;
 use zns_verify::Action;
@@ -64,8 +68,8 @@ impl Registry {
         decrypted: Vec<DecryptedNote>,
         received_nullifiers: Vec<([u8; 32], [u8; 32], u32)>,
         spent_nullifiers: Vec<([u8; 32], u32)>,
-        scanned: ChainPosition,
-        tip: ChainPosition,
+        scanned: Cursor,
+        tip: Cursor,
     ) -> Result<(), RegistryError> {
         self.call(move |c| {
             Ok(core::apply_batch(
@@ -87,18 +91,23 @@ impl Registry {
 
     // ── reads (all async; everything serialised on the same connection) ────
 
-    pub(crate) async fn get_resume_info(&self, birthday: u32) -> Result<ResumeInfo, RegistryError> {
-        let cp = self.checkpoint().await?;
-        let start_height = cp
-            .as_ref()
-            .map(|c| c.scanned_height.saturating_add(1))
-            .unwrap_or(birthday);
-        let seam_hash = cp.and_then(|c| c.scanned_hash);
-        let ironwood_nullifiers = self.call(|c| Ok(core::ironwood_nullifiers(c)?)).await?;
-        Ok(ResumeInfo {
-            start_height,
-            seam_hash,
-            ironwood_nullifiers,
+    pub(crate) async fn resume(&self) -> Result<Resume, RegistryError> {
+        let checkpoint = cursor_from_checkpoint(self.checkpoint().await?);
+        let ironwood = self
+            .call(|c| Ok(core::ironwood_nullifiers(c)?))
+            .await?
+            .into_iter()
+            .filter_map(|bytes| Option::from(Nullifier::from_bytes(&bytes)))
+            .collect();
+
+        Ok(Resume {
+            birthday: BlockHeight::from_u32(SCAN_BIRTHDAY),
+            checkpoint,
+            nullifiers: Nullifiers {
+                sapling: vec![],
+                orchard: vec![],
+                ironwood,
+            },
         })
     }
 
@@ -163,5 +172,31 @@ impl Registry {
             )?)
         })
         .await
+    }
+}
+
+fn cursor_from_checkpoint(checkpoint: Option<Checkpoint>) -> Option<Cursor> {
+    checkpoint.and_then(|checkpoint| {
+        checkpoint.scanned_hash.map(|hash| Cursor {
+            height: BlockHeight::from_u32(checkpoint.scanned_height),
+            hash: BlockHash(hash),
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hashless_checkpoint_is_not_resumable() {
+        let checkpoint = Checkpoint {
+            scanned_height: 42,
+            scanned_hash: None,
+            chain_tip_height: None,
+            chain_tip_hash: None,
+        };
+
+        assert!(cursor_from_checkpoint(Some(checkpoint)).is_none());
     }
 }

@@ -3,11 +3,12 @@
 use std::collections::HashMap;
 
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
+use seer_sync::Cursor;
 
 use zns_verify::{Action, Tip};
 
 use super::notes;
-use super::{ChainPosition, Checkpoint, Event, NameNote, Registration};
+use super::{Checkpoint, Event, NameNote, Registration};
 use crate::sync::DecryptedNote;
 
 /// Standalone version of the logic (will be called from inside a
@@ -67,8 +68,8 @@ pub(super) fn install_registry_config(
 /// No other DB operation can interleave.
 pub(super) fn apply_batch(
     conn: &Connection,
-    scanned: ChainPosition,
-    live: ChainPosition,
+    scanned: Cursor,
+    live: Cursor,
     decrypted: &[DecryptedNote],
     received_nullifiers: &[([u8; 32], [u8; 32], u32)],
     spent_nullifiers: &[([u8; 32], u32)],
@@ -169,10 +170,10 @@ pub(super) fn apply_batch(
     set_checkpoint_in_tx(
         &tx,
         Checkpoint {
-            scanned_height: scanned.height,
-            scanned_hash: scanned.hash,
-            chain_tip_height: Some(live.height),
-            chain_tip_hash: live.hash,
+            scanned_height: u32::from(scanned.height),
+            scanned_hash: Some(scanned.hash.0),
+            chain_tip_height: Some(u32::from(live.height)),
+            chain_tip_hash: Some(live.hash.0),
         },
     )?;
     tx.commit()?;
@@ -206,15 +207,7 @@ pub(super) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
         rebuild_name_tip(&tx, name)?;
     }
 
-    set_checkpoint_in_tx(
-        &tx,
-        Checkpoint {
-            scanned_height: fork_height,
-            scanned_hash: None,
-            chain_tip_height: None,
-            chain_tip_hash: None,
-        },
-    )?;
+    tx.execute("DELETE FROM scan_state WHERE id = 0", [])?;
 
     tx.commit()?;
     Ok(())
@@ -570,5 +563,58 @@ fn action_str(a: Action) -> &'static str {
         Action::Claim => "claim",
         Action::Update => "update",
         Action::Release => "release",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::storage::SCHEMA_SQL;
+    use zcash_primitives::block::BlockHash;
+    use zcash_protocol::consensus::BlockHeight;
+
+    fn database() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn
+    }
+
+    fn cursor(height: u32, hash_byte: u8) -> Cursor {
+        Cursor {
+            height: BlockHeight::from_u32(height),
+            hash: BlockHash([hash_byte; 32]),
+        }
+    }
+
+    #[test]
+    fn apply_batch_persists_a_complete_cursor() {
+        let conn = database();
+        let cursor = cursor(42, 7);
+
+        apply_batch(&conn, cursor, cursor, &[], &[], &[]).unwrap();
+
+        let checkpoint = checkpoint(&conn).unwrap().unwrap();
+        assert_eq!(checkpoint.scanned_height, 42);
+        assert_eq!(checkpoint.scanned_hash, Some([7; 32]));
+        assert_eq!(checkpoint.chain_tip_height, Some(42));
+        assert_eq!(checkpoint.chain_tip_hash, Some([7; 32]));
+    }
+
+    #[test]
+    fn rewind_removes_the_checkpoint_and_rolled_back_nullifiers() {
+        let conn = database();
+        let cursor = cursor(42, 7);
+        let received = [([1; 32], [2; 32], 42)];
+        apply_batch(&conn, cursor, cursor, &[], &received, &[]).unwrap();
+
+        rewind(&conn, 41).unwrap();
+
+        assert!(checkpoint(&conn).unwrap().is_none());
+        let watched: u64 = conn
+            .query_row("SELECT COUNT(*) FROM watched_ironwood_notes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(watched, 0);
     }
 }

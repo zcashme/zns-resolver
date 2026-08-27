@@ -6,18 +6,16 @@ use std::time::Duration;
 
 use group::{Group, GroupEncoding};
 use orchard::keys::FullViewingKey;
-use orchard::note::Nullifier;
 use pasta_curves::arithmetic::CurveExt;
 use pasta_curves::pallas;
 use seer_sync::sync::scan::WalletTx;
-use seer_sync::{Account, Cursor as SeerCursor, Nullifiers, Resume, UnifiedFullViewingKey};
-use zcash_primitives::block::BlockHash;
+use seer_sync::{Account, Cursor as SeerCursor, Resume, UnifiedFullViewingKey};
 use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::consensus::BlockHeight;
 use zns_verify::decrypt as zns_decrypt;
 
 use crate::network::{NETWORK, NETWORK_NAME, SCAN_BIRTHDAY, UFVK};
-use crate::registry::{ChainPosition, Registry};
+use crate::registry::Registry;
 
 use thiserror::Error;
 
@@ -96,26 +94,7 @@ struct ZnsAccount {
 impl Account for ZnsAccount {
     fn resume(&self) -> Result<Resume, Box<dyn Error + Send + Sync>> {
         let registry = self.registry.clone();
-        let info = block_on(async move { registry.get_resume_info(SCAN_BIRTHDAY).await })?;
-        let checkpoint = info.seam_hash.map(|hash| SeerCursor {
-            height: BlockHeight::from_u32(info.start_height.saturating_sub(1)),
-            hash: BlockHash(hash),
-        });
-        let ironwood = info
-            .ironwood_nullifiers
-            .into_iter()
-            .filter_map(|bytes| Option::from(Nullifier::from_bytes(&bytes)))
-            .collect();
-
-        Ok(Resume {
-            birthday: BlockHeight::from_u32(SCAN_BIRTHDAY),
-            checkpoint,
-            nullifiers: Nullifiers {
-                sapling: vec![],
-                orchard: vec![],
-                ironwood,
-            },
-        })
+        Ok(block_on(async move { registry.resume().await })?)
     }
 
     fn rewind(&self, to: BlockHeight) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -234,11 +213,10 @@ impl Account for ZnsAccount {
             });
         }
 
-        let scanned: ChainPosition = (u32::from(at.height), Some(at.hash.0)).into();
         let registry = self.registry.clone();
         block_on(async move {
             registry
-                .apply_batch(decrypted, pending.received, pending.spent, scanned, scanned)
+                .apply_batch(decrypted, pending.received, pending.spent, at, at)
                 .await
         })?;
         Ok(())
