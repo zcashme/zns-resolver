@@ -8,47 +8,45 @@ use rusqlite::{self, Connection};
 use seer_sync::{Cursor, Nullifiers, Resume};
 use tokio_rusqlite::Connection as AsyncConnection;
 use zcash_primitives::block::BlockHash;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, Network};
 
 use super::core::{self};
 use super::storage;
 use super::{Checkpoint, Event, Registration, RegistryError};
-use crate::network::{DB_PATH, NETWORK, SCAN_BIRTHDAY, UFVK};
 use crate::sync::DecryptedNote;
 use zns_verify::Action;
 
 #[derive(Clone)]
 pub(crate) struct Registry {
     conn: AsyncConnection,
+    birthday: u32,
 }
 
 impl Registry {
-    /// Open the registry using the compile-time DB path and stamp the
-    /// compile-time registry identity (UFVK + network + birthday).
-    pub(crate) async fn start() -> Result<Self, RegistryError> {
-        let conn = AsyncConnection::open(PathBuf::from(DB_PATH)).await?;
+    pub(crate) async fn start(
+        network: Network,
+        ufvk: &str,
+        birthday: u32,
+        db_path: &str,
+    ) -> Result<Self, RegistryError> {
+        let conn = AsyncConnection::open(PathBuf::from(db_path)).await?;
 
         conn.call(|c| Ok(c.execute_batch(storage::SCHEMA_SQL)?))
             .await?;
 
-        let ufvk = UFVK.to_owned();
-        let net_str = if NETWORK == zcash_protocol::consensus::Network::MainNetwork {
+        let ufvk = ufvk.to_owned();
+        let net_str = if network == Network::MainNetwork {
             "main"
         } else {
             "test"
         };
 
         conn.call(move |c| {
-            Ok(core::install_registry_config(
-                c,
-                &ufvk,
-                net_str,
-                SCAN_BIRTHDAY,
-            )?)
+            Ok(core::install_registry_config(c, &ufvk, net_str, birthday)?)
         })
         .await?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, birthday })
     }
 
     /// Run a closure against the underlying rusqlite connection.
@@ -101,7 +99,7 @@ impl Registry {
             .collect();
 
         Ok(Resume {
-            birthday: BlockHeight::from_u32(SCAN_BIRTHDAY),
+            birthday: BlockHeight::from_u32(self.birthday),
             checkpoint,
             nullifiers: Nullifiers {
                 sapling: vec![],

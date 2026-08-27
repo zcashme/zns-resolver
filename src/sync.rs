@@ -11,10 +11,9 @@ use pasta_curves::pallas;
 use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Account, Cursor as SeerCursor, Resume, UnifiedFullViewingKey};
 use zcash_primitives::transaction::{Transaction, TxId};
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, Network};
 use zns_verify::decrypt as zns_decrypt;
 
-use crate::network::{NETWORK, NETWORK_NAME, SCAN_BIRTHDAY, UFVK};
 use crate::registry::Registry;
 
 use thiserror::Error;
@@ -55,17 +54,28 @@ struct PendingBatch {
     name_actions: Vec<([u8; 32], usize)>,
 }
 
-pub(crate) async fn run_sync_loop(registry: Registry) -> Result<(), SyncError> {
-    let ufvk = UnifiedFullViewingKey::decode(&NETWORK, UFVK)
+pub(crate) async fn run_sync_loop(
+    registry: Registry,
+    network: Network,
+    ufvk: &str,
+    birthday: u32,
+) -> Result<(), SyncError> {
+    let ufvk_decoded = UnifiedFullViewingKey::decode(&network, ufvk)
         .map_err(|e| SyncError::InvalidUfvk(e.to_string()))?;
-    let fvk = ufvk
+    let fvk = ufvk_decoded
         .orchard()
         .ok_or(SyncError::MissingOrchard)?
         .clone();
 
+    let network_name = if network == Network::MainNetwork {
+        "main"
+    } else {
+        "test"
+    };
+
     tracing::info!(
-        network = NETWORK_NAME,
-        birthday = SCAN_BIRTHDAY,
+        network = network_name,
+        birthday,
         "starting sync"
     );
     let account = ZnsAccount {
@@ -75,7 +85,7 @@ pub(crate) async fn run_sync_loop(registry: Registry) -> Result<(), SyncError> {
     };
 
     loop {
-        match seer_sync::run(UFVK, NETWORK, &account).await {
+        match seer_sync::run(ufvk, network, &account).await {
             Ok(()) => {}
             Err(error) => {
                 tracing::warn!(%error, "sync error; reconnecting");
