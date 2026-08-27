@@ -7,7 +7,8 @@ use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use zns_verify::Action;
 
-use crate::registry::{Registry, RegistryError};
+use crate::registry::core;
+use crate::registry::Db;
 
 use super::records::{to_name_event, to_name_record, NameEvent, NameRecord, Paginated, Status};
 
@@ -52,17 +53,13 @@ pub trait ZnsApi {
     ) -> RpcResult<Paginated<NameEvent>>;
 }
 
-/// The actual implementation of the ZNS JSON-RPC API.
-///
-/// Wraps the lower-level `Registry` (single tokio-rusqlite connection) rather
-/// than exposing the registry directly.
 pub struct JsonRpcApi {
-    registry: Registry,
+    db: Db,
 }
 
 impl JsonRpcApi {
-    pub fn new(registry: Registry) -> Self {
-        Self { registry }
+    pub fn new(db: Db) -> Self {
+        Self { db }
     }
 }
 
@@ -75,7 +72,7 @@ enum RpcError {
     #[error("invalid params: {0}")]
     InvalidParams(String),
     #[error("internal error")]
-    Internal(#[from] RegistryError),
+    Internal(#[from] rusqlite::Error),
 }
 
 impl From<RpcError> for ErrorObjectOwned {
@@ -102,10 +99,8 @@ fn clamp_pagination(limit: Option<u64>, offset: Option<u64>) -> (u32, u32) {
 #[async_trait]
 impl ZnsApiServer for JsonRpcApi {
     async fn resolve(&self, name: String) -> RpcResult<Option<NameRecord>> {
-        let reg = self
-            .registry
-            .resolve_by_name(&name)
-            .await
+        let conn = self.db.lock();
+        let reg = core::resolve_by_name(&conn, &name)
             .map_err(RpcError::from)?;
         Ok(reg.map(to_name_record))
     }
@@ -116,10 +111,8 @@ impl ZnsApiServer for JsonRpcApi {
         offset: Option<u64>,
     ) -> RpcResult<Paginated<NameRecord>> {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
-        let (regs, total) = self
-            .registry
-            .list_registrations(limit_u32, offset_u32)
-            .await
+        let conn = self.db.lock();
+        let (regs, total) = core::list_registrations(&conn, limit_u32, offset_u32)
             .map_err(RpcError::from)?;
         let items = regs.into_iter().map(to_name_record).collect();
         Ok(Paginated {
@@ -137,10 +130,8 @@ impl ZnsApiServer for JsonRpcApi {
         offset: Option<u64>,
     ) -> RpcResult<Paginated<NameRecord>> {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
-        let (regs, total) = self
-            .registry
-            .registrations_by_ua(&address, limit_u32, offset_u32)
-            .await
+        let conn = self.db.lock();
+        let (regs, total) = core::registrations_by_ua(&conn, &address, limit_u32, offset_u32)
             .map_err(RpcError::from)?;
         let items = regs.into_iter().map(to_name_record).collect();
         Ok(Paginated {
@@ -152,13 +143,10 @@ impl ZnsApiServer for JsonRpcApi {
     }
 
     async fn status(&self) -> RpcResult<Status> {
-        let checkpoint = self.registry.checkpoint().await.map_err(RpcError::from)?;
-        let viewing_key = self
-            .registry
-            .registry_ufvk()
-            .await
-            .map_err(RpcError::from)?;
-        let registered = self.registry.name_count().await.map_err(RpcError::from)?;
+        let conn = self.db.lock();
+        let checkpoint = core::checkpoint(&conn).map_err(RpcError::from)?;
+        let viewing_key = core::registry_ufvk(&conn).map_err(RpcError::from)?;
+        let registered = core::name_count(&conn).map_err(RpcError::from)?;
 
         let (synced_height, chain_tip_height, synced, blocks_behind) = match checkpoint {
             Some(c) => {
@@ -213,11 +201,16 @@ impl ZnsApiServer for JsonRpcApi {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
         let since = since_height.map(|h| h.min(u32::MAX as u64) as u32);
 
-        let (events, total) = self
-            .registry
-            .events(name.as_deref(), action, since, limit_u32, offset_u32)
-            .await
-            .map_err(RpcError::from)?;
+        let conn = self.db.lock();
+        let (events, total) = core::events(
+            &conn,
+            name.as_deref(),
+            action,
+            since,
+            limit_u32,
+            offset_u32,
+        )
+        .map_err(RpcError::from)?;
 
         let items = events.into_iter().map(to_name_event).collect();
 

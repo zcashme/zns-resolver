@@ -2,7 +2,7 @@
 
 /// The SQL to create the name index tables (and supporting state).
 /// Run once by the writer connection at startup.
-pub(super) const SCHEMA_SQL: &str = r#"
+pub(crate) const SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;

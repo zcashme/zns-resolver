@@ -2,18 +2,19 @@
 
 use std::collections::HashMap;
 
+use orchard::keys::FullViewingKey;
+use orchard::note::Nullifier;
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
-use seer_sync::Cursor;
-
+use seer_sync::sync::scan::WalletTx;
+use seer_sync::{Cursor, Nullifiers, Resume};
+use zcash_primitives::block::BlockHash;
+use zcash_protocol::consensus::BlockHeight;
 use zns_verify::{Action, Tip};
 
 use super::notes;
 use super::{Checkpoint, Event, NameNote, Registration};
-use crate::sync::DecryptedNote;
 
-/// Standalone version of the logic (will be called from inside a
-/// tokio_rusqlite::Connection::call closure).
-pub(super) fn install_registry_config(
+pub(crate) fn install_registry_config(
     conn: &Connection,
     ufvk: &str,
     network: &str,
@@ -66,62 +67,92 @@ pub(super) fn install_registry_config(
 /// SAFETY (TOCTOU on the tip): the offline tip read in Phase 1 and the tx
 /// write in Phase 2 run inside the same serialized tokio_rusqlite call.
 /// No other DB operation can interleave.
-pub(super) fn apply_batch(
+pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
     live: Cursor,
-    decrypted: &[DecryptedNote],
-    received_nullifiers: &[([u8; 32], [u8; 32], u32)],
-    spent_nullifiers: &[([u8; 32], u32)],
+    transactions: &[WalletTx],
+    fvk: &FullViewingKey,
 ) -> rusqlite::Result<Vec<NameNote>> {
     let mut pending_tips: HashMap<String, Tip> = HashMap::new();
     let mut admitted: Vec<NameNote> = Vec::new();
 
-    for n in decrypted {
-        let Some(name) = notes::name_from_memo(n.memo.as_slice()) else {
-            continue;
-        };
+    for tx in transactions {
+        let txid = *tx.txid.as_ref();
+        let height = u32::from(tx.height);
 
-        let tip: Option<Tip> = match pending_tips.get(&name) {
-            Some(t) => Some(*t),
-            None => read_tip_offline(conn, &name)?,
-        };
+        for output in &tx.ironwood_outputs {
+            if !output.is_sent {
+                continue;
+            }
+            let Some(memo) = output.memo else {
+                continue;
+            };
+            if !memo.starts_with(b"ZNS:") {
+                continue;
+            }
 
-        let Some(name_note) = notes::try_admit_name_note(n.memo.as_slice(), n, tip.as_ref()) else {
-            notes::warn_registry_fork(n.memo.as_slice(), n, tip.as_ref());
-            continue;
-        };
+            let Some(name) = notes::name_from_memo(&memo) else {
+                continue;
+            };
 
-        pending_tips.insert(
-            name_note.name.clone(),
-            Tip {
-                action: name_note.action,
-                rcm: name_note.rcm,
-            },
-        );
-        admitted.push(name_note);
+            let tip: Option<Tip> = match pending_tips.get(&name) {
+                Some(t) => Some(*t),
+                None => read_tip_offline(conn, &name)?,
+            };
+
+            let Some(name_note) =
+                notes::try_admit_name_note(output, txid, height, fvk, tip.as_ref())
+            else {
+                notes::warn_registry_fork(&memo, output, txid, height, tip.as_ref());
+                continue;
+            };
+
+            pending_tips.insert(
+                name_note.name.clone(),
+                Tip {
+                    action: name_note.action,
+                    rcm: name_note.rcm,
+                },
+            );
+            admitted.push(name_note);
+        }
     }
 
     let tx = conn.unchecked_transaction()?;
-    for (nullifier, txid, height) in received_nullifiers {
-        tx.execute(
-            "INSERT OR IGNORE INTO watched_ironwood_notes (nullifier, txid, height, spent_height)
-             VALUES (?1, ?2, ?3, NULL)",
-            params![nullifier.as_slice(), txid.as_slice(), *height as i64],
-        )?;
+
+    // Persist received ironwood nullifiers.
+    for tx_data in transactions {
+        let txid = *tx_data.txid.as_ref();
+        let height = u32::from(tx_data.height);
+        for output in &tx_data.ironwood_outputs {
+            if !output.is_sent {
+                if let Some(nf) = output.nf {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO watched_ironwood_notes (nullifier, txid, height, spent_height)
+                         VALUES (?1, ?2, ?3, NULL)",
+                        params![nf.to_bytes().as_slice(), txid.as_slice(), height as i64],
+                    )?;
+                }
+            }
+        }
     }
-    for (nullifier, height) in spent_nullifiers {
-        tx.execute(
-            "UPDATE watched_ironwood_notes SET spent_height = ?1
-             WHERE nullifier = ?2 AND spent_height IS NULL",
-            params![*height as i64, nullifier.as_slice()],
-        )?;
-        // A consumed live Name Note is no longer resolvable unless this same
-        // transaction supplies a verified successor below.
-        tx.execute(
-            "DELETE FROM names WHERE nullifier = ?1",
-            params![nullifier.as_slice()],
-        )?;
+
+    // Mark spent ironwood nullifiers.
+    for tx_data in transactions {
+        let height = u32::from(tx_data.height);
+        for spend in &tx_data.ironwood_spends {
+            let nf_bytes = spend.nf.to_bytes();
+            tx.execute(
+                "UPDATE watched_ironwood_notes SET spent_height = ?1
+                 WHERE nullifier = ?2 AND spent_height IS NULL",
+                params![height as i64, nf_bytes.as_slice()],
+            )?;
+            tx.execute(
+                "DELETE FROM names WHERE nullifier = ?1",
+                params![nf_bytes.as_slice()],
+            )?;
+        }
     }
     for nn in &admitted {
         insert_event(
@@ -180,8 +211,7 @@ pub(super) fn apply_batch(
     Ok(admitted)
 }
 
-/// Standalone version.
-pub(super) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()> {
+pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
 
     let mut stmt = tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
@@ -213,9 +243,46 @@ pub(super) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
     Ok(())
 }
 
-// ── reads (free functions; run inside the single serialized connection) ──────
+// ── reads (free functions; called directly on a locked connection) ──────
 
-pub(super) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoint>> {
+pub(crate) fn resume(conn: &Connection) -> rusqlite::Result<Resume> {
+    let checkpoint = cursor_from_checkpoint(checkpoint(conn)?);
+    let ironwood: Vec<Nullifier> = ironwood_nullifiers(conn)?
+        .into_iter()
+        .filter_map(|bytes| Option::from(Nullifier::from_bytes(&bytes)))
+        .collect();
+    let birthday = birthday(conn)?;
+
+    Ok(Resume {
+        birthday: BlockHeight::from_u32(birthday),
+        checkpoint,
+        nullifiers: Nullifiers {
+            sapling: vec![],
+            orchard: vec![],
+            ironwood,
+        },
+    })
+}
+
+fn cursor_from_checkpoint(checkpoint: Option<Checkpoint>) -> Option<Cursor> {
+    checkpoint.and_then(|checkpoint| {
+        checkpoint.scanned_hash.map(|hash| Cursor {
+            height: BlockHeight::from_u32(checkpoint.scanned_height),
+            hash: BlockHash(hash),
+        })
+    })
+}
+
+fn birthday(conn: &Connection) -> rusqlite::Result<u32> {
+    let b: i64 = conn.query_row(
+        "SELECT birthday FROM registry_account WHERE id = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(b as u32)
+}
+
+pub(crate) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoint>> {
     conn.query_row(
         "SELECT height, hash, chain_tip_height, chain_tip_hash FROM scan_state WHERE id = 0",
         [],
@@ -224,7 +291,7 @@ pub(super) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoin
     .optional()
 }
 
-pub(super) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
+pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut out = Vec::new();
     for query in [
         "SELECT nullifier FROM watched_ironwood_notes WHERE spent_height IS NULL",
@@ -244,7 +311,7 @@ pub(super) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8
     Ok(out)
 }
 
-pub(super) fn registry_ufvk(conn: &Connection) -> rusqlite::Result<Option<String>> {
+pub(crate) fn registry_ufvk(conn: &Connection) -> rusqlite::Result<Option<String>> {
     conn.query_row(
         "SELECT ufvk FROM registry_account WHERE id = 0",
         [],
@@ -253,12 +320,12 @@ pub(super) fn registry_ufvk(conn: &Connection) -> rusqlite::Result<Option<String
     .optional()
 }
 
-pub(super) fn name_count(conn: &Connection) -> rusqlite::Result<u64> {
+pub(crate) fn name_count(conn: &Connection) -> rusqlite::Result<u64> {
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
     Ok(n as u64)
 }
 
-pub(super) fn resolve_by_name(
+pub(crate) fn resolve_by_name(
     conn: &Connection,
     name: &str,
 ) -> rusqlite::Result<Option<Registration>> {
@@ -270,7 +337,7 @@ pub(super) fn resolve_by_name(
     .optional()
 }
 
-pub(super) fn registrations_by_ua(
+pub(crate) fn registrations_by_ua(
     conn: &Connection,
     ua: &str,
     limit: u32,
@@ -291,7 +358,7 @@ pub(super) fn registrations_by_ua(
     Ok((rows, total as u64))
 }
 
-pub(super) fn list_registrations(
+pub(crate) fn list_registrations(
     conn: &Connection,
     limit: u32,
     offset: u32,
@@ -306,7 +373,7 @@ pub(super) fn list_registrations(
     Ok((rows, total as u64))
 }
 
-pub(super) fn events(
+pub(crate) fn events(
     conn: &Connection,
     name: Option<&str>,
     action: Option<Action>,
@@ -570,8 +637,6 @@ fn action_str(a: Action) -> &'static str {
 mod tests {
     use super::*;
     use crate::registry::storage::SCHEMA_SQL;
-    use zcash_primitives::block::BlockHash;
-    use zcash_protocol::consensus::BlockHeight;
 
     fn database() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -579,33 +644,48 @@ mod tests {
         conn
     }
 
-    fn cursor(height: u32, hash_byte: u8) -> Cursor {
-        Cursor {
-            height: BlockHeight::from_u32(height),
-            hash: BlockHash([hash_byte; 32]),
-        }
+    fn insert_checkpoint(conn: &Connection, height: u32, hash_byte: u8) {
+        conn.execute(
+            "INSERT INTO scan_state (id, height, hash, chain_tip_height, chain_tip_hash)
+             VALUES (0, ?1, ?2, ?1, ?2)",
+            params![height, vec![hash_byte; 32]],
+        )
+        .unwrap();
     }
 
     #[test]
-    fn apply_batch_persists_a_complete_cursor() {
+    fn checkpoint_persists_a_complete_cursor() {
         let conn = database();
-        let cursor = cursor(42, 7);
+        insert_checkpoint(&conn, 42, 7);
 
-        apply_batch(&conn, cursor, cursor, &[], &[], &[]).unwrap();
+        let cp = checkpoint(&conn).unwrap().unwrap();
+        assert_eq!(cp.scanned_height, 42);
+        assert_eq!(cp.scanned_hash, Some([7; 32]));
+        assert_eq!(cp.chain_tip_height, Some(42));
+        assert_eq!(cp.chain_tip_hash, Some([7; 32]));
+    }
 
-        let checkpoint = checkpoint(&conn).unwrap().unwrap();
-        assert_eq!(checkpoint.scanned_height, 42);
-        assert_eq!(checkpoint.scanned_hash, Some([7; 32]));
-        assert_eq!(checkpoint.chain_tip_height, Some(42));
-        assert_eq!(checkpoint.chain_tip_hash, Some([7; 32]));
+    #[test]
+    fn cursor_from_checkpoint_returns_none_for_hashless_row() {
+        let cp = Checkpoint {
+            scanned_height: 42,
+            scanned_hash: None,
+            chain_tip_height: None,
+            chain_tip_hash: None,
+        };
+        assert!(cursor_from_checkpoint(Some(cp)).is_none());
     }
 
     #[test]
     fn rewind_removes_the_checkpoint_and_rolled_back_nullifiers() {
         let conn = database();
-        let cursor = cursor(42, 7);
-        let received = [([1; 32], [2; 32], 42)];
-        apply_batch(&conn, cursor, cursor, &[], &received, &[]).unwrap();
+        insert_checkpoint(&conn, 42, 7);
+        conn.execute(
+            "INSERT INTO watched_ironwood_notes (nullifier, txid, height, spent_height)
+             VALUES (?1, ?2, 42, NULL)",
+            params![vec![1u8; 32], vec![2u8; 32]],
+        )
+        .unwrap();
 
         rewind(&conn, 41).unwrap();
 

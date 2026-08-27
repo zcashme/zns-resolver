@@ -33,7 +33,6 @@ zcash_primitives = { version = "0.29", default-features = false }
 zcash_note_encryption = "0.4"
 pasta_curves = "0.5"
 group = "0.13"
-tokio-rusqlite = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 serde = { version = "1", features = ["derive"] }

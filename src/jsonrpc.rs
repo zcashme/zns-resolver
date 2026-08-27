@@ -15,10 +15,10 @@ pub use records::{NameEvent, NameRecord, Paginated, Status};
 use service::ZnsApiServer;
 use jsonrpsee::server::ServerHandle;
 
-use crate::registry::Registry;
+use crate::registry::Db;
 
-pub(crate) async fn serve_rpc(addr: &str, registry: Registry) -> std::io::Result<ServerHandle> {
-    let api = JsonRpcApi::new(registry);
+pub(crate) async fn serve_rpc(addr: &str, db: Db) -> std::io::Result<ServerHandle> {
+    let api = JsonRpcApi::new(db);
     let server = jsonrpsee::server::Server::builder().build(addr).await?;
     let handle = server.start(api.into_rpc());
     tracing::info!("JSON-RPC listening on {addr}");

@@ -17,7 +17,7 @@ use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
 use jsonrpc::serve_rpc;
-use registry::Registry;
+use registry::Db;
 
 // ── compile-time network selection ───────────────────────────────────────────
 
@@ -60,15 +60,14 @@ async fn main() -> Result<(), SyncError> {
         .init();
 
     // --- Persistent layer bootstrap ---
-    let registry = Registry::start(NETWORK, UFVK, SCAN_BIRTHDAY, DB_PATH)
-        .await
+    let db = Db::open(NETWORK, UFVK, SCAN_BIRTHDAY, DB_PATH)
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, "registry database failed to open");
             std::process::exit(1);
         });
 
     // --- RPC server ---
-    let _rpc_handle = serve_rpc(RPC_ADDR, registry.clone())
+    let _rpc_handle = serve_rpc(RPC_ADDR, db.clone())
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, "rpc server failed to start");
@@ -76,7 +75,7 @@ async fn main() -> Result<(), SyncError> {
         });
 
     // --- Sync loop ---
-    run_sync_loop(registry.clone(), NETWORK, UFVK, SCAN_BIRTHDAY).await?;
+    run_sync_loop(db.clone(), NETWORK, UFVK, SCAN_BIRTHDAY).await?;
 
     Ok(())
 }

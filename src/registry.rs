@@ -1,14 +1,44 @@
 //! ZNS name index in SQLite (single-connection architecture).
 
-use rusqlite;
+use std::sync::{Arc, Mutex};
+
+use rusqlite::{self, Connection};
+use zcash_protocol::consensus::Network;
 use zns_verify::Action;
 
-mod core;
-mod handle;
+pub(crate) mod core;
 mod notes;
-mod storage;
+pub(crate) mod storage;
 
-pub(crate) use handle::Registry;
+// ── Db handle ───────────────────────────────────────────────────────────────
+
+/// Cheap-clone handle to the ZNS database.
+/// Cloning shares the same locked connection.
+#[derive(Clone)]
+pub(crate) struct Db(Arc<Mutex<Connection>>);
+
+impl Db {
+    pub(crate) fn open(
+        network: Network,
+        ufvk: &str,
+        birthday: u32,
+        db_path: &str,
+    ) -> rusqlite::Result<Self> {
+        let conn = Connection::open(db_path)?;
+        conn.execute_batch(storage::SCHEMA_SQL)?;
+        let net_str = if network == Network::MainNetwork {
+            "main"
+        } else {
+            "test"
+        };
+        core::install_registry_config(&conn, ufvk, net_str, birthday)?;
+        Ok(Self(Arc::new(Mutex::new(conn))))
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.0.lock().unwrap()
+    }
+}
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -62,6 +92,4 @@ pub(crate) struct Event {
 pub(crate) enum RegistryError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    #[error(transparent)]
-    Driver(#[from] tokio_rusqlite::Error),
 }
