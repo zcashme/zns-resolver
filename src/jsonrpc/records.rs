@@ -19,6 +19,8 @@ pub struct NameRecord {
     pub height: u64,
     /// The last lifecycle action that produced this state ("claim", "update", or "release").
     pub last_action: String,
+    /// Canonical Name Note `expires_at`: `"none"` or a decimal Unix timestamp.
+    pub expires_at: String,
 }
 
 /// One entry in the immutable event log for names.
@@ -35,6 +37,8 @@ pub struct NameEvent {
     pub action_index: u64,
     /// The address bound by this action (present on claim/update, absent on release).
     pub address: Option<String>,
+    /// Canonical Name Note `expires_at`: `"none"` or a decimal Unix timestamp.
+    pub expires_at: String,
 }
 
 /// Paginated result envelope used by list-style methods.
@@ -83,6 +87,7 @@ pub(super) fn to_name_record(reg: Registration) -> NameRecord {
         txid: hex::encode(reg.txid),
         height: reg.height as u64,
         last_action: action_name(reg.last_action).to_string(),
+        expires_at: reg.expires_at,
     }
 }
 
@@ -95,5 +100,6 @@ pub(super) fn to_name_event(e: Event) -> NameEvent {
         height: e.height as u64,
         action_index: e.action_index as u64,
         address: (!e.ua.is_empty()).then_some(e.ua),
+        expires_at: e.expires_at,
     }
 }

@@ -59,6 +59,7 @@ pub(crate) fn try_admit_name_note(
         note.action.as_bytes(),
         note.name.as_bytes(),
         note.ua.as_bytes(),
+        note.expires_at.as_bytes(),
         &prev_rcm,
         g_d,
         pk_d,
@@ -73,6 +74,7 @@ pub(crate) fn try_admit_name_note(
     Some(NameNote {
         name: note.name.to_string(),
         ua: note.ua.to_string(),
+        expires_at: note.expires_at.to_string(),
         action: note.action,
         prev_rcm,
         rcm: rcm.to_repr(),
@@ -128,6 +130,7 @@ pub(crate) fn warn_registry_fork(
         note.action.as_bytes(),
         note.name.as_bytes(),
         note.ua.as_bytes(),
+        note.expires_at.as_bytes(),
         &claimed,
         g_d,
         pk_d,
