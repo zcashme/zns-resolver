@@ -2793,15 +2793,11 @@ dependencies = [
 
 [[package]]
 name = "zns-verify"
-version = "0.0.2"
+version = "0.1.0"
+source = "git+https://github.com/zcashme/zns-verify.git?tag=v0.1.0#2efb9511066e6fdbaa40fa1c536fffadd32b4c0d"
 dependencies = [
  "blake2b_simd",
- "chacha20",
- "chacha20poly1305",
  "group",
- "orchard",
  "pasta_curves",
  "sinsemilla",
- "zcash_note_encryption",
- "zcash_protocol",
 ]

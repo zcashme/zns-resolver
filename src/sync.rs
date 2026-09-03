@@ -46,11 +46,7 @@ pub(crate) async fn run_sync_loop(
         "test"
     };
 
-    tracing::info!(
-        network = network_name,
-        birthday,
-        "starting sync"
-    );
+    tracing::info!(network = network_name, birthday, "starting sync");
     let account = ZnsAccount { db, fvk };
 
     loop {
