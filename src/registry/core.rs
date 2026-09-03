@@ -456,85 +456,24 @@ fn set_checkpoint_in_tx(tx: &Transaction<'_>, state: Checkpoint) -> rusqlite::Re
 /// After deleting post-fork events, set `names` to the highest surviving event
 /// for this name (or delete the row if the tip was a release).
 fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
-    let row: Option<(
-        String,
-        i64,
-        String,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        i64,
-        i64,
-    )> = tx
+    let action: Option<String> = tx
         .query_row(
-            "SELECT name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index
-             FROM name_events WHERE name = ?1 ORDER BY height DESC, rowid DESC LIMIT 1",
+            "SELECT action FROM name_events WHERE name = ?1
+             ORDER BY height DESC, rowid DESC LIMIT 1",
             params![name],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                    r.get(10)?,
-                ))
-            },
+            |r| r.get(0),
         )
         .optional()?;
 
-    match row {
-        None => {
-            tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
-        }
-        Some((
-            name,
-            height,
-            action,
-            ua,
-            prev_rcm,
-            rcm,
-            psi,
-            cmx,
-            nullifier,
-            txid,
-            action_index,
-        )) => {
-            if action == "release" {
-                tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
-            } else {
-                tx.execute(
-                    "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                     ON CONFLICT (name) DO UPDATE SET
-                       height = excluded.height, action = excluded.action, ua = excluded.ua,
-                       prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
-                       cmx = excluded.cmx, nullifier = excluded.nullifier,
-                       txid = excluded.txid, action_index = excluded.action_index",
-                    params![
-                        name,
-                        height,
-                        action,
-                        ua,
-                        prev_rcm,
-                        rcm,
-                        psi,
-                        cmx,
-                        nullifier,
-                        txid,
-                        action_index,
-                    ],
-                )?;
-            }
-        }
+    tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
+    if matches!(action.as_deref(), Some("claim") | Some("update")) {
+        tx.execute(
+            "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
+             SELECT name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index
+             FROM name_events WHERE name = ?1
+             ORDER BY height DESC, rowid DESC LIMIT 1",
+            params![name],
+        )?;
     }
     Ok(())
 }

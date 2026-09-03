@@ -17,7 +17,7 @@ fn parse_memo(memo: &[u8]) -> Option<zns_verify::NameNote<'_>> {
     let Ok(note) = parse_name_note(memo) else {
         return None;
     };
-    if shadows_ua_namespace(&note.name) {
+    if shadows_ua_namespace(note.name) {
         return None;
     }
     Some(note)
@@ -44,10 +44,9 @@ pub(crate) fn try_admit_name_note(
 
     let rho = zns_verify::pallas::Base::from_repr(output.note.rho().to_bytes()).into_option()?;
     let cmx = output.note.commitment();
-    let expected = zns_verify::pallas::Base::from_repr(
-        ExtractedNoteCommitment::from(cmx).to_bytes(),
-    )
-    .into_option()?;
+    let expected =
+        zns_verify::pallas::Base::from_repr(ExtractedNoteCommitment::from(cmx).to_bytes())
+            .into_option()?;
 
     let raw = output.recipient.to_raw_address_bytes();
     let diversifier: [u8; 11] = raw[..11].try_into().expect("raw address is 43 bytes");
@@ -105,7 +104,8 @@ pub(crate) fn warn_registry_fork(
         return;
     }
 
-    let rho = match zns_verify::pallas::Base::from_repr(output.note.rho().to_bytes()).into_option() {
+    let rho = match zns_verify::pallas::Base::from_repr(output.note.rho().to_bytes()).into_option()
+    {
         Some(v) => v,
         None => return,
     };

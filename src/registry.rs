@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{self, Connection};
+use rusqlite::Connection;
 use zcash_protocol::consensus::Network;
 use zns_verify::Action;
 
@@ -85,11 +85,4 @@ pub(crate) struct Event {
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
     pub(crate) action_index: usize,
-}
-
-/// Errors surfaced by the registry.
-#[derive(thiserror::Error, Debug)]
-pub(crate) enum RegistryError {
-    #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
 }

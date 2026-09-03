@@ -2794,6 +2794,7 @@ dependencies = [
 [[package]]
 name = "zns-verify"
 version = "0.0.2"
+source = "git+https://github.com/zcashme/zns-verify?rev=6419745e54cfab5339c50353af96d4fbb37cbb0d#6419745e54cfab5339c50353af96d4fbb37cbb0d"
 dependencies = [
  "blake2b_simd",
  "chacha20",

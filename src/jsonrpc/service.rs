@@ -66,7 +66,7 @@ impl JsonRpcApi {
 /// Categorizes handler failures for the wire.
 ///
 /// `InvalidParams` → JSON-RPC `-32602`; `Internal` → `-32603` + a log line.
-/// The underlying `RegistryError` is never serialized to the client.
+/// The underlying SQLite error is never serialized to the client.
 #[derive(thiserror::Error, Debug)]
 enum RpcError {
     #[error("invalid params: {0}")]
@@ -100,8 +100,7 @@ fn clamp_pagination(limit: Option<u64>, offset: Option<u64>) -> (u32, u32) {
 impl ZnsApiServer for JsonRpcApi {
     async fn resolve(&self, name: String) -> RpcResult<Option<NameRecord>> {
         let conn = self.db.lock();
-        let reg = core::resolve_by_name(&conn, &name)
-            .map_err(RpcError::from)?;
+        let reg = core::resolve_by_name(&conn, &name).map_err(RpcError::from)?;
         Ok(reg.map(to_name_record))
     }
 
@@ -112,8 +111,8 @@ impl ZnsApiServer for JsonRpcApi {
     ) -> RpcResult<Paginated<NameRecord>> {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
         let conn = self.db.lock();
-        let (regs, total) = core::list_registrations(&conn, limit_u32, offset_u32)
-            .map_err(RpcError::from)?;
+        let (regs, total) =
+            core::list_registrations(&conn, limit_u32, offset_u32).map_err(RpcError::from)?;
         let items = regs.into_iter().map(to_name_record).collect();
         Ok(Paginated {
             items,
@@ -202,15 +201,9 @@ impl ZnsApiServer for JsonRpcApi {
         let since = since_height.map(|h| h.min(u32::MAX as u64) as u32);
 
         let conn = self.db.lock();
-        let (events, total) = core::events(
-            &conn,
-            name.as_deref(),
-            action,
-            since,
-            limit_u32,
-            offset_u32,
-        )
-        .map_err(RpcError::from)?;
+        let (events, total) =
+            core::events(&conn, name.as_deref(), action, since, limit_u32, offset_u32)
+                .map_err(RpcError::from)?;
 
         let items = events.into_iter().map(to_name_event).collect();
 

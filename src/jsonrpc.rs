@@ -8,12 +8,12 @@
 mod records;
 mod service;
 
-pub use service::JsonRpcApi;
 #[allow(unused_imports)]
 pub use records::{NameEvent, NameRecord, Paginated, Status};
+pub use service::JsonRpcApi;
 
-use service::ZnsApiServer;
 use jsonrpsee::server::ServerHandle;
+use service::ZnsApiServer;
 
 use crate::registry::Db;
 
