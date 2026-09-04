@@ -93,9 +93,3 @@ pub(crate) struct Event {
     pub(crate) action_index: usize,
 }
 
-/// Errors surfaced by the registry.
-#[derive(thiserror::Error, Debug)]
-pub(crate) enum RegistryError {
-    #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
-}
