@@ -54,6 +54,8 @@ pub(crate) struct Checkpoint {
 pub(crate) struct NameNote {
     pub(crate) name: String,
     pub(crate) ua: String,
+    /// Canonical memo field: `"none"` or decimal Unix seconds.
+    pub(crate) expires_at: String,
     pub(crate) action: Action,
     pub(crate) prev_rcm: [u8; 32],
     pub(crate) rcm: [u8; 32],
@@ -70,6 +72,8 @@ pub(crate) struct NameNote {
 pub(crate) struct Registration {
     pub(crate) name: String,
     pub(crate) ua: String,
+    /// Canonical memo field: `"none"` or decimal Unix seconds.
+    pub(crate) expires_at: String,
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
     pub(crate) last_action: Action,
@@ -82,14 +86,10 @@ pub(crate) struct Event {
     pub(crate) name: String,
     pub(crate) action: Action,
     pub(crate) ua: String,
+    /// Canonical memo field: `"none"` or decimal Unix seconds.
+    pub(crate) expires_at: String,
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
     pub(crate) action_index: usize,
 }
 
-/// Errors surfaced by the registry.
-#[derive(thiserror::Error, Debug)]
-pub(crate) enum RegistryError {
-    #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
-}

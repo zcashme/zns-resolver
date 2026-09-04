@@ -155,29 +155,17 @@ pub(crate) fn apply_batch(
         }
     }
     for nn in &admitted {
-        insert_event(
-            &tx,
-            &nn.name,
-            &nn.ua,
-            &nn.prev_rcm,
-            &nn.rcm,
-            &nn.psi,
-            &nn.cmx,
-            &nn.nullifier,
-            &nn.txid,
-            nn.height,
-            nn.action,
-            nn.action_index,
-        )?;
+        insert_event(&tx, nn)?;
 
         if nn.action == Action::Release {
             tx.execute("DELETE FROM names WHERE name = ?1", params![nn.name])?;
         } else {
             tx.execute(
-                "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT (name) DO UPDATE SET
                    height = excluded.height, action = excluded.action, ua = excluded.ua,
+                   expires_at = excluded.expires_at,
                    prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
                    cmx = excluded.cmx, nullifier = excluded.nullifier,
                    txid = excluded.txid, action_index = excluded.action_index",
@@ -186,6 +174,7 @@ pub(crate) fn apply_batch(
                     nn.height as i64,
                     action_str(nn.action),
                     nn.ua,
+                    nn.expires_at,
                     nn.prev_rcm.as_slice(),
                     nn.rcm.as_slice(),
                     nn.psi.as_slice(),
@@ -330,7 +319,7 @@ pub(crate) fn resolve_by_name(
     name: &str,
 ) -> rusqlite::Result<Option<Registration>> {
     conn.query_row(
-        "SELECT name, ua, txid, height, action FROM names WHERE name = ?1",
+        "SELECT name, ua, txid, height, action, expires_at FROM names WHERE name = ?1",
         params![name],
         row_to_registration,
     )
@@ -349,7 +338,7 @@ pub(crate) fn registrations_by_ua(
         |r| r.get(0),
     )?;
     let mut stmt = conn.prepare(
-        "SELECT name, ua, txid, height, action FROM names
+        "SELECT name, ua, txid, height, action, expires_at FROM names
          WHERE ua = ?1 ORDER BY name LIMIT ?2 OFFSET ?3",
     )?;
     let rows = stmt
@@ -365,7 +354,7 @@ pub(crate) fn list_registrations(
 ) -> rusqlite::Result<(Vec<Registration>, u64)> {
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
     let mut stmt = conn.prepare(
-        "SELECT name, ua, txid, height, action FROM names ORDER BY name LIMIT ?1 OFFSET ?2",
+        "SELECT name, ua, txid, height, action, expires_at FROM names ORDER BY name LIMIT ?1 OFFSET ?2",
     )?;
     let rows = stmt
         .query_map(params![limit, offset], row_to_registration)?
@@ -398,7 +387,7 @@ pub(crate) fn events(
         |r| r.get(0),
     )?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT rowid, name, action, ua, txid, height, action_index FROM name_events {WHERE}
+        "SELECT rowid, name, action, ua, txid, height, action_index, expires_at FROM name_events {WHERE}
          ORDER BY height DESC, rowid DESC LIMIT ?4 OFFSET ?5"
     ))?;
     let events = stmt
@@ -456,119 +445,45 @@ fn set_checkpoint_in_tx(tx: &Transaction<'_>, state: Checkpoint) -> rusqlite::Re
 /// After deleting post-fork events, set `names` to the highest surviving event
 /// for this name (or delete the row if the tip was a release).
 fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
-    let row: Option<(
-        String,
-        i64,
-        String,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        i64,
-        i64,
-    )> = tx
+    let action: Option<String> = tx
         .query_row(
-            "SELECT name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index
-             FROM name_events WHERE name = ?1 ORDER BY height DESC, rowid DESC LIMIT 1",
+            "SELECT action FROM name_events WHERE name = ?1
+             ORDER BY height DESC, rowid DESC LIMIT 1",
             params![name],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                    r.get(10)?,
-                ))
-            },
+            |r| r.get(0),
         )
         .optional()?;
 
-    match row {
-        None => {
-            tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
-        }
-        Some((
-            name,
-            height,
-            action,
-            ua,
-            prev_rcm,
-            rcm,
-            psi,
-            cmx,
-            nullifier,
-            txid,
-            action_index,
-        )) => {
-            if action == "release" {
-                tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
-            } else {
-                tx.execute(
-                    "INSERT INTO names (name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                     ON CONFLICT (name) DO UPDATE SET
-                       height = excluded.height, action = excluded.action, ua = excluded.ua,
-                       prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
-                       cmx = excluded.cmx, nullifier = excluded.nullifier,
-                       txid = excluded.txid, action_index = excluded.action_index",
-                    params![
-                        name,
-                        height,
-                        action,
-                        ua,
-                        prev_rcm,
-                        rcm,
-                        psi,
-                        cmx,
-                        nullifier,
-                        txid,
-                        action_index,
-                    ],
-                )?;
-            }
-        }
+    tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
+    if matches!(action.as_deref(), Some("claim") | Some("update")) {
+        tx.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
+             SELECT name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index
+             FROM name_events WHERE name = ?1
+             ORDER BY height DESC, rowid DESC LIMIT 1",
+            params![name],
+        )?;
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn insert_event(
-    conn: &Transaction<'_>,
-    name: &str,
-    ua: &str,
-    prev_rcm: &[u8; 32],
-    rcm: &[u8; 32],
-    psi: &[u8; 32],
-    cmx: &[u8; 32],
-    nullifier: &[u8; 32],
-    txid: &[u8; 32],
-    height: u32,
-    action: Action,
-    action_index: usize,
-) -> rusqlite::Result<()> {
+fn insert_event(conn: &Transaction<'_>, nn: &NameNote) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO name_events (name, height, action, ua, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
-            name,
-            height as i64,
-            action_str(action),
-            ua,
-            prev_rcm.as_slice(),
-            rcm.as_slice(),
-            psi.as_slice(),
-            cmx.as_slice(),
-            nullifier.as_slice(),
-            txid.as_slice(),
-            action_index as i64,
+            nn.name,
+            nn.height as i64,
+            action_str(nn.action),
+            nn.ua,
+            nn.expires_at,
+            nn.prev_rcm.as_slice(),
+            nn.rcm.as_slice(),
+            nn.psi.as_slice(),
+            nn.cmx.as_slice(),
+            nn.nullifier.as_slice(),
+            nn.txid.as_slice(),
+            nn.action_index as i64,
         ],
     )?;
     Ok(())
@@ -603,6 +518,7 @@ fn row_to_registration(r: &Row<'_>) -> rusqlite::Result<Registration> {
             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?,
         height: r.get::<_, i64>(3)? as u32,
         last_action: parse_action(&r.get::<_, String>(4)?)?,
+        expires_at: r.get(5)?,
     })
 }
 
@@ -618,6 +534,7 @@ fn row_to_event(row: &Row<'_>) -> rusqlite::Result<Event> {
             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, 0))?,
         height: row.get::<_, i64>(5)? as u32,
         action_index: row.get::<_, i64>(6)? as usize,
+        expires_at: row.get(7)?,
     })
 }
 

@@ -60,19 +60,16 @@ async fn main() -> Result<(), SyncError> {
         .init();
 
     // --- Persistent layer bootstrap ---
-    let db = Db::open(NETWORK, UFVK, SCAN_BIRTHDAY, DB_PATH)
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "registry database failed to open");
-            std::process::exit(1);
-        });
+    let db = Db::open(NETWORK, UFVK, SCAN_BIRTHDAY, DB_PATH).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "registry database failed to open");
+        std::process::exit(1);
+    });
 
     // --- RPC server ---
-    let _rpc_handle = serve_rpc(RPC_ADDR, db.clone())
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "rpc server failed to start");
-            std::process::exit(1);
-        });
+    let _rpc_handle = serve_rpc(RPC_ADDR, db.clone()).await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, "rpc server failed to start");
+        std::process::exit(1);
+    });
 
     // --- Sync loop ---
     run_sync_loop(db.clone(), NETWORK, UFVK, SCAN_BIRTHDAY).await?;
