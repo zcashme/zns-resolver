@@ -2,10 +2,10 @@
 
 use group::{Group, GroupEncoding};
 use orchard::keys::FullViewingKey;
-use orchard::note::ExtractedNoteCommitment;
+use orchard::note::NoteCommitTrapdoor;
 use pasta_curves::arithmetic::CurveExt;
 use pasta_curves::pallas;
-use seer_sync::sync::scan::OrchardOutput;
+use seer_sync::sync::decrypt::RelaxedIronwoodOutput;
 use zns_verify::verify::verify_name_note_with_witness;
 use zns_verify::{prev_rcm_for, ExtractedNoteCommitment as ZnsCmx, PrevRcm, PrimeField, Rho, Tip};
 
@@ -14,7 +14,7 @@ use super::NameNote;
 /// Parse a candidate name memo (if valid format and does not shadow UA namespace).
 /// The returned note borrows from `memo` and carries the *memo's* `prev_rcm`
 /// (untrusted until the tip rule and the commitment check pass).
-fn parse_memo(memo: &zns_verify::Memo) -> Option<zns_verify::NameNote<'_>> {
+pub(super) fn parse_memo(memo: &zns_verify::Memo) -> Option<zns_verify::NameNote<'_>> {
     let note = zns_verify::NameNote::parse(memo).ok()?;
     if shadows_ua_namespace(note.name().as_str()) {
         return None;
@@ -22,48 +22,59 @@ fn parse_memo(memo: &zns_verify::Memo) -> Option<zns_verify::NameNote<'_>> {
     Some(note)
 }
 
-/// Lightweight extractor for the name only. Used by the batch applicator
-/// to look up the current per-name tip before running verification.
-/// Returns `None` for unparseable or invalid memos.
-pub(super) fn name_from_memo(memo: &[u8]) -> Option<String> {
-    let memo = zns_verify::Memo::from_bytes(memo).ok()?;
-    parse_memo(&memo).map(|n| n.name().as_str().to_string())
-}
-
+/// Attempt to admit a decrypted Name Note candidate.
+///
+/// `prev` is the name's live state: the tip the note must extend plus the
+/// predecessor's derived nullifier (for the consumption link on
+/// updates/releases; claims start a fresh chain and check nothing).
 pub(crate) fn try_admit_name_note(
-    output: &OrchardOutput,
+    candidate: &RelaxedIronwoodOutput,
+    note: zns_verify::NameNote<'_>,
     txid: [u8; 32],
     height: u32,
     fvk: &FullViewingKey,
-    tip: Option<&Tip>,
+    prev: Option<&(Tip, [u8; 32])>,
 ) -> Option<NameNote> {
-    let memo = output.memo?;
-    let zns_memo = zns_verify::Memo::from_bytes(&memo).ok()?;
-    let note = parse_memo(&zns_memo)?;
+    let (idx, cand, consumed_nf, _, is_sent) = candidate;
 
-    // The kernel hashes the *disclosed* predecessor into the commitment, so
-    // the chain rule is enforced here: the disclosed `prev_rcm` (zero for a
-    // claim) must exactly extend our current tip.
-    let expected_prev = prev_rcm_for(tip, note.action())?;
+    // A name note exists only as a mint self-send; `is_sent` is
+    // OVK-established by the scan.
+    if !is_sent {
+        return None;
+    }
+
+    // The disclosed predecessor must be exactly what the live tip demands.
+    let expected_prev = prev_rcm_for(prev.map(|p| &p.0), note.action())?;
     let disclosed = note.prev_rcm().unwrap_or(PrevRcm::ZERO);
     if disclosed.as_bytes() != &expected_prev {
         return None;
     }
 
-    let rho = Rho::from_bytes(&output.note.rho().to_bytes())?;
-    let cmx =
-        ZnsCmx::from_bytes(&ExtractedNoteCommitment::from(output.note.commitment()).to_bytes())?;
+    // Consumption link: an update/release must consume the admitted
+    // predecessor (its action reveals the stored nullifier).
+    if !matches!(note, zns_verify::NameNote::Claim { .. }) {
+        let (_, prev_nullifier) = prev?;
+        if consumed_nf.to_bytes() != *prev_nullifier {
+            return None;
+        }
+    }
 
-    let raw = output.recipient.to_raw_address_bytes();
+    let rho = Rho::from_bytes(&cand.note().rho().to_bytes())?;
+    let cmx = ZnsCmx::from_bytes(&cand.cmx().to_bytes())?;
+
+    let raw = cand.note().recipient().to_raw_address_bytes();
     let diversifier: [u8; 11] = raw[..11].try_into().expect("raw address is 43 bytes");
     let pk_d: [u8; 32] = raw[11..].try_into().expect("raw address is 43 bytes");
     let g_d = diversify_hash(&diversifier);
-    let value = output.note.value().inner();
+    let value = cand.note().value().inner();
 
     let (psi, rcm) = verify_name_note_with_witness(&note, g_d, pk_d, value, rho, cmx)?;
 
-    let nullifier = output.note.nullifier(fvk).to_bytes();
-    let cmx_bytes = ExtractedNoteCommitment::from(output.note.commitment()).to_bytes();
+    // Derived at admission, revealed at consumption.
+    let nullifier = cand
+        .note()
+        .zns_nullifier(fvk, NoteCommitTrapdoor::from_inner(rcm), psi)?
+        .to_bytes();
 
     Some(NameNote {
         name: note.name().as_str().to_string(),
@@ -78,52 +89,46 @@ pub(crate) fn try_admit_name_note(
         prev_rcm: expected_prev,
         rcm: rcm.to_repr(),
         psi: psi.to_repr(),
-        cmx: cmx_bytes,
+        cmx: cand.cmx().to_bytes(),
         txid,
         height,
-        action_index: output.index as usize,
+        action_index: *idx,
         nullifier,
     })
 }
 
+/// Warn on a registry fork: a candidate whose binding verifies but whose
+/// disclosed predecessor differs from our live tip. Called after a failed
+/// admission; all other rejection paths stay silent.
 pub(crate) fn warn_registry_fork(
-    memo: &[u8],
-    output: &OrchardOutput,
-    _txid: [u8; 32],
+    candidate: &RelaxedIronwoodOutput,
+    note: zns_verify::NameNote<'_>,
     height: u32,
     tip: Option<&Tip>,
 ) {
-    let Ok(zns_memo) = zns_verify::Memo::from_bytes(memo) else {
-        return;
-    };
-    let Some(note) = parse_memo(&zns_memo) else {
-        return;
-    };
+    let (_, cand, _, _, _) = candidate;
 
     let Some(expected_prev) = prev_rcm_for(tip, note.action()) else {
         return;
     };
-
     let claimed = note.prev_rcm().unwrap_or(PrevRcm::ZERO);
     let claimed_bytes = claimed.as_bytes();
     if claimed_bytes == &expected_prev {
         return;
     }
 
-    let Some(rho) = Rho::from_bytes(&output.note.rho().to_bytes()) else {
+    let Some(rho) = Rho::from_bytes(&cand.note().rho().to_bytes()) else {
         return;
     };
-    let Some(cmx) =
-        ZnsCmx::from_bytes(&ExtractedNoteCommitment::from(output.note.commitment()).to_bytes())
-    else {
+    let Some(cmx) = ZnsCmx::from_bytes(&cand.cmx().to_bytes()) else {
         return;
     };
 
-    let raw = output.recipient.to_raw_address_bytes();
+    let raw = cand.note().recipient().to_raw_address_bytes();
     let diversifier: [u8; 11] = raw[..11].try_into().expect("raw address is 43 bytes");
     let pk_d: [u8; 32] = raw[11..].try_into().expect("raw address is 43 bytes");
     let g_d = diversify_hash(&diversifier);
-    let value = output.note.value().inner();
+    let value = cand.note().value().inner();
 
     let matches = verify_name_note_with_witness(&note, g_d, pk_d, value, rho, cmx).is_some();
 

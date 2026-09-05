@@ -92,4 +92,3 @@ pub(crate) struct Event {
     pub(crate) height: u32,
     pub(crate) action_index: usize,
 }
-

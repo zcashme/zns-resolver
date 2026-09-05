@@ -9,7 +9,7 @@ use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
-use zns_verify::{Action, Tip};
+use zns_verify::{Action, Memo, Tip};
 
 use super::notes;
 use super::{Checkpoint, Event, NameNote, Registration};
@@ -74,46 +74,50 @@ pub(crate) fn apply_batch(
     transactions: &[WalletTx],
     fvk: &FullViewingKey,
 ) -> rusqlite::Result<Vec<NameNote>> {
-    let mut pending_tips: HashMap<String, Tip> = HashMap::new();
+    let mut pending_tips: HashMap<String, (Tip, [u8; 32])> = HashMap::new();
     let mut admitted: Vec<NameNote> = Vec::new();
 
     for tx in transactions {
         let txid = *tx.txid.as_ref();
         let height = u32::from(tx.height);
 
-        for output in &tx.ironwood_outputs {
-            if !output.is_sent {
+        for candidate in &tx.relaxed_ironwood_outputs {
+            // A name note exists only as a mint self-send.
+            if !candidate.4 {
                 continue;
             }
-            let Some(memo) = output.memo else {
+            let Some(memo) = candidate.3 else {
                 continue;
             };
-            if !memo.starts_with(b"ZNS:") {
-                continue;
-            }
-
-            let Some(name) = notes::name_from_memo(&memo) else {
+            let Ok(zns_memo) = Memo::from_bytes(&memo) else {
                 continue;
             };
+            let Some(note) = notes::parse_memo(&zns_memo) else {
+                continue;
+            };
+            let name = note.name().as_str().to_string();
 
-            let tip: Option<Tip> = match pending_tips.get(&name) {
-                Some(t) => Some(*t),
+            let prev = match pending_tips.get(&name) {
+                Some(p) => Some(*p),
                 None => read_tip_offline(conn, &name)?,
             };
 
             let Some(name_note) =
-                notes::try_admit_name_note(output, txid, height, fvk, tip.as_ref())
+                notes::try_admit_name_note(candidate, note, txid, height, fvk, prev.as_ref())
             else {
-                notes::warn_registry_fork(&memo, output, txid, height, tip.as_ref());
+                notes::warn_registry_fork(candidate, note, height, prev.as_ref().map(|p| &p.0));
                 continue;
             };
 
             pending_tips.insert(
-                name_note.name.clone(),
-                Tip {
-                    action: name_note.action,
-                    rcm: name_note.rcm,
-                },
+                name,
+                (
+                    Tip {
+                        action: name_note.action,
+                        rcm: name_note.rcm,
+                    },
+                    name_note.nullifier,
+                ),
             );
             admitted.push(name_note);
         }
@@ -407,12 +411,13 @@ fn registry_config(conn: &Connection) -> rusqlite::Result<Option<(String, String
     .optional()
 }
 
-/// Plain `SELECT` of a name's tip — no transaction. Used by `apply_batch`
-/// Phase 1. Safe alongside the Phase 2 tx because the serialized execution
-/// inside the Registry impl is the sole mutator.
-fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<Tip>> {
+/// Plain `SELECT` of a name's live state — the tip plus the stored nullifier
+/// (for the consumption link). No transaction: used by `apply_batch` Phase 1.
+/// Safe alongside the Phase 2 tx because the serialized execution inside the
+/// Registry impl is the sole mutator.
+fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<(Tip, [u8; 32])>> {
     conn.query_row(
-        "SELECT action, rcm FROM names WHERE name = ?1",
+        "SELECT action, rcm, nullifier FROM names WHERE name = ?1",
         params![name],
         |row| {
             let action = parse_action(&row.get::<_, String>(0)?)?;
@@ -420,7 +425,11 @@ fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<Ti
             let rcm: [u8; 32] = rcm
                 .try_into()
                 .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?;
-            Ok(Tip { action, rcm })
+            let nullifier: Vec<u8> = row.get(2)?;
+            let nullifier: [u8; 32] = nullifier
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?;
+            Ok((Tip { action, rcm }, nullifier))
         },
     )
     .optional()
