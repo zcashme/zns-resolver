@@ -8,8 +8,6 @@
 mod records;
 mod service;
 
-#[allow(unused_imports)]
-pub use records::{NameEvent, NameRecord, Paginated, Status};
 pub use service::JsonRpcApi;
 
 use jsonrpsee::server::ServerHandle;
