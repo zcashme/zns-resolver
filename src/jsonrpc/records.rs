@@ -2,7 +2,7 @@
 //!
 
 use serde::Serialize;
-use zns_verify::Action;
+use zcash_protocol::TxId;
 
 use crate::registry::{Event, Registration};
 
@@ -57,12 +57,8 @@ pub struct Paginated<T> {
 pub struct Status {
     /// Height up to which we have verified and indexed name bindings.
     pub synced_height: u64,
-    /// Best known chain tip height from the lightwalletd we are following.
-    pub chain_tip_height: u64,
-    /// Whether we are currently caught up with the chain tip.
+    /// Whether indexing has reached the chain head (as of the last tip poll).
     pub synced: bool,
-    /// How many blocks behind the chain tip we are (0 when synced).
-    pub blocks_behind: u64,
     /// The viewing key (as a string) used to observe name bindings.
     /// Exposed so clients can verify they are talking to the expected resolver.
     pub viewing_key: String,
@@ -72,21 +68,13 @@ pub struct Status {
 
 // ── conversion helpers (private to the jsonrpc module) ───────────────────────
 
-pub(super) fn action_name(a: Action) -> &'static str {
-    match a {
-        Action::Claim => "claim",
-        Action::Update => "update",
-        Action::Release => "release",
-    }
-}
-
 pub(super) fn to_name_record(reg: Registration) -> NameRecord {
     NameRecord {
         name: reg.name,
         address: reg.ua,
-        txid: hex::encode(reg.txid),
+        txid: TxId::from_bytes(reg.txid).to_string(),
         height: reg.height as u64,
-        last_action: action_name(reg.last_action).to_string(),
+        last_action: reg.last_action.as_str().to_string(),
         expires_at: reg.expires_at,
     }
 }
@@ -95,8 +83,8 @@ pub(super) fn to_name_event(e: Event) -> NameEvent {
     NameEvent {
         id: e.id,
         name: e.name,
-        action: action_name(e.action).to_string(),
-        txid: hex::encode(e.txid),
+        action: e.action.as_str().to_string(),
+        txid: TxId::from_bytes(e.txid).to_string(),
         height: e.height as u64,
         action_index: e.action_index as u64,
         address: (!e.ua.is_empty()).then_some(e.ua),

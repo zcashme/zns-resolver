@@ -11,8 +11,8 @@ mod jsonrpc; // API implementation
 mod registry; // Name index Database
 mod sync; // Sync Loop
 
-use sync::run_sync_loop;
 use sync::SyncError;
+use sync::{run_sync_loop, run_tip_publisher};
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
@@ -65,11 +65,17 @@ async fn main() -> Result<(), SyncError> {
         std::process::exit(1);
     });
 
+    // --- Network path: the live chain head, observed and published ---
+    let (tip_tx, tip_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(run_tip_publisher(NETWORK, tip_tx));
+
     // --- RPC server ---
-    let _rpc_handle = serve_rpc(RPC_ADDR, db.clone()).await.unwrap_or_else(|e| {
-        tracing::error!(error = %e, "rpc server failed to start");
-        std::process::exit(1);
-    });
+    let _rpc_handle = serve_rpc(RPC_ADDR, db.clone(), tip_rx)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "rpc server failed to start");
+            std::process::exit(1);
+        });
 
     // --- Sync loop ---
     run_sync_loop(db.clone(), NETWORK, UFVK, SCAN_BIRTHDAY).await?;

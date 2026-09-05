@@ -13,10 +13,16 @@ pub use service::JsonRpcApi;
 use jsonrpsee::server::ServerHandle;
 use service::ZnsApiServer;
 
+use tokio::sync::watch;
+
 use crate::registry::Db;
 
-pub(crate) async fn serve_rpc(addr: &str, db: Db) -> std::io::Result<ServerHandle> {
-    let api = JsonRpcApi::new(db);
+pub(crate) async fn serve_rpc(
+    addr: &str,
+    db: Db,
+    tip_rx: watch::Receiver<Option<u32>>,
+) -> std::io::Result<ServerHandle> {
+    let api = JsonRpcApi::new(db, tip_rx);
     let server = jsonrpsee::server::Server::builder().build(addr).await?;
     let handle = server.start(api.into_rpc());
     tracing::info!("JSON-RPC listening on {addr}");
