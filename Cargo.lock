@@ -1774,9 +1774,8 @@ dependencies = [
 
 [[package]]
 name = "seer-sync"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec26095115bb484a8adbd0d634b4b9b80b45ec07d4dace7ce69ff209c168d985"
+version = "0.4.0"
+source = "git+https://github.com/zcashme/seer-sync.git?tag=seer-sync-v0.4.0#df6e65402285334350d81add34b95aa0a8535a70"
 dependencies = [
  "http",
  "orchard",

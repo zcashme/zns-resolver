@@ -1,8 +1,7 @@
 # ZNS resolver binary (`sync`, `orchard`, `registry`, `jsonrpc`). Watches the registry inbox on Zcash,
 # verifies Orchard note bindings, indexes name→UA, serves JSON-RPC.
-# Deps: seer-sync (chain I/O + ZNS decryption), zns-verify (crypto + memos; kernel only,
-# its optional decrypt feature is unused here), orchard via patched fork.
-# zns-verify pinned via git tag; the resolver uses the default (no_std kernel) feature set.
+# Deps: seer-sync (chain I/O + relaxed Ironwood Name Note scan; git dep), zns-verify
+# (crypto + memos; no_std kernel only), orchard via patched fork.
 [package]
 name = "zns-resolver"
 description = "ZNS resolver: verifies name bindings and maintains a name → UA index."
@@ -27,7 +26,8 @@ mainnet = []
 testnet = []
 
 [dependencies]
-seer-sync = "0.3.1"
+# ZNS fork of seer-sync — relaxed Ironwood scan (Name Note candidates) via `zns-decrypt`.
+seer-sync = { git = "https://github.com/zcashme/seer-sync.git", tag = "seer-sync-v0.4.0", default-features = false, features = ["zns-decrypt"] }
 zns-verify = { git = "https://github.com/zcashme/zns-verify.git", tag = "v0.1.0" }
 orchard = { version = "0.15.5", default-features = false, features = ["std"] }
 zcash_protocol = { version = "0.10", default-features = false, features = ["std"] }
