@@ -66,7 +66,7 @@ impl JsonRpcApi {
 /// Categorizes handler failures for the wire.
 ///
 /// `InvalidParams` → JSON-RPC `-32602`; `Internal` → `-32603` + a log line.
-/// The underlying `RegistryError` is never serialized to the client.
+/// The underlying SQLite error is never serialized to the client.
 #[derive(thiserror::Error, Debug)]
 enum RpcError {
     #[error("invalid params: {0}")]

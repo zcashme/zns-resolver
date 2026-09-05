@@ -3,3 +3,5 @@
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+coverage/
+lcov.info

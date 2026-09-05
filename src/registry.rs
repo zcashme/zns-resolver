@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{self, Connection};
+use rusqlite::Connection;
 use zcash_protocol::consensus::Network;
 use zns_verify::Action;
 
