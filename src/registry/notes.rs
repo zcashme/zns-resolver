@@ -1,100 +1,51 @@
-//! Parses and verifies `NameNote`s from decrypted memos.
+//! Name-note admission helpers: the link gates, binding verification,
+//! and the registry-fork warning.
 
 use group::{Group, GroupEncoding};
-use orchard::keys::FullViewingKey;
-use orchard::note::NoteCommitTrapdoor;
 use pasta_curves::arithmetic::CurveExt;
 use pasta_curves::pallas;
 use seer_sync::sync::decrypt::RelaxedIronwoodOutput;
 use zns_verify::verify::verify_name_note_with_witness;
-use zns_verify::{prev_rcm_for, ExtractedNoteCommitment as ZnsCmx, PrevRcm, PrimeField, Rho, Tip};
+use zns_verify::{prev_rcm_for, ExtractedNoteCommitment as ZnsCmx, PrevRcm, Rho, Tip};
 
-use super::NameNote;
-
-/// Parse a candidate name memo (if valid format and does not shadow UA namespace).
-/// The returned note borrows from `memo` and carries the *memo's* `prev_rcm`
-/// (untrusted until the tip rule and the commitment check pass).
-pub(super) fn parse_memo(memo: &zns_verify::Memo) -> Option<zns_verify::NameNote<'_>> {
-    let note = zns_verify::NameNote::parse(memo).ok()?;
-    if shadows_ua_namespace(note.name().as_str()) {
+/// Checks a candidate's linkage to the name's live state: the chain rule
+/// (disclosed `prev_rcm` must extend the tip) and the consumption link
+/// (updates/releases must consume the admitted predecessor's nullifier).
+/// Returns the expected `prev_rcm` on success.
+pub(crate) fn check_name_link(
+    prev: Option<&(Tip, [u8; 32])>,
+    note: &zns_verify::NameNote<'_>,
+    consumed_nf: &orchard::note::Nullifier,
+) -> Option<[u8; 32]> {
+    let expected_prev = prev_rcm_for(prev.map(|p| &p.0), note.action())?;
+    if note.prev_rcm().unwrap_or(PrevRcm::ZERO).as_bytes() != &expected_prev {
         return None;
     }
-    Some(note)
+    if !matches!(note, zns_verify::NameNote::Claim { .. }) {
+        prev?
+            .1
+            .eq(&consumed_nf.to_bytes())
+            .then_some(expected_prev)?;
+    }
+    Some(expected_prev)
 }
 
-/// Attempt to admit a decrypted Name Note candidate.
-///
-/// `prev` is the name's live state: the tip the note must extend plus the
-/// predecessor's derived nullifier (for the consumption link on
-/// updates/releases; claims start a fresh chain and check nothing).
-pub(crate) fn try_admit_name_note(
-    candidate: &RelaxedIronwoodOutput,
-    note: zns_verify::NameNote<'_>,
-    txid: [u8; 32],
-    height: u32,
-    fvk: &FullViewingKey,
-    prev: Option<&(Tip, [u8; 32])>,
-) -> Option<NameNote> {
-    let (idx, cand, consumed_nf, _, is_sent) = candidate;
-
-    // A name note exists only as a mint self-send; `is_sent` is
-    // OVK-established by the scan.
-    if !is_sent {
-        return None;
-    }
-
-    // The disclosed predecessor must be exactly what the live tip demands.
-    let expected_prev = prev_rcm_for(prev.map(|p| &p.0), note.action())?;
-    let disclosed = note.prev_rcm().unwrap_or(PrevRcm::ZERO);
-    if disclosed.as_bytes() != &expected_prev {
-        return None;
-    }
-
-    // Consumption link: an update/release must consume the admitted
-    // predecessor (its action reveals the stored nullifier).
-    if !matches!(note, zns_verify::NameNote::Claim { .. }) {
-        let (_, prev_nullifier) = prev?;
-        if consumed_nf.to_bytes() != *prev_nullifier {
-            return None;
-        }
-    }
-
+/// Verifies a candidate's binding: recomputes the ZNS commitment from the
+/// parsed transition and the note's parameters, and demands equality with
+/// the published `cmx`. Returns the re-derived opening `(ψ, rcm)`.
+pub(crate) fn verify_commitment(
+    note: &zns_verify::NameNote<'_>,
+    cand: &RelaxedIronwoodOutput,
+) -> Option<(pallas::Base, pallas::Scalar)> {
+    let (_, cand, _, _, _) = cand;
     let rho = Rho::from_bytes(&cand.note().rho().to_bytes())?;
     let cmx = ZnsCmx::from_bytes(&cand.cmx().to_bytes())?;
-
     let raw = cand.note().recipient().to_raw_address_bytes();
     let diversifier: [u8; 11] = raw[..11].try_into().expect("raw address is 43 bytes");
     let pk_d: [u8; 32] = raw[11..].try_into().expect("raw address is 43 bytes");
     let g_d = diversify_hash(&diversifier);
     let value = cand.note().value().inner();
-
-    let (psi, rcm) = verify_name_note_with_witness(&note, g_d, pk_d, value, rho, cmx)?;
-
-    // Derived at admission, revealed at consumption.
-    let nullifier = cand
-        .note()
-        .zns_nullifier(fvk, NoteCommitTrapdoor::from_inner(rcm), psi)?
-        .to_bytes();
-
-    Some(NameNote {
-        name: note.name().as_str().to_string(),
-        ua: note.ua().as_str().to_string(),
-        // A release carries no expiry; the row is deleted anyway and the
-        // event logs the canonical "none" spelling.
-        expires_at: note
-            .expires_at()
-            .map(|e| e.field_bytes().to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        action: note.action(),
-        prev_rcm: expected_prev,
-        rcm: rcm.to_repr(),
-        psi: psi.to_repr(),
-        cmx: cand.cmx().to_bytes(),
-        txid,
-        height,
-        action_index: *idx,
-        nullifier,
-    })
+    verify_name_note_with_witness(note, g_d, pk_d, value, rho, cmx)
 }
 
 /// Warn on a registry fork: a candidate whose binding verifies but whose
@@ -143,11 +94,6 @@ pub(crate) fn warn_registry_fork(
         tip = hex::encode(expected_prev),
         "registry fork: note extends a different predecessor than our tip"
     );
-}
-
-/// Reject names that could be mistaken for Zcash unified addresses.
-fn shadows_ua_namespace(name: &str) -> bool {
-    name.starts_with("u1") || name.starts_with("utest1")
 }
 
 fn diversify_hash(diversifier: &[u8; 11]) -> [u8; 32] {
