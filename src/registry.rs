@@ -50,23 +50,6 @@ pub(crate) struct Checkpoint {
     pub(crate) chain_tip_hash: Option<[u8; 32]>,
 }
 
-/// A verified ZNS name note:
-pub(crate) struct NameNote {
-    pub(crate) name: String,
-    pub(crate) ua: String,
-    /// Canonical memo field: `"none"` or decimal Unix seconds.
-    pub(crate) expires_at: String,
-    pub(crate) action: Action,
-    pub(crate) prev_rcm: [u8; 32],
-    pub(crate) rcm: [u8; 32],
-    pub(crate) psi: [u8; 32],
-    pub(crate) cmx: [u8; 32],
-    pub(crate) txid: [u8; 32],
-    pub(crate) height: u32,
-    pub(crate) action_index: usize,
-    pub(crate) nullifier: [u8; 32],
-}
-
 /// Current registration: a name's live tip (absent from `names` if released).
 #[derive(Debug, Clone)]
 pub(crate) struct Registration {
