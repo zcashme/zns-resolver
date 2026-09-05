@@ -13,7 +13,7 @@ use zcash_protocol::consensus::BlockHeight;
 use zns_verify::{Action, Memo, NameNote, PrimeField, Tip};
 
 use super::notes;
-use super::{Checkpoint, Event, Registration};
+use super::{Event, Registration};
 
 pub(crate) fn install_registry_config(
     conn: &Connection,
@@ -69,7 +69,6 @@ pub(crate) fn install_registry_config(
 pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
-    live: Cursor,
     transactions: &[WalletTx],
     fvk: &FullViewingKey,
 ) -> rusqlite::Result<()> {
@@ -209,7 +208,7 @@ pub(crate) fn apply_batch(
                     params![
                         name,
                         height as i64,
-                        action_str(note.action()),
+                        note.action().as_str(),
                         ua,
                         expires_at,
                         expected_prev.as_slice(),
@@ -237,15 +236,7 @@ pub(crate) fn apply_batch(
         }
     }
 
-    set_checkpoint_in_tx(
-        &db_tx,
-        Checkpoint {
-            scanned_height: u32::from(scanned.height),
-            scanned_hash: Some(scanned.hash.0),
-            chain_tip_height: Some(u32::from(live.height)),
-            chain_tip_hash: Some(live.hash.0),
-        },
-    )?;
+    set_checkpoint_in_tx(&db_tx, &scanned)?;
     db_tx.commit()?;
     Ok(())
 }
@@ -276,7 +267,12 @@ pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
         rebuild_name_tip(&tx, name)?;
     }
 
-    tx.execute("DELETE FROM scan_state WHERE id = 0", [])?;
+    // The sync position falls back to the fork height; the hash is fixed by
+    // the next apply (seer-sync's rewind convention).
+    tx.execute(
+        "UPDATE registry_account SET sync_height = ?1, sync_hash = NULL WHERE id = 0",
+        params![fork_height as i64],
+    )?;
 
     tx.commit()?;
     Ok(())
@@ -285,7 +281,7 @@ pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
 // ── reads (free functions; called directly on a locked connection) ──────
 
 pub(crate) fn resume(conn: &Connection) -> rusqlite::Result<Resume> {
-    let checkpoint = cursor_from_checkpoint(checkpoint(conn)?);
+    let checkpoint = checkpoint(conn)?;
     let ironwood: Vec<Nullifier> = ironwood_nullifiers(conn)?
         .into_iter()
         .filter_map(|bytes| Option::from(Nullifier::from_bytes(&bytes)))
@@ -303,15 +299,6 @@ pub(crate) fn resume(conn: &Connection) -> rusqlite::Result<Resume> {
     })
 }
 
-fn cursor_from_checkpoint(checkpoint: Option<Checkpoint>) -> Option<Cursor> {
-    checkpoint.and_then(|checkpoint| {
-        checkpoint.scanned_hash.map(|hash| Cursor {
-            height: BlockHeight::from_u32(checkpoint.scanned_height),
-            hash: BlockHash(hash),
-        })
-    })
-}
-
 fn birthday(conn: &Connection) -> rusqlite::Result<u32> {
     let b: i64 = conn.query_row(
         "SELECT birthday FROM registry_account WHERE id = 0",
@@ -321,42 +308,59 @@ fn birthday(conn: &Connection) -> rusqlite::Result<u32> {
     Ok(b as u32)
 }
 
-pub(crate) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Checkpoint>> {
-    conn.query_row(
-        "SELECT height, hash, chain_tip_height, chain_tip_hash FROM scan_state WHERE id = 0",
-        [],
-        row_to_checkpoint,
-    )
-    .optional()
-}
-
-pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
-    let mut out = Vec::new();
-    for query in [
-        "SELECT nullifier FROM watched_ironwood_notes WHERE spent_height IS NULL",
-        "SELECT nullifier FROM names",
-    ] {
-        let mut statement = conn.prepare(query)?;
-        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-        for row in rows {
-            let bytes: [u8; 32] = row?
-                .try_into()
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
-            if !out.contains(&bytes) {
-                out.push(bytes);
-            }
+/// The sync position, decoded from the registry's account row. `None` = no
+/// checkpoint yet (or one that failed to decode — healed by rescanning from
+/// the birthday; the index replays idempotently).
+pub(crate) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Cursor>> {
+    let row: Option<(Option<i64>, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT sync_height, sync_hash FROM registry_account WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((height, hash)) = row else {
+        return Ok(None);
+    };
+    match (height, hash) {
+        (Some(h), Some(bytes)) if bytes.len() == 32 => Ok(Some(Cursor {
+            height: BlockHeight::from_u32(h as u32),
+            hash: BlockHash(bytes.as_slice().try_into().expect("32 bytes checked above")),
+        })),
+        (Some(_), Some(bytes)) => {
+            tracing::warn!(
+                bytes = bytes.len(),
+                "sync position is corrupt; rescanning from the birthday"
+            );
+            Ok(None)
         }
+        _ => Ok(None),
     }
-    Ok(out)
 }
 
-pub(crate) fn registry_ufvk(conn: &Connection) -> rusqlite::Result<Option<String>> {
+/// The watch-set: every nullifier whose consumption we must detect —
+/// unspent watched ironwood notes plus every admitted name's nullifier.
+pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
+    let mut statement = conn.prepare(
+        "SELECT nullifier FROM watched_ironwood_notes WHERE spent_height IS NULL
+         UNION
+         SELECT nullifier FROM names",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let bytes: Vec<u8> = row.get(0)?;
+        bytes.try_into().map_err(|_| corrupt_record())
+    })?;
+    rows.collect()
+}
+
+/// The registry's UFVK. The account row is guaranteed at open; a missing row
+/// is a broken database and fails loudly.
+pub(crate) fn registry_ufvk(conn: &Connection) -> rusqlite::Result<String> {
     conn.query_row(
         "SELECT ufvk FROM registry_account WHERE id = 0",
         [],
         |row| row.get(0),
     )
-    .optional()
 }
 
 pub(crate) fn name_count(conn: &Connection) -> rusqlite::Result<u64> {
@@ -425,7 +429,7 @@ pub(crate) fn events(
                          AND (?3 IS NULL OR height > ?3)";
     let p = params![
         name,
-        action.map(action_str),
+        action.map(|a| a.as_str()),
         since_height.map(|h| h as i64),
         limit,
         offset
@@ -452,13 +456,11 @@ pub(crate) fn events(
             let memo: Vec<u8> = row.get(7)?;
             let zns_memo = Memo::from_bytes(&memo).map_err(|_| corrupt_record())?;
             let note = parse_stored_record(&zns_memo, &name, &ua).ok_or(corrupt_record())?;
-            let txid: [u8; 32] = txid
-                .try_into()
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, 0))?;
+            let txid: [u8; 32] = txid.try_into().map_err(|_| corrupt_record())?;
             Ok(Event {
                 id,
                 name: note.name().as_str().to_string(),
-                action: parse_action(&action)?,
+                action: Action::from_bytes(action.as_bytes()).ok_or(corrupt_record())?,
                 ua: note.ua().as_str().to_string(),
                 txid,
                 height: height as u32,
@@ -493,33 +495,22 @@ fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<(T
         "SELECT action, rcm, nullifier FROM names WHERE name = ?1",
         params![name],
         |row| {
-            let action = parse_action(&row.get::<_, String>(0)?)?;
+            let action =
+                Action::from_bytes(row.get::<_, String>(0)?.as_bytes()).ok_or(corrupt_record())?;
             let rcm: Vec<u8> = row.get(1)?;
-            let rcm: [u8; 32] = rcm
-                .try_into()
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?;
+            let rcm: [u8; 32] = rcm.try_into().map_err(|_| corrupt_record())?;
             let nullifier: Vec<u8> = row.get(2)?;
-            let nullifier: [u8; 32] = nullifier
-                .try_into()
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?;
+            let nullifier: [u8; 32] = nullifier.try_into().map_err(|_| corrupt_record())?;
             Ok((Tip { action, rcm }, nullifier))
         },
     )
     .optional()
 }
 
-fn set_checkpoint_in_tx(tx: &Transaction<'_>, state: Checkpoint) -> rusqlite::Result<()> {
+fn set_checkpoint_in_tx(tx: &Transaction<'_>, scanned: &Cursor) -> rusqlite::Result<()> {
     tx.execute(
-        "INSERT INTO scan_state (id, height, hash, chain_tip_height, chain_tip_hash)
-         VALUES (0, ?1, ?2, ?3, ?4)
-         ON CONFLICT (id) DO UPDATE SET
-           height = ?1, hash = ?2, chain_tip_height = ?3, chain_tip_hash = ?4",
-        params![
-            state.scanned_height,
-            state.scanned_hash,
-            state.chain_tip_height.map(|h| h as i64),
-            state.chain_tip_hash,
-        ],
+        "UPDATE registry_account SET sync_height = ?1, sync_hash = ?2 WHERE id = 0",
+        params![u32::from(scanned.height) as i64, scanned.hash.0.as_slice()],
     )?;
     Ok(())
 }
@@ -578,7 +569,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
     if parse_stored_record(&zns_memo, name, &ua_b).is_none() {
         return Err(corrupt_record());
     }
-    let action = parse_action(&action_col)?;
+    let action = Action::from_bytes(action_col.as_bytes()).ok_or(corrupt_record())?;
 
     if matches!(action, Action::Claim | Action::Update) {
         tx.execute(
@@ -627,7 +618,7 @@ fn insert_event(
         params![
             name,
             height as i64,
-            action_str(action),
+            action.as_str(),
             ua,
             expires_at,
             prev_rcm,
@@ -641,25 +632,6 @@ fn insert_event(
         ],
     )?;
     Ok(())
-}
-
-fn row_to_checkpoint(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
-    let scanned_height: u32 = row.get(0)?;
-    let scanned_hash: Option<[u8; 32]> = row
-        .get::<_, Option<Vec<u8>>>(1)?
-        .and_then(|v| v.try_into().ok());
-    let chain_tip_height: Option<u32> = row
-        .get::<_, Option<i64>>(2)?
-        .and_then(|h| u32::try_from(h).ok());
-    let chain_tip_hash: Option<[u8; 32]> = row
-        .get::<_, Option<Vec<u8>>>(3)?
-        .and_then(|v| v.try_into().ok());
-    Ok(Checkpoint {
-        scanned_height,
-        scanned_hash,
-        chain_tip_height,
-        chain_tip_hash,
-    })
 }
 
 /// The error for a record that fails the read-time check: its memo no longer
@@ -701,9 +673,7 @@ fn registration_from_row(r: &Row<'_>) -> rusqlite::Result<Registration> {
     let Some(note) = parse_stored_record(&zns_memo, &name, &ua) else {
         return Err(corrupt_record());
     };
-    let txid: [u8; 32] = txid
-        .try_into()
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?;
+    let txid: [u8; 32] = txid.try_into().map_err(|_| corrupt_record())?;
     Ok(Registration {
         name: note.name().as_str().to_string(),
         ua: note.ua().as_str().to_string(),
@@ -713,20 +683,8 @@ fn registration_from_row(r: &Row<'_>) -> rusqlite::Result<Registration> {
             .unwrap_or_else(|| "none".to_string()),
         txid,
         height: height as u32,
-        last_action: parse_action(&action)?,
+        last_action: Action::from_bytes(action.as_bytes()).ok_or(corrupt_record())?,
     })
-}
-
-fn parse_action(s: &str) -> rusqlite::Result<Action> {
-    Action::from_bytes(s.as_bytes()).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, 0))
-}
-
-fn action_str(a: Action) -> &'static str {
-    match a {
-        Action::Claim => "claim",
-        Action::Update => "update",
-        Action::Release => "release",
-    }
 }
 
 #[cfg(test)]
@@ -742,39 +700,35 @@ mod tests {
 
     fn insert_checkpoint(conn: &Connection, height: u32, hash_byte: u8) {
         conn.execute(
-            "INSERT INTO scan_state (id, height, hash, chain_tip_height, chain_tip_hash)
-             VALUES (0, ?1, ?2, ?1, ?2)",
-            params![height, vec![hash_byte; 32]],
+            "UPDATE registry_account SET sync_height = ?1, sync_hash = ?2 WHERE id = 0",
+            params![height as i64, vec![hash_byte; 32]],
         )
         .unwrap();
     }
 
     #[test]
-    fn checkpoint_persists_a_complete_cursor() {
+    fn checkpoint_persists_the_sync_position() {
         let conn = database();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
         insert_checkpoint(&conn, 42, 7);
 
-        let cp = checkpoint(&conn).unwrap().unwrap();
-        assert_eq!(cp.scanned_height, 42);
-        assert_eq!(cp.scanned_hash, Some([7; 32]));
-        assert_eq!(cp.chain_tip_height, Some(42));
-        assert_eq!(cp.chain_tip_hash, Some([7; 32]));
+        let scanned = checkpoint(&conn).unwrap().unwrap();
+        assert_eq!(scanned.height, BlockHeight::from_u32(42));
+        assert_eq!(scanned.hash.0, [7; 32]);
     }
 
     #[test]
-    fn cursor_from_checkpoint_returns_none_for_hashless_row() {
-        let cp = Checkpoint {
-            scanned_height: 42,
-            scanned_hash: None,
-            chain_tip_height: None,
-            chain_tip_hash: None,
-        };
-        assert!(cursor_from_checkpoint(Some(cp)).is_none());
-    }
-
-    #[test]
-    fn rewind_removes_the_checkpoint_and_rolled_back_nullifiers() {
+    fn rewind_resets_the_sync_position_to_the_fork_height() {
         let conn = database();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
         insert_checkpoint(&conn, 42, 7);
         conn.execute(
             "INSERT INTO watched_ironwood_notes (nullifier, txid, height, spent_height)
@@ -785,7 +739,9 @@ mod tests {
 
         rewind(&conn, 41).unwrap();
 
-        assert!(checkpoint(&conn).unwrap().is_none());
+        let position = checkpoint(&conn).unwrap();
+        assert!(position.is_none()); // NULL hash: the next apply fixes it; a
+                                     // restart meanwhile rescans from the birthday.
         let watched: u64 = conn
             .query_row("SELECT COUNT(*) FROM watched_ironwood_notes", [], |row| {
                 row.get(0)

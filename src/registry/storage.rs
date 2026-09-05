@@ -10,18 +10,13 @@ PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 
 CREATE TABLE IF NOT EXISTS registry_account (
-    id       INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
-    ufvk     TEXT    NOT NULL,  -- full viewing key (UFVK) for the name-note account
-    network  TEXT    NOT NULL,
-    birthday INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS scan_state (
-    id               INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
-    height           INTEGER NOT NULL,
-    hash             BLOB,
-    chain_tip_height INTEGER,
-    chain_tip_hash   BLOB
+    id          INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+    ufvk        TEXT    NOT NULL,  -- full viewing key (UFVK) for the name-note account
+    network     TEXT    NOT NULL,
+    birthday    INTEGER NOT NULL,
+    -- The sync position: where indexing stopped. NULL = scan from birthday.
+    sync_height INTEGER,
+    sync_hash   BLOB
 );
 
 CREATE TABLE IF NOT EXISTS name_events (
