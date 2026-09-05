@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS name_events (
     nullifier    BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
     action_index INTEGER NOT NULL,
+    memo         BLOB    NOT NULL,
     PRIMARY KEY (name, height, txid, action_index)
 );
 CREATE INDEX IF NOT EXISTS idx_name_events_height ON name_events (height);
@@ -54,7 +55,8 @@ CREATE TABLE IF NOT EXISTS names (
     cmx          BLOB    NOT NULL,
     nullifier    BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
-    action_index INTEGER NOT NULL
+    action_index INTEGER NOT NULL,
+    memo         BLOB    NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS watched_ironwood_notes (
