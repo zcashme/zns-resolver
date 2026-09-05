@@ -1,11 +1,11 @@
 # ZNS resolver binary (`sync`, `orchard`, `registry`, `jsonrpc`). Watches the registry inbox on Zcash,
 # verifies Orchard note bindings, indexes name→UA, serves JSON-RPC.
-# Deps: seer-sync (chain I/O), zns-verify (crypto + memos); orchard via patched fork.
-# zns-verify is pinned to the last kernel this tree compiles against.
+# Deps: seer-sync (chain I/O + relaxed Ironwood Name Note scan; git dep), zns-verify
+# (crypto + memos; no_std kernel only), orchard via patched fork.
 [package]
 name = "zns-resolver"
 description = "ZNS resolver: verifies name bindings and maintains a name → UA index."
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -26,8 +26,9 @@ mainnet = []
 testnet = []
 
 [dependencies]
-seer-sync = "0.3.1"
-zns-verify = { git = "https://github.com/zcashme/zns-verify", rev = "6419745e54cfab5339c50353af96d4fbb37cbb0d", features = ["decrypt"] }
+# ZNS fork of seer-sync — relaxed Ironwood scan (Name Note candidates) via `zns-decrypt`.
+seer-sync = { git = "https://github.com/zcashme/seer-sync.git", tag = "seer-sync-v0.4.0", default-features = false, features = ["zns-decrypt"] }
+zns-verify = { git = "https://github.com/zcashme/zns-verify.git", tag = "v0.1.0" }
 orchard = { version = "0.15.5", default-features = false, features = ["std"] }
 zcash_protocol = { version = "0.10", default-features = false, features = ["std"] }
 zcash_primitives = { version = "0.29", default-features = false }
@@ -46,6 +47,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = true }
 
 [patch.crates-io]
-# Git tag of the last commit whose package name is `orchard` (pre-rename).
-# Keeps zcash_keys' transitive orchard unified with the ZNS fork — no sibling checkout needed.
-orchard = { git = "https://github.com/zcashme/orchard.git", tag = "zns-orchard-v0.15.5" }
+# ZNS orchard fork; keeps package name `orchard` so the patched crates.io dep unifies
+# the whole graph (zcash_keys, zcash_primitives, etc.).
+orchard = { git = "https://github.com/zcashme/orchard.git", tag = "zns-orchard-v0.15.5.2" }

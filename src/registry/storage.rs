@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS name_events (
     height       INTEGER NOT NULL,
     action       TEXT    NOT NULL CHECK (action IN ('claim', 'update', 'release')),
     ua           TEXT    NOT NULL,
+    expires_at   TEXT    NOT NULL,
     prev_rcm     BLOB    NOT NULL,
     rcm          BLOB    NOT NULL,
     psi          BLOB    NOT NULL,
@@ -36,6 +37,7 @@ CREATE TABLE IF NOT EXISTS name_events (
     nullifier    BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
     action_index INTEGER NOT NULL,
+    memo         BLOB    NOT NULL,
     PRIMARY KEY (name, height, txid, action_index)
 );
 CREATE INDEX IF NOT EXISTS idx_name_events_height ON name_events (height);
@@ -46,13 +48,15 @@ CREATE TABLE IF NOT EXISTS names (
     height       INTEGER NOT NULL,
     action       TEXT    NOT NULL CHECK (action IN ('claim', 'update', 'release')),
     ua           TEXT    NOT NULL,
+    expires_at   TEXT    NOT NULL,
     prev_rcm     BLOB    NOT NULL,
     rcm          BLOB    NOT NULL,
     psi          BLOB    NOT NULL,
     cmx          BLOB    NOT NULL,
     nullifier    BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
-    action_index INTEGER NOT NULL
+    action_index INTEGER NOT NULL,
+    memo         BLOB    NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS watched_ironwood_notes (

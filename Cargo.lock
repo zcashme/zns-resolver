@@ -1199,7 +1199,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "orchard"
 version = "0.15.5"
-source = "git+https://github.com/zcashme/orchard.git?tag=zns-orchard-v0.15.5#7cd84bbd63b801279009af39c94d2cd5fceda3aa"
+source = "git+https://github.com/zcashme/orchard.git?tag=zns-orchard-v0.15.5.2#faa82e48548f2492432e9ffbf6a8e1eb2474d663"
 dependencies = [
  "aes",
  "bitvec",
@@ -1774,9 +1774,8 @@ dependencies = [
 
 [[package]]
 name = "seer-sync"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec26095115bb484a8adbd0d634b4b9b80b45ec07d4dace7ce69ff209c168d985"
+version = "0.4.0"
+source = "git+https://github.com/zcashme/seer-sync.git?tag=seer-sync-v0.4.0#df6e65402285334350d81add34b95aa0a8535a70"
 dependencies = [
  "http",
  "orchard",
@@ -2770,7 +2769,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zns-resolver"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "group",
  "hex",
@@ -2793,16 +2792,11 @@ dependencies = [
 
 [[package]]
 name = "zns-verify"
-version = "0.0.2"
-source = "git+https://github.com/zcashme/zns-verify?rev=6419745e54cfab5339c50353af96d4fbb37cbb0d#6419745e54cfab5339c50353af96d4fbb37cbb0d"
+version = "0.1.0"
+source = "git+https://github.com/zcashme/zns-verify.git?tag=v0.1.0#c6817f9900b37210aa2a3390f28bdbf3b5b75103"
 dependencies = [
  "blake2b_simd",
- "chacha20",
- "chacha20poly1305",
  "group",
- "orchard",
  "pasta_curves",
  "sinsemilla",
- "zcash_note_encryption",
- "zcash_protocol",
 ]
