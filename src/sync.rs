@@ -6,38 +6,22 @@ use std::time::Duration;
 use orchard::keys::FullViewingKey;
 use seer_sync::sync::chain::LwdClient;
 use seer_sync::sync::scan::WalletTx;
-use seer_sync::{Account, Cursor as SeerCursor, Resume, UnifiedFullViewingKey};
+use seer_sync::{Account, Cursor as SeerCursor, Resume};
 use tokio::sync::watch;
-use zcash_protocol::consensus::{BlockHeight, Network};
+use zcash_protocol::consensus::BlockHeight;
 
 use crate::registry::{core, Db};
-
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub(crate) enum SyncError {
-    #[error("seer-sync error: {0}")]
-    SeerSync(#[from] seer_sync::SyncError),
-
-    #[error("invalid registry UFVK: {0}")]
-    InvalidUfvk(String),
-
-    #[error("registry UFVK has no orchard component")]
-    MissingOrchard,
-
-    #[error("registry error: {0}")]
-    Registry(#[from] rusqlite::Error),
-}
+use crate::Registry;
 
 /// The network path: observes the chain head live and publishes it to status
-/// readers. Separate from the sync loop — the tip is an observation, never
+/// readers. Separate from the indexer — the tip is an observation, never
 /// correctness state, so it is never persisted.
-pub(crate) async fn run_tip_publisher(network: Network, tip_tx: watch::Sender<Option<u32>>) {
-    let mut client = LwdClient::connect_auto(network).await.ok();
+pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<u32>>) {
+    let mut client = LwdClient::connect_auto(crate::NETWORK).await.ok();
 
     loop {
         if client.is_none() {
-            client = LwdClient::connect_auto(network).await.ok();
+            client = LwdClient::connect_auto(crate::NETWORK).await.ok();
             if client.is_none() {
                 tracing::warn!("no lightwalletd server for the tip publisher; retrying");
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -52,51 +36,30 @@ pub(crate) async fn run_tip_publisher(network: Network, tip_tx: watch::Sender<Op
             }
             Err(error) => {
                 tracing::warn!(%error, "tip poll failed; reconnecting");
-                client = LwdClient::connect_auto(network).await.ok();
+                client = LwdClient::connect_auto(crate::NETWORK).await.ok();
             }
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 
-pub(crate) async fn run_sync_loop(
-    db: Db,
-    network: Network,
-    ufvk: &str,
-    birthday: u32,
-) -> Result<(), SyncError> {
-    let ufvk_decoded = UnifiedFullViewingKey::decode(&network, ufvk)
-        .map_err(|e| SyncError::InvalidUfvk(e.to_string()))?;
-    let fvk = ufvk_decoded
-        .orchard()
-        .ok_or(SyncError::MissingOrchard)?
-        .clone();
-
-    let network_name = if network == Network::MainNetwork {
-        "main"
-    } else {
-        "test"
-    };
-
-    tracing::info!(network = network_name, birthday, "starting sync");
-    let account = ZnsAccount { db, fvk };
+/// Runs the name indexer forever: drives seer-sync's scan pipeline so newly
+/// published name notes are verified and indexed as they arrive.
+pub(crate) async fn run_indexer(db: Db, ufvk: &str, fvk: FullViewingKey, birthday: u32) {
+    tracing::info!(network = ?crate::NETWORK, birthday, "starting indexer");
+    let account = Registry { db, fvk };
 
     // seer-sync's run loops internally until an error; any return is a
     // restart, never a hot loop.
     loop {
-        if let Err(error) = seer_sync::run(ufvk, network, &account).await {
+        if let Err(error) = seer_sync::run(ufvk, crate::NETWORK, &account).await {
             tracing::warn!(%error, "sync error; reconnecting");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
-struct ZnsAccount {
-    db: Db,
-    fvk: FullViewingKey,
-}
-
-impl Account for ZnsAccount {
+impl Account for Registry {
     fn resume(&self) -> Result<Resume, Box<dyn Error + Send + Sync>> {
         let conn = self.db.lock();
         Ok(core::resume(&conn)?)
