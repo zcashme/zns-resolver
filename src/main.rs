@@ -9,7 +9,7 @@
 
 mod jsonrpc; // API implementation
 mod registry; // Name index Database
-mod sync; // seer-sync integration: live_tip + the registry's Account face
+mod sync; // Sync Loop
 
 use orchard::keys::FullViewingKey;
 use seer_sync::UnifiedFullViewingKey;
@@ -67,6 +67,26 @@ async fn main() {
         .with_max_level(LevelFilter::INFO)
         .init();
 
+    // --- The registry key: decoded before anything persists it — a bad key
+    // --- parks here and never poisons the registry_account row. ---
+    let fvk = match UnifiedFullViewingKey::decode(&NETWORK, UFVK) {
+        Ok(decoded) => match decoded.orchard() {
+            Some(fvk) => fvk.clone(),
+            None => {
+                tracing::error!(
+                    "fatal: resolver is unconfigured — registry UFVK has no orchard component"
+                );
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        },
+        Err(error) => {
+            tracing::error!(error = %error, "fatal: resolver is unconfigured — registry UFVK failed to decode");
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    };
+
     // --- Network path: the live chain head, observed and published ---
     let (tip_tx, tip_rx) = tokio::sync::watch::channel(None);
     tokio::spawn(live_tip(tip_tx));
@@ -76,9 +96,8 @@ async fn main() {
         Ok(db) => db,
         Err(error) => {
             tracing::error!(error = %error, "fatal: resolver is unconfigured — registry database failed to open");
-            loop {
-                std::future::pending::<()>().await
-            }
+            std::future::pending::<()>().await;
+            unreachable!()
         }
     };
 
@@ -87,31 +106,8 @@ async fn main() {
         Ok(handle) => handle,
         Err(error) => {
             tracing::error!(error = %error, "fatal: resolver is unconfigured — rpc server failed to start");
-            loop {
-                std::future::pending::<()>().await
-            }
-        }
-    };
-
-    // --- The registry key: only sync depends on it; the RPC keeps serving ---
-    // --- the (empty) registry regardless. ---
-    let fvk = match UnifiedFullViewingKey::decode(&NETWORK, UFVK) {
-        Ok(decoded) => match decoded.orchard() {
-            Some(fvk) => fvk.clone(),
-            None => {
-                tracing::error!(
-                    "fatal: resolver is unconfigured — registry UFVK has no orchard component"
-                );
-                loop {
-                    std::future::pending::<()>().await
-                }
-            }
-        },
-        Err(error) => {
-            tracing::error!(error = %error, "fatal: resolver is unconfigured — registry UFVK failed to decode");
-            loop {
-                std::future::pending::<()>().await
-            }
+            std::future::pending::<()>().await;
+            unreachable!()
         }
     };
 
