@@ -8,8 +8,9 @@ use orchard::note::Nullifier;
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
 use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
+use zcash_address::unified::Encoding as _;
 use zcash_primitives::block::BlockHash;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, Parameters as _};
 use zns_verify::{Action, Memo, NameNote, PrimeField, Tip};
 
 use super::notes;
@@ -135,6 +136,21 @@ pub(crate) fn apply_batch(
             };
             let name = note.name().as_str().to_string();
             let ua = note.ua().as_str().to_string();
+
+            // Gate: the bound UA must decode as a Unified Address on this
+            // network — the warn is the only trace of why a kernel-valid
+            // name won't resolve.
+            let Some(_) = zcash_address::unified::Address::decode(&ua)
+                .ok()
+                .filter(|(net, _)| *net == crate::NETWORK.network_type())
+            else {
+                tracing::warn!(
+                    ua = %ua, name = %name, height,
+                    txid = %zcash_protocol::TxId::from_bytes(txid),
+                    "name note UA is not a unified address for this network; not admitted"
+                );
+                continue;
+            };
             // A release carries no expiry; the row records the canonical
             // "none" spelling.
             let expires_at = note
@@ -144,7 +160,7 @@ pub(crate) fn apply_batch(
 
             let prev = match pending_tips.get(&name) {
                 Some(p) => Some(*p),
-                None => read_tip_offline(&db_tx, &name)?,
+                None => read_local_tip(&db_tx, &name)?,
             };
 
             // Gates: chain rule + consumption link. A failure here is either an
@@ -486,11 +502,9 @@ fn registry_config(conn: &Connection) -> rusqlite::Result<Option<(String, String
     .optional()
 }
 
-/// Plain `SELECT` of a name's live state — the tip plus the stored nullifier
-/// (for the consumption link). No transaction: used by `apply_batch` Phase 1.
-/// Safe alongside the Phase 2 tx because the serialized execution inside the
-/// Registry impl is the sole mutator.
-fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<(Tip, [u8; 32])>> {
+/// The name's local tip from the `names` row: the tip plus the stored
+/// nullifier for the consumption link.
+fn read_local_tip(conn: &Connection, name: &str) -> rusqlite::Result<Option<(Tip, [u8; 32])>> {
     conn.query_row(
         "SELECT action, rcm, nullifier FROM names WHERE name = ?1",
         params![name],
