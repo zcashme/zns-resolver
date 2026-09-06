@@ -18,15 +18,10 @@ pub(crate) mod storage;
 pub(crate) struct Db(Arc<Mutex<Connection>>);
 
 impl Db {
-    pub(crate) fn open(
-        network: Network,
-        ufvk: &str,
-        birthday: u32,
-        db_path: &str,
-    ) -> rusqlite::Result<Self> {
+    pub(crate) fn open(ufvk: &str, birthday: u32, db_path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
         conn.execute_batch(storage::SCHEMA_SQL)?;
-        let net_str = if network == Network::MainNetwork {
+        let net_str = if crate::NETWORK == Network::MainNetwork {
             "main"
         } else {
             "test"

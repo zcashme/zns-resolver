@@ -11,8 +11,9 @@ mod jsonrpc; // API implementation
 mod registry; // Name index Database
 mod sync; // Sync Loop
 
-use sync::SyncError;
-use sync::{run_sync_loop, run_tip_publisher};
+use orchard::keys::FullViewingKey;
+use seer_sync::UnifiedFullViewingKey;
+use sync::{live_tip, run_indexer};
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
@@ -27,9 +28,9 @@ compile_error!("mainnet and testnet are mutually exclusive");
 compile_error!("enable either mainnet (default) or testnet feature");
 
 #[cfg(feature = "mainnet")]
-const NETWORK: Network = Network::MainNetwork;
+pub(crate) const NETWORK: Network = Network::MainNetwork;
 #[cfg(feature = "testnet")]
-const NETWORK: Network = Network::TestNetwork;
+pub(crate) const NETWORK: Network = Network::TestNetwork;
 
 /// Registry unified full viewing key for the active network.
 #[cfg(feature = "mainnet")]
@@ -52,33 +53,64 @@ const SCAN_BIRTHDAY: u32 = 4_000_000;
 
 const RPC_ADDR: &str = "127.0.0.1:8080"; // where clients send JSON-RPC name queries
 
+/// The registry: the resolver's local registry replica, wearing seer-sync's
+/// `Account` face — the scan pipeline applies chain observations to it.
+pub(crate) struct Registry {
+    pub(crate) db: Db,
+    pub(crate) fvk: FullViewingKey,
+}
+
 #[tokio::main]
-async fn main() -> Result<(), SyncError> {
+async fn main() {
     // --- Logging ---
     tracing_subscriber::fmt()
         .with_max_level(LevelFilter::INFO)
         .init();
 
-    // --- Persistent layer bootstrap ---
-    let db = Db::open(NETWORK, UFVK, SCAN_BIRTHDAY, DB_PATH).unwrap_or_else(|e| {
-        tracing::error!(error = %e, "registry database failed to open");
-        std::process::exit(1);
-    });
+    // --- The registry key: decoded before anything persists it — a bad key
+    // --- parks here and never poisons the registry_account row. ---
+    let fvk = match UnifiedFullViewingKey::decode(&NETWORK, UFVK) {
+        Ok(decoded) => match decoded.orchard() {
+            Some(fvk) => fvk.clone(),
+            None => {
+                tracing::error!(
+                    "fatal: resolver is unconfigured — registry UFVK has no orchard component"
+                );
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        },
+        Err(error) => {
+            tracing::error!(error = %error, "fatal: resolver is unconfigured — registry UFVK failed to decode");
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    };
 
     // --- Network path: the live chain head, observed and published ---
     let (tip_tx, tip_rx) = tokio::sync::watch::channel(None);
-    tokio::spawn(run_tip_publisher(NETWORK, tip_tx));
+    tokio::spawn(live_tip(tip_tx));
 
-    // --- RPC server ---
-    let _rpc_handle = serve_rpc(RPC_ADDR, db.clone(), tip_rx)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "rpc server failed to start");
-            std::process::exit(1);
-        });
+    // --- Persistent layer bootstrap. Without it there is nothing to serve. ---
+    let db = match Db::open(UFVK, SCAN_BIRTHDAY, DB_PATH) {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::error!(error = %error, "fatal: resolver is unconfigured — registry database failed to open");
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    };
 
-    // --- Sync loop ---
-    run_sync_loop(db.clone(), NETWORK, UFVK, SCAN_BIRTHDAY).await?;
+    // --- RPC server: serves whatever the registry has ---
+    let _rpc_handle = match serve_rpc(RPC_ADDR, db.clone(), tip_rx).await {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::error!(error = %error, "fatal: resolver is unconfigured — rpc server failed to start");
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    };
 
-    Ok(())
+    // --- The indexer: everything passed — run forever ---
+    run_indexer(db, UFVK, fvk, SCAN_BIRTHDAY).await;
 }
