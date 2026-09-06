@@ -147,12 +147,12 @@ pub(crate) fn apply_batch(
                 None => read_tip_offline(&db_tx, &name)?,
             };
 
-            // Gates: chain rule + consumption link. A failure here is either an
-            // invalid-given-tip transition, a competing transition, or a registry
-            // fork — warn_registry_fork discriminates and warns only on true forks.
+            // Gates: chain rule + consumption link. The name's history is linear
+            // by consensus — a competing extension would be a nullifier
+            // double-spend, which the chain rejects — so a failure here is
+            // never a fork.
             let Some(expected_prev) = notes::check_name_link(prev.as_ref(), &note, consumed_nf)
             else {
-                notes::warn_registry_fork(candidate, note, height, prev.as_ref().map(|p| &p.0));
                 continue;
             };
 
