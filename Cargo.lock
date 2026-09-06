@@ -2772,7 +2772,6 @@ name = "zns-resolver"
 version = "0.0.2"
 dependencies = [
  "group",
- "hex",
  "jsonrpsee",
  "orchard",
  "pasta_curves",

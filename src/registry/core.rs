@@ -54,8 +54,8 @@ pub(crate) fn install_registry_config(
 ///
 /// Runs in one transaction. For each decrypted candidate: the gates (self-send
 /// policy, protocol parse, chain rule, consumption link — the link gates via
-/// `notes::check_name_link`, with the fork warning on failure), then the binding
-/// verification (`notes::verify_commitment`), then the nullifier derivation.
+/// `notes::check_name_link`), then the binding verification
+/// (`notes::verify_commitment`), then the nullifier derivation.
 /// Verified values are written immediately — the event row and the per-name
 /// tip row — with the raw memo stored alongside. Tips are recorded in
 /// `pending_tips` so a later note for the same name in the same batch sees
