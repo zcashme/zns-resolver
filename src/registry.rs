@@ -42,14 +42,6 @@ impl Db {
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
-/// Persisted `scan_state` row.
-pub(crate) struct Checkpoint {
-    pub(crate) scanned_height: u32,
-    pub(crate) scanned_hash: Option<[u8; 32]>,
-    pub(crate) chain_tip_height: Option<u32>,
-    pub(crate) chain_tip_hash: Option<[u8; 32]>,
-}
-
 /// Current registration: a name's live tip (absent from `names` if released).
 #[derive(Debug, Clone)]
 pub(crate) struct Registration {

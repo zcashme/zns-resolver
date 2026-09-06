@@ -5,12 +5,17 @@ use jsonrpsee::core::async_trait;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
+use tokio::sync::watch;
 use zns_verify::Action;
 
 use crate::registry::core;
 use crate::registry::Db;
 
 use super::records::{to_name_event, to_name_record, NameEvent, NameRecord, Paginated, Status};
+
+/// The network head as published live by the tip publisher: `None` until the
+/// first poll lands.
+type ChainTip = watch::Receiver<Option<u32>>;
 
 /// Public JSON-RPC API for the ZNS resolver.
 #[rpc(server)]
@@ -55,11 +60,13 @@ pub trait ZnsApi {
 
 pub struct JsonRpcApi {
     db: Db,
+    /// The live chain head for `status` — never persisted.
+    tip: ChainTip,
 }
 
 impl JsonRpcApi {
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    pub fn new(db: Db, tip: ChainTip) -> Self {
+        Self { db, tip }
     }
 }
 
@@ -143,39 +150,25 @@ impl ZnsApiServer for JsonRpcApi {
 
     async fn status(&self) -> RpcResult<Status> {
         let conn = self.db.lock();
-        let checkpoint = core::checkpoint(&conn).map_err(RpcError::from)?;
+        let position = core::checkpoint(&conn).map_err(RpcError::from)?;
         let viewing_key = core::registry_ufvk(&conn).map_err(RpcError::from)?;
         let registered = core::name_count(&conn).map_err(RpcError::from)?;
+        drop(conn);
 
-        let (synced_height, chain_tip_height, synced, blocks_behind) = match checkpoint {
-            Some(c) => {
-                let sh = c.scanned_height as u64;
-                match c.chain_tip_height {
-                    Some(tip) => {
-                        let synced = c.scanned_height >= tip;
-                        (
-                            sh,
-                            tip as u64,
-                            synced,
-                            if synced {
-                                0
-                            } else {
-                                (tip - c.scanned_height) as u64
-                            },
-                        )
-                    }
-                    None => (sh, 0, false, 0),
-                }
-            }
-            None => (0, 0, false, 0),
+        // The network path's live observation: None until the first poll lands.
+        let tip = *self.tip.borrow();
+
+        // The verdict needs both facts: our durable position and the network's
+        // live head. Either missing — not synced.
+        let synced = match (position.as_ref(), tip) {
+            (Some(cursor), Some(tip)) => u32::from(cursor.height) >= tip,
+            _ => false,
         };
 
         Ok(Status {
-            synced_height,
-            chain_tip_height,
+            synced_height: position.map_or(0, |c| u64::from(u32::from(c.height))),
             synced,
-            blocks_behind,
-            viewing_key: viewing_key.unwrap_or_default(),
+            viewing_key,
             registered,
         })
     }
