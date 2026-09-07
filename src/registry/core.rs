@@ -6,6 +6,7 @@ use orchard::keys::FullViewingKey;
 use orchard::note::NoteCommitTrapdoor;
 use orchard::note::Nullifier;
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
+use seer_sync::sync::decrypt::RelaxedIronwoodOutput;
 use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
 use zcash_primitives::block::BlockHash;
@@ -52,10 +53,14 @@ pub(crate) fn install_registry_config(
 
 /// The main write path.
 ///
-/// Runs in one transaction. For each decrypted candidate: the gates (self-send
-/// policy, protocol parse, chain rule, consumption link — the link gates via
-/// `notes::check_name_link`), then the binding verification
-/// (`notes::verify_commitment`), then the nullifier derivation.
+/// Runs in one transaction, in two layers. Bookkeeping records chain facts
+/// — received and spent nullifiers of the watch set; a registration ends
+/// only through an accepted release, never through a raw spend. Derivation
+/// considers each block's parse-gated candidates per name — a release
+/// disclosing the block-start accepted rcm is considered before the updates
+/// competing over it (WP §6.3) — through the chain rule, the binding
+/// verification, and the consumption proof: every accepted action spends a
+/// mint-owned note, except claims, which await the mint's anchor note.
 /// Verified values are written immediately — the event row and the per-name
 /// tip row — with the raw memo stored alongside. Tips are recorded in
 /// `pending_tips` so a later note for the same name in the same batch sees
@@ -64,8 +69,8 @@ pub(crate) fn install_registry_config(
 /// Readers see either the pre-batch or post-batch state — never partial
 /// (WAL snapshot isolation + atomic commit).
 ///
-/// SAFETY (TOCTOU on the tip): the offline tip read and the tx writes run
-/// inside the same serialized call. No other DB operation can interleave.
+/// SAFETY (TOCTOU on the tip): the tip reads and the writes run inside the
+/// same serialized call. No other DB operation can interleave.
 pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
@@ -92,7 +97,9 @@ pub(crate) fn apply_batch(
         }
     }
 
-    // Mark spent ironwood nullifiers.
+    // Mark spent nullifiers of the watch set — bookkeeping only: a
+    // registration ends through an accepted release, never through a raw
+    // spend.
     for tx_data in transactions {
         let height = u32::from(tx_data.height);
         for spend in &tx_data.ironwood_spends {
@@ -102,100 +109,170 @@ pub(crate) fn apply_batch(
                  WHERE nullifier = ?2 AND spent_height IS NULL",
                 params![height as i64, nf_bytes.as_slice()],
             )?;
-            db_tx.execute(
-                "DELETE FROM names WHERE nullifier = ?1",
-                params![nf_bytes.as_slice()],
-            )?;
         }
     }
-    // Admit name-note candidates: gates, then write at the moment of
-    // verification. Verified values flow straight to the rows — there is
-    // no intermediate type.
-    for tx in transactions {
-        let txid = *tx.txid.as_ref();
-        let height = u32::from(tx.height);
+    // Derivation: consider each block's candidates per name. A name note
+    // references the accepted predecessor and authenticates by consuming
+    // mint-owned money; the resolver's only decisions are order and state.
+    for block in transactions.chunk_by(|a, b| a.height == b.height) {
+        let height = u32::from(block[0].height);
 
-        for candidate in &tx.relaxed_ironwood_outputs {
-            let (_, cand, consumed_nf, _, is_sent) = candidate;
+        // Triage: the cheap gates. The name is the grouping key; every
+        // other value is derived where it is used.
+        let mut candidates: Vec<(String, &RelaxedIronwoodOutput, [u8; 32])> = Vec::new();
+        for tx in block {
+            let txid = *tx.txid.as_ref();
+            for candidate in &tx.relaxed_ironwood_outputs {
+                let (_, _, _, memo, is_sent) = candidate;
 
-            // Gate: a name note exists only as a mint self-send.
-            if !is_sent {
-                continue;
+                // Gate: a name note exists only as a mint self-send.
+                if !is_sent {
+                    continue;
+                }
+                let Some(memo) = memo else {
+                    continue;
+                };
+                let Ok(zns_memo) = Memo::from_bytes(memo) else {
+                    continue;
+                };
+                // Gate: protocol parse. The kernel's structural rules are the
+                // authority — invalid statements never become candidates.
+                let Some(note) = NameNote::parse(&zns_memo).ok() else {
+                    continue;
+                };
+
+                candidates.push((note.name().as_str().to_string(), candidate, txid));
             }
-            let Some(memo) = candidate.3 else {
-                continue;
-            };
-            let Ok(zns_memo) = Memo::from_bytes(&memo) else {
-                continue;
-            };
-            // Gate: protocol parse. The kernel's structural rules are the
-            // authority — invalid statements never become candidates.
-            let Some(note) = NameNote::parse(&zns_memo).ok() else {
-                continue;
-            };
-            let name = note.name().as_str().to_string();
-            let ua = note.ua().as_str().to_string();
-            // A release carries no expiry; the row records the canonical
-            // "none" spelling.
-            let expires_at = note
-                .expires_at()
-                .map(|e| e.field_bytes().to_string())
-                .unwrap_or_else(|| "none".to_string());
+        }
 
-            let prev = match pending_tips.get(&name) {
-                Some(p) => Some(*p),
-                None => read_tip_offline(&db_tx, &name)?,
+        // Grouping: stable sort by name, then the same chunk_by the blocks
+        // use — scan order preserved within each name.
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Consideration: per name, with the name's whole candidate set and
+        // its state in scope. A release disclosing the block-start accepted
+        // rcm is considered before the updates competing over it — it
+        // references a predecessor the state still holds, and may spend a
+        // note the state has not yet recorded.
+        for group in candidates.chunk_by(|a, b| a.0 == b.0) {
+            let name = &group[0].0;
+            let mut binding = match pending_tips.get(name) {
+                Some(b) => Some(*b),
+                None => read_tip_offline(&db_tx, name)?,
             };
+            let start = binding;
 
-            // Gates: chain rule + consumption link. The name's history is linear
-            // by consensus — a competing extension would be a nullifier
-            // double-spend, which the chain rejects — so a failure here is
-            // never a fork.
-            let Some(expected_prev) = notes::check_name_link(prev.as_ref(), &note, consumed_nf)
-            else {
-                continue;
-            };
+            // Consideration order: releases disclosing the block-start
+            // accepted rcm first, scan order among them; then everything
+            // else in scan order.
+            let (release_first, rest): (Vec<_>, Vec<_>) =
+                group.iter().partition(|(_, candidate, _)| {
+                    let Some(memo) = candidate.3 else {
+                        return false;
+                    };
+                    let Ok(zns_memo) = Memo::from_bytes(&memo) else {
+                        return false;
+                    };
+                    let Ok(note) = NameNote::parse(&zns_memo) else {
+                        return false;
+                    };
+                    matches!(note, NameNote::Release { .. })
+                        && start.is_some_and(|(t, _)| {
+                            t.action != Action::Release
+                                && note.prev_rcm().map(|p| *p.as_bytes()) == Some(t.rcm)
+                        })
+                });
 
-            // Gate: binding verification. The kernel recomputes the commitment
-            // from the transition fields and demands equality with the published cmx.
-            let Some((psi, rcm)) = notes::verify_commitment(&note, candidate) else {
-                continue;
-            };
+            for (_, candidate, txid) in release_first.into_iter().chain(rest) {
+                let candidate = *candidate;
+                let txid = *txid;
+                let (_, cand, _, _, _) = candidate;
 
-            // Derived at admission, revealed at consumption.
-            let Some(nullifier) = cand
-                .note()
-                .zns_nullifier(fvk, NoteCommitTrapdoor::from_inner(rcm), psi)
-                .map(|n| n.to_bytes())
-            else {
-                continue;
-            };
+                let Some(memo) = candidate.3 else {
+                    continue;
+                };
+                let Ok(zns_memo) = Memo::from_bytes(&memo) else {
+                    continue;
+                };
+                let Some(note) = NameNote::parse(&zns_memo).ok() else {
+                    continue;
+                };
+                let ua = note.ua().as_str().to_string();
+                // A release carries no expiry; the row records the canonical
+                // "none" spelling.
+                let expires_at = note
+                    .expires_at()
+                    .map(|e| e.field_bytes().to_string())
+                    .unwrap_or_else(|| "none".to_string());
 
-            let rcm_repr = rcm.to_repr();
-            let psi_repr = psi.to_repr();
-            let cmx = cand.cmx().to_bytes();
+                // Gate: chain rule — the disclosed prev_rcm extends the tip.
+                let Some(expected_prev) =
+                    notes::check_chain_rule(binding.as_ref().map(|b| &b.0), &note)
+                else {
+                    continue;
+                };
 
-            insert_event(
-                &db_tx,
-                &name,
-                &ua,
-                &expires_at,
-                note.action(),
-                &expected_prev,
-                &rcm_repr,
-                &psi_repr,
-                &cmx,
-                &nullifier,
-                &txid,
-                height,
-                candidate.0,
-                &memo,
-            )?;
+                // Gate: binding — the kernel recomputes the commitment from
+                // the transition fields and demands equality with the
+                // published cmx.
+                let Some((psi, rcm)) = notes::verify_commitment(&note, candidate) else {
+                    continue;
+                };
 
-            if note.action() == Action::Release {
-                db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
-            } else {
+                // Gate: auth — the action consumed mint-owned money. A
+                // nullifier is public to compute; only the mint's key can
+                // reveal one on chain. Claims consume nothing yet — the
+                // anchor note is the mint-side piece still missing.
+                let consumed = candidate.2.to_bytes();
+                let auth = match note.action() {
+                    Action::Claim => true,
+                    Action::Update => binding.is_some_and(|b| b.1 == consumed),
+                    Action::Release => {
+                        binding.is_some_and(|b| b.1 == consumed)
+                            || spends_same_block_update(group, start, consumed, fvk)
+                    }
+                };
+                if !auth {
+                    continue;
+                }
+
+                // Derived at admission, revealed at consumption.
+                let Some(nullifier) = cand
+                    .note()
+                    .zns_nullifier(fvk, NoteCommitTrapdoor::from_inner(rcm), psi)
+                    .map(|n| n.to_bytes())
+                else {
+                    continue;
+                };
+
+                let rcm_repr = rcm.to_repr();
+                let psi_repr = psi.to_repr();
+                let cmx = cand.cmx().to_bytes();
+
                 db_tx.execute(
+                    "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        name,
+                        height as i64,
+                        note.action().as_str(),
+                        ua,
+                        expires_at,
+                        expected_prev.as_slice(),
+                        rcm_repr.as_slice(),
+                        psi_repr.as_slice(),
+                        cmx.as_slice(),
+                        nullifier.as_slice(),
+                        txid.as_slice(),
+                        candidate.0 as i64,
+                        memo.as_slice(),
+                    ],
+                )?;
+
+                if note.action() == Action::Release {
+                    db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
+                } else {
+                    db_tx.execute(
                     "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                      ON CONFLICT (name) DO UPDATE SET
@@ -221,24 +298,63 @@ pub(crate) fn apply_batch(
                         memo.as_slice(),
                     ],
                 )?;
-            }
+                }
 
-            pending_tips.insert(
-                name,
-                (
+                let tip = (
                     Tip {
                         action: note.action(),
                         rcm: rcm_repr,
                     },
                     nullifier,
-                ),
-            );
+                );
+                pending_tips.insert(name.clone(), tip);
+                binding = Some(tip);
+            }
         }
     }
 
     set_checkpoint_in_tx(&db_tx, &scanned)?;
     db_tx.commit()?;
     Ok(())
+}
+
+/// True when `consumed` is the derived nullifier of a genuine same-block
+/// update — one that discloses the block-start rcm and consumes the
+/// block-start binding note. The consumption is the consensus wall: only
+/// the mint's key can reveal that nullifier, so a forged update can never
+/// qualify. Cheap checks run before the crypto.
+fn spends_same_block_update(
+    candidates: &[(String, &RelaxedIronwoodOutput, [u8; 32])],
+    start: Option<(Tip, [u8; 32])>,
+    consumed: [u8; 32],
+    fvk: &FullViewingKey,
+) -> bool {
+    let Some((start_tip, start_nf)) = start else {
+        return false;
+    };
+    candidates.iter().any(|(_, candidate, _)| {
+        let Some(memo) = candidate.3 else {
+            return false;
+        };
+        let Ok(zns_memo) = Memo::from_bytes(&memo) else {
+            return false;
+        };
+        let Ok(note) = NameNote::parse(&zns_memo) else {
+            return false;
+        };
+        matches!(note, NameNote::Update { .. })
+            && note.prev_rcm().map(|p| *p.as_bytes()) == Some(start_tip.rcm)
+            && candidate.2.to_bytes() == start_nf
+            && notes::verify_commitment(&note, candidate)
+                .and_then(|(psi, rcm)| {
+                    candidate
+                        .1
+                        .note()
+                        .zns_nullifier(fvk, NoteCommitTrapdoor::from_inner(rcm), psi)
+                        .map(|n| n.to_bytes())
+                })
+                .is_some_and(|nf| nf == consumed)
+    })
 }
 
 pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()> {
@@ -592,45 +708,6 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
             ],
         )?;
     }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_event(
-    tx: &Transaction<'_>,
-    name: &str,
-    ua: &str,
-    expires_at: &str,
-    action: Action,
-    prev_rcm: &[u8; 32],
-    rcm: &[u8; 32],
-    psi: &[u8; 32],
-    cmx: &[u8; 32],
-    nullifier: &[u8; 32],
-    txid: &[u8; 32],
-    height: u32,
-    action_index: usize,
-    memo: &[u8],
-) -> rusqlite::Result<()> {
-    tx.execute(
-        "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![
-            name,
-            height as i64,
-            action.as_str(),
-            ua,
-            expires_at,
-            prev_rcm,
-            rcm,
-            psi,
-            cmx,
-            nullifier,
-            txid,
-            action_index as i64,
-            memo,
-        ],
-    )?;
     Ok(())
 }
 
