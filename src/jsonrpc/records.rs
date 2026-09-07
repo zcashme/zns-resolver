@@ -35,8 +35,8 @@ pub struct NameEvent {
     /// Index of this action within the block (for ordering when multiple
     /// actions for the same name occur in one block).
     pub action_index: u64,
-    /// The address bound by this action (present on claim/update, absent on release).
-    pub address: Option<String>,
+    /// The address carried by this action's Name Note — the binding it establishes or ends.
+    pub address: String,
     /// Canonical Name Note `expires_at`: `"none"` or a decimal Unix timestamp.
     pub expires_at: String,
 }
@@ -87,7 +87,7 @@ pub(super) fn to_name_event(e: Event) -> NameEvent {
         txid: TxId::from_bytes(e.txid).to_string(),
         height: e.height as u64,
         action_index: e.action_index as u64,
-        address: (!e.ua.is_empty()).then_some(e.ua),
+        address: e.ua,
         expires_at: e.expires_at,
     }
 }
