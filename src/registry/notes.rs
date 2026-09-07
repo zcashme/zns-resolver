@@ -1,4 +1,4 @@
-//! Name-note admission helpers: the link gates and binding verification.
+//! Name-note admission checks: the chain rule and binding verification.
 
 use group::{Group, GroupEncoding};
 use pasta_curves::arithmetic::CurveExt;
@@ -7,26 +7,14 @@ use seer_sync::sync::decrypt::RelaxedIronwoodOutput;
 use zns_verify::verify::verify_name_note_with_witness;
 use zns_verify::{prev_rcm_for, ExtractedNoteCommitment as ZnsCmx, PrevRcm, Rho, Tip};
 
-/// Checks a candidate's linkage to the name's live state: the chain rule
-/// (disclosed `prev_rcm` must extend the tip) and the consumption link
-/// (updates/releases must consume the admitted predecessor's nullifier).
-/// Returns the expected `prev_rcm` on success.
-pub(crate) fn check_name_link(
-    prev: Option<&(Tip, [u8; 32])>,
+/// Checks the chain rule: the disclosed `prev_rcm` must extend the current
+/// tip. Returns the expected `prev_rcm` on success.
+pub(crate) fn check_chain_rule(
+    prev: Option<&Tip>,
     note: &zns_verify::NameNote<'_>,
-    consumed_nf: &orchard::note::Nullifier,
 ) -> Option<[u8; 32]> {
-    let expected_prev = prev_rcm_for(prev.map(|p| &p.0), note.action())?;
-    if note.prev_rcm().unwrap_or(PrevRcm::ZERO).as_bytes() != &expected_prev {
-        return None;
-    }
-    if !matches!(note, zns_verify::NameNote::Claim { .. }) {
-        prev?
-            .1
-            .eq(&consumed_nf.to_bytes())
-            .then_some(expected_prev)?;
-    }
-    Some(expected_prev)
+    let expected_prev = prev_rcm_for(prev, note.action())?;
+    (note.prev_rcm().unwrap_or(PrevRcm::ZERO).as_bytes() == &expected_prev).then_some(expected_prev)
 }
 
 /// Verifies a candidate's binding: recomputes the ZNS commitment from the
