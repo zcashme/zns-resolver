@@ -11,7 +11,7 @@ use zns_verify::Action;
 use crate::registry::core;
 use crate::registry::Db;
 
-use super::records::{to_name_event, to_name_record, NameEvent, NameRecord, Paginated, Status};
+use super::records::{NameEvent, NameRecord, Paginated, Status};
 
 /// The network head as published live by the tip publisher: `None` until the
 /// first poll lands.
@@ -108,7 +108,7 @@ impl ZnsApiServer for JsonRpcApi {
     async fn resolve(&self, name: String) -> RpcResult<Option<NameRecord>> {
         let conn = self.db.lock();
         let reg = core::resolve_by_name(&conn, &name).map_err(RpcError::from)?;
-        Ok(reg.map(to_name_record))
+        Ok(reg.map(NameRecord::from))
     }
 
     async fn list_names(
@@ -120,7 +120,7 @@ impl ZnsApiServer for JsonRpcApi {
         let conn = self.db.lock();
         let (regs, total) =
             core::list_registrations(&conn, limit_u32, offset_u32).map_err(RpcError::from)?;
-        let items = regs.into_iter().map(to_name_record).collect();
+        let items = regs.into_iter().map(NameRecord::from).collect();
         Ok(Paginated {
             items,
             total,
@@ -139,7 +139,7 @@ impl ZnsApiServer for JsonRpcApi {
         let conn = self.db.lock();
         let (regs, total) = core::registrations_by_ua(&conn, &address, limit_u32, offset_u32)
             .map_err(RpcError::from)?;
-        let items = regs.into_iter().map(to_name_record).collect();
+        let items = regs.into_iter().map(NameRecord::from).collect();
         Ok(Paginated {
             items,
             total,
@@ -198,7 +198,7 @@ impl ZnsApiServer for JsonRpcApi {
             core::events(&conn, name.as_deref(), action, since, limit_u32, offset_u32)
                 .map_err(RpcError::from)?;
 
-        let items = events.into_iter().map(to_name_event).collect();
+        let items = events.into_iter().map(NameEvent::from).collect();
 
         Ok(Paginated {
             items,
