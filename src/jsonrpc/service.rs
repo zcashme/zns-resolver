@@ -6,6 +6,8 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use tokio::sync::watch;
+use zcash_address::unified::Encoding as _;
+use zcash_protocol::consensus::Parameters as _;
 use zns_verify::Action;
 
 use crate::registry::core;
@@ -34,6 +36,8 @@ pub trait ZnsApi {
     ) -> RpcResult<Paginated<NameRecord>>;
 
     /// Reverse lookup: find all names currently bound to a unified address.
+    /// Queries that do not decode as a unified address on this network are
+    /// rejected as invalid params.
     #[method(name = "reverse_lookup")]
     async fn reverse_lookup(
         &self,
@@ -135,6 +139,19 @@ impl ZnsApiServer for JsonRpcApi {
         limit: Option<u64>,
         offset: Option<u64>,
     ) -> RpcResult<Paginated<NameRecord>> {
+        // Fail loud on malformed queries: an empty result would read as
+        // "no names bound", which is a different answer. Same check as the
+        // admission gate in registry::core's apply_batch — keep the two in
+        // step if either changes.
+        if !zcash_address::unified::Address::decode(&address)
+            .is_ok_and(|(net, _)| net == crate::NETWORK.network_type())
+        {
+            let shown: String = address.chars().take(64).collect();
+            return Err(RpcError::InvalidParams(format!(
+                "invalid address '{shown}': must decode as a unified address on this network"
+            ))
+            .into());
+        }
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
         let conn = self.db.lock();
         let (regs, total) = core::registrations_by_ua(&conn, &address, limit_u32, offset_u32)
