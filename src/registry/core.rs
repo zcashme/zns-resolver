@@ -301,15 +301,17 @@ pub(crate) fn apply_batch(
                     }
                     Action::Update => {
                         binding.is_some_and(|b| b.1 == candidate.output.2.to_bytes())
+                            && !snapshot.touches_live_anchor(tx_facts)
                     }
                     Action::Release => {
-                        binding.is_some_and(|b| b.1 == candidate.output.2.to_bytes())
-                            || spends_same_block_update(
-                                group,
-                                start,
-                                candidate.output.2.to_bytes(),
-                                fvk,
-                            )
+                        !snapshot.touches_live_anchor(tx_facts)
+                            && (binding.is_some_and(|b| b.1 == candidate.output.2.to_bytes())
+                                || spends_same_block_update(
+                                    group,
+                                    start,
+                                    candidate.output.2.to_bytes(),
+                                    fvk,
+                                ))
                     }
                 };
                 if !auth {

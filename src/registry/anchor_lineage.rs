@@ -108,6 +108,16 @@ impl Lineage {
             .count()
     }
 
+    /// Whether any of the transaction's retirements hits a live anchor —
+    /// the mint's `predecessor_spent` guard: an update or release whose
+    /// transaction also spends an anchor is malformed.
+    pub(crate) fn touches_live_anchor(&self, facts: &TxAnchorFacts) -> bool {
+        facts
+            .retirements
+            .iter()
+            .any(|r| self.live.contains(&r.nf))
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.live.len()
     }
