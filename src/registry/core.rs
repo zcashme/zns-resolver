@@ -234,14 +234,13 @@ pub(crate) fn apply_batch(
             // Consideration order: releases disclosing the block-start
             // accepted rcm first, scan order among them; then everything
             // else in scan order.
-            let (release_first, rest): (Vec<_>, Vec<_>) =
-                group.iter().partition(|candidate| {
-                    matches!(candidate.note, NameNote::Release { .. })
-                        && start.is_some_and(|(t, _)| {
-                            t.action != Action::Release
-                                && candidate.note.prev_rcm().map(|p| *p.as_bytes()) == Some(t.rcm)
-                        })
-                });
+            let (release_first, rest): (Vec<_>, Vec<_>) = group.iter().partition(|candidate| {
+                matches!(candidate.note, NameNote::Release { .. })
+                    && start.is_some_and(|(t, _)| {
+                        t.action != Action::Release
+                            && candidate.note.prev_rcm().map(|p| *p.as_bytes()) == Some(t.rcm)
+                    })
+            });
 
             for candidate in release_first.into_iter().chain(rest) {
                 let cand = candidate.output.1;
@@ -435,9 +434,7 @@ fn load_lineage(conn: &Connection) -> rusqlite::Result<Lineage> {
 
     // Group by transaction, in canonical order.
     let mut lineage = Lineage::new();
-    for group in events.chunk_by(|a, b| {
-        (a.0.height, a.0.tx_index) == (b.0.height, b.0.tx_index)
-    }) {
+    for group in events.chunk_by(|a, b| (a.0.height, a.0.tx_index) == (b.0.height, b.0.tx_index)) {
         let mut facts = TxAnchorFacts::default();
         for (_, event) in group.iter().copied() {
             match event {
@@ -1042,9 +1039,7 @@ mod tests {
         assert!(position.is_none()); // NULL hash: the next apply fixes it; a
                                      // restart meanwhile rescans from the birthday.
         let watched: u64 = conn
-            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(watched, 0);
     }

@@ -112,10 +112,7 @@ impl Lineage {
     /// the mint's `predecessor_spent` guard: an update or release whose
     /// transaction also spends an anchor is malformed.
     pub(crate) fn touches_live_anchor(&self, facts: &TxAnchorFacts) -> bool {
-        facts
-            .retirements
-            .iter()
-            .any(|r| self.live.contains(&r.nf))
+        facts.retirements.iter().any(|r| self.live.contains(&r.nf))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -326,12 +323,30 @@ mod canon {
     #[derive(Deserialize)]
     #[serde(tag = "kind", rename_all = "snake_case")]
     enum CanonEvent {
-        AdoptAnchor { height: u32, nullifier: String },
-        Claim { height: u32, spent_anchor: String, successor_anchor: String },
-        UnbackedClaim { height: u32, spent: Vec<String> },
-        Update { height: u32, prev_nullifier: String },
-        Release { height: u32, prev_nullifier: String },
-        Rewind { to_height: u32 },
+        AdoptAnchor {
+            height: u32,
+            nullifier: String,
+        },
+        Claim {
+            height: u32,
+            spent_anchor: String,
+            successor_anchor: String,
+        },
+        UnbackedClaim {
+            height: u32,
+            spent: Vec<String>,
+        },
+        Update {
+            height: u32,
+            prev_nullifier: String,
+        },
+        Release {
+            height: u32,
+            prev_nullifier: String,
+        },
+        Rewind {
+            to_height: u32,
+        },
     }
 
     #[derive(Deserialize)]
@@ -386,12 +401,18 @@ mod canon {
                     CanonEvent::AdoptAnchor { height, nullifier } => (
                         *height,
                         TxAnchorFacts {
-                            adoptions: vec![Adoption { nf: hex32(nullifier) }],
+                            adoptions: vec![Adoption {
+                                nf: hex32(nullifier),
+                            }],
                             retirements: vec![],
                             has_single_name_note: false,
                         },
                     ),
-                    CanonEvent::Claim { height, spent_anchor, successor_anchor } => (
+                    CanonEvent::Claim {
+                        height,
+                        spent_anchor,
+                        successor_anchor,
+                    } => (
                         *height,
                         TxAnchorFacts {
                             adoptions: vec![Adoption {
@@ -414,8 +435,14 @@ mod canon {
                             has_single_name_note: true,
                         },
                     ),
-                    CanonEvent::Update { height, prev_nullifier }
-                    | CanonEvent::Release { height, prev_nullifier } => (
+                    CanonEvent::Update {
+                        height,
+                        prev_nullifier,
+                    }
+                    | CanonEvent::Release {
+                        height,
+                        prev_nullifier,
+                    } => (
                         *height,
                         TxAnchorFacts {
                             adoptions: vec![],
