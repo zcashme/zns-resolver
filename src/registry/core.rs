@@ -109,7 +109,6 @@ pub(crate) fn apply_batch(
     transactions: &[WalletTx],
     fvk: &FullViewingKey,
 ) -> rusqlite::Result<()> {
-    let mut pending_tips: HashMap<String, (Tip, [u8; 32])> = HashMap::new();
     let db_tx = conn.unchecked_transaction()?;
 
     // The lineage as of the batch start, folded from the stored facts; the
@@ -275,156 +274,18 @@ pub(crate) fn apply_batch(
             tx_law.insert(txid, (snapshot, facts));
         }
 
-        // Grouping: stable sort by name, then the same chunk_by the blocks
-        // use — scan order preserved within each name.
-        candidates.sort_by(|a, b| a.name().cmp(b.name()));
-
-        // Consideration: per name, with the name's whole candidate set and
-        // its state in scope. A release disclosing the block-start accepted
-        // rcm is considered before the updates competing over it — it
-        // references a predecessor the state still holds, and may spend a
-        // note the state has not yet recorded.
-        for group in candidates.chunk_by(|a, b| a.name() == b.name()) {
-            let name = group[0].name();
-            let mut binding = match pending_tips.get(name) {
-                Some(b) => Some(*b),
-                None => read_tip_offline(&db_tx, name)?,
-            };
-            let start = binding;
-
-            // Consideration order: releases disclosing the block-start
-            // accepted rcm first, scan order among them; then everything
-            // else in scan order.
-            let (release_first, rest): (Vec<_>, Vec<_>) = group.iter().partition(|candidate| {
-                matches!(candidate.note, NameNote::Release { .. })
-                    && start.is_some_and(|(t, _)| {
-                        t.action != Action::Release
-                            && candidate.note.prev_rcm().map(|p| *p.as_bytes()) == Some(t.rcm)
-                    })
-            });
-
-            for candidate in release_first.into_iter().chain(rest) {
-                let note = &candidate.note;
-                let ua = note.ua().as_str().to_string();
-                // A release carries no expiry; the row records the canonical
-                // "none" spelling.
-                let expires_at = note
-                    .expires_at()
-                    .map(|e| e.field_bytes().to_string())
-                    .unwrap_or_else(|| "none".to_string());
-
-                // Gate: chain rule — the disclosed prev_rcm extends the tip.
-                let Some(expected_prev) =
-                    notes::check_chain_rule(binding.as_ref().map(|b| &b.0), note)
-                else {
-                    continue;
-                };
-
-                // Gate: binding — verified at triage; the opening is carried.
-                let psi = candidate.psi;
-                let rcm = candidate.rcm;
-
-                // Gate: law context — the candidate is judged against the
-                // lineage its own transaction was judged against.
-                let Some((snapshot, tx_facts)) = tx_law.get(&candidate.txid) else {
-                    continue;
-                };
-
-                // Gate: accept path — the mint offers exactly-one-candidate
-                // transactions to the law; everything else is follow_spends.
-                if !tx_facts.has_single_name_note {
-                    continue;
-                }
-
-                // Gate: auth — the action consumed mint-owned money. A
-                // nullifier is public to compute; only the mint's key can
-                // reveal one on chain. The claim law is the mint's
-                // `accept_claim`: exactly one live anchor spent by this
-                // transaction, by the claim's own action; no live name note
-                // spent; a zero-value successor created; the name free
-                // (already enforced by the chain rule).
-                let consumed = AnchorNf::from_bytes(&candidate.action_nullifier);
-                let spent_a_live_name = tx_facts
-                    .retirements
-                    .iter()
-                    .any(|r| live_names.contains(r.nf.as_bytes()));
-                let auth = match note.action() {
-                    Action::Claim => {
-                        snapshot.contains(&consumed)
-                            && snapshot.live_retirements(tx_facts) == 1
-                            && !spent_a_live_name
-                            && tx_facts.adoptions.len() == 1
-                    }
-                    Action::Update => {
-                        binding.is_some_and(|b| b.1 == candidate.action_nullifier)
-                            && !snapshot.touches_live_anchor(tx_facts)
-                    }
-                    Action::Release => {
-                        !snapshot.touches_live_anchor(tx_facts)
-                            && (binding.is_some_and(|b| b.1 == candidate.action_nullifier)
-                                || spends_same_block_update(
-                                    group,
-                                    start,
-                                    candidate.action_nullifier,
-                                    fvk,
-                                ))
-                    }
-                };
-                if !auth {
-                    continue;
-                }
-
-                // Derived at admission, revealed at consumption.
-                let Some(nullifier) = candidate
-                    .note_orchard
-                    .zns_nullifier(fvk, NoteCommitTrapdoor::from_inner(rcm), psi)
-                    .map(|n| n.to_bytes())
-                else {
-                    continue;
-                };
-
-                let rcm_repr = rcm.to_repr();
-                let psi_repr = psi.to_repr();
-                let cmx = candidate.cand_cmx;
-
-                record_admission(
-                    &db_tx,
-                    &AdmissionRow {
-                        name,
-                        height: height as i64,
-                        action: note.action().as_str(),
-                        ua: &ua,
-                        expires_at: &expires_at,
-                        prev_rcm: expected_prev.as_slice(),
-                        rcm: rcm_repr.as_slice(),
-                        psi: psi_repr.as_slice(),
-                        cmx: cmx.as_slice(),
-                        nullifier: nullifier.as_slice(),
-                        txid: candidate.txid.as_slice(),
-                        action_index: candidate.action_index as i64,
-                        memo: candidate.memo,
-                    },
-                )?;
-
-                // Mirror the tip change into the live-name set.
-                if let Some(b) = binding {
-                    live_names.remove(&b.1);
-                }
-                if note.action() != Action::Release {
-                    live_names.insert(nullifier);
-                }
-
-                let tip = (
-                    Tip {
-                        action: note.action(),
-                        rcm: rcm_repr,
-                    },
-                    nullifier,
-                );
-                pending_tips.insert(name.to_string(), tip);
-                binding = Some(tip);
-            }
-        }
+        // Consideration: canonical transaction order — the mint evaluates
+        // transactions sequentially, each against the state its
+        // predecessors left. The accept path admits at most one candidate
+        // per transaction, so this is a total order over admissions.
+        apply_candidates(
+            &db_tx,
+            height,
+            &mut candidates,
+            &mut live_names,
+            &tx_law,
+            fvk,
+        )?;
     }
 
     set_checkpoint_in_tx(&db_tx, &scanned)?;
@@ -543,6 +404,249 @@ fn live_name_nullifiers(conn: &Connection) -> rusqlite::Result<HashSet<[u8; 32]>
     Ok(set)
 }
 
+/// The law, in canonical transaction order. The accept path admits at most
+/// one candidate per transaction; each candidate is judged against the
+/// lineage snapshot and live-name state of its own position, and every
+/// admission is visible to later candidates in the same batch.
+///
+/// A transaction that consumes the live tip without a valid successor ends
+/// that binding (the mint's `release_predecessor`), and a transaction that
+/// spends any other live name tip ends that binding too (the mint's
+/// `mark_released`) — both recorded as implicit releases.
+fn apply_candidates(
+    db_tx: &Transaction<'_>,
+    height: u32,
+    candidates: &mut [Candidate],
+    live_names: &mut HashSet<[u8; 32]>,
+    tx_law: &HashMap<[u8; 32], (Lineage, TxAnchorFacts)>,
+    fvk: &FullViewingKey,
+) -> rusqlite::Result<()> {
+    // Canonical order: transaction index, then action index.
+    candidates.sort_by_key(|c| (c.tx_index, c.action_index));
+
+    for candidate in candidates {
+        // Gate: law context — the candidate is judged against the lineage
+        // its own transaction was judged against.
+        let Some((snapshot, tx_facts)) = tx_law.get(&candidate.txid) else {
+            continue;
+        };
+
+        // Gate: accept path — the mint offers exactly-one-candidate
+        // transactions to the law; everything else is follow_spends.
+        if !tx_facts.has_single_name_note {
+            continue;
+        }
+
+        let binding = read_tip_offline(db_tx, candidate.name())?;
+        let note = &candidate.note;
+        let tip_consumed = binding
+            .as_ref()
+            .is_some_and(|b| b.1 == candidate.action_nullifier);
+        let spent_a_live_name = tx_facts
+            .retirements
+            .iter()
+            .any(|r| live_names.contains(r.nf.as_bytes()));
+
+        match note.action() {
+            Action::Claim => {
+                // Gate: claim law — the mint's accept_claim: exactly one
+                // live anchor spent by this transaction, by the claim's own
+                // action; no live name note spent; a zero-value successor
+                // created.
+                let law_ok = snapshot.contains(&AnchorNf::from_bytes(&candidate.action_nullifier))
+                    && snapshot.live_retirements(tx_facts) == 1
+                    && !spent_a_live_name
+                    && tx_facts.adoptions.len() == 1;
+                if !law_ok {
+                    // The mint's mark_released: every live name this
+                    // transaction spent ends its binding.
+                    mark_released_spent(
+                        db_tx,
+                        live_names,
+                        tx_facts,
+                        height,
+                        &candidate.txid,
+                        candidate.action_index,
+                    )?;
+                    continue;
+                }
+
+                // Gate: chain rule — a claim's predecessor is zero, which
+                // also requires the name free.
+                let Some(expected_prev) =
+                    notes::check_chain_rule(binding.as_ref().map(|b| &b.0), note)
+                else {
+                    continue;
+                };
+
+                let Some(nullifier) = admit_nullifier(candidate, fvk) else {
+                    continue;
+                };
+                record_admission(
+                    db_tx,
+                    &AdmissionRow {
+                        name: candidate.name(),
+                        height: height as i64,
+                        action: note.action().as_str(),
+                        ua: note.ua().as_str(),
+                        expires_at: &note
+                            .expires_at()
+                            .map(|e| e.field_bytes().to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        prev_rcm: expected_prev.as_slice(),
+                        rcm: candidate.rcm.to_repr().as_slice(),
+                        psi: candidate.psi.to_repr().as_slice(),
+                        cmx: &candidate.cand_cmx,
+                        nullifier: nullifier.as_slice(),
+                        txid: candidate.txid.as_slice(),
+                        action_index: candidate.action_index as i64,
+                        memo: candidate.memo,
+                    },
+                )?;
+                live_names.insert(nullifier);
+            }
+            Action::Update | Action::Release => {
+                // Gate: predecessor — the transaction must consume this
+                // name's live tip, only this name's, and no anchor. Anything
+                // else is follow_spends: every spent live name ends its
+                // binding.
+                let spent_other_live = tx_facts.retirements.iter().any(|r| {
+                    live_names.contains(r.nf.as_bytes())
+                        && r.nf.as_bytes() != &candidate.action_nullifier
+                });
+                if !tip_consumed || spent_other_live || snapshot.touches_live_anchor(tx_facts) {
+                    mark_released_spent(
+                        db_tx,
+                        live_names,
+                        tx_facts,
+                        height,
+                        &candidate.txid,
+                        candidate.action_index,
+                    )?;
+                    continue;
+                }
+
+                // The tip was consumed: a valid successor advances an update
+                // or lands a proper release; an invalid one ends the binding
+                // — the mint's release_predecessor.
+                let Some(expected_prev) =
+                    notes::check_chain_rule(binding.as_ref().map(|b| &b.0), note)
+                else {
+                    end_binding_implicitly(
+                        db_tx,
+                        live_names,
+                        candidate.name(),
+                        height,
+                        &candidate.txid,
+                        candidate.action_index,
+                        &candidate.action_nullifier,
+                    )?;
+                    continue;
+                };
+
+                let Some(nullifier) = admit_nullifier(candidate, fvk) else {
+                    continue;
+                };
+                record_admission(
+                    db_tx,
+                    &AdmissionRow {
+                        name: candidate.name(),
+                        height: height as i64,
+                        action: note.action().as_str(),
+                        ua: note.ua().as_str(),
+                        expires_at: &note
+                            .expires_at()
+                            .map(|e| e.field_bytes().to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        prev_rcm: expected_prev.as_slice(),
+                        rcm: candidate.rcm.to_repr().as_slice(),
+                        psi: candidate.psi.to_repr().as_slice(),
+                        cmx: &candidate.cand_cmx,
+                        nullifier: nullifier.as_slice(),
+                        txid: candidate.txid.as_slice(),
+                        action_index: candidate.action_index as i64,
+                        memo: candidate.memo,
+                    },
+                )?;
+                if let Some(b) = binding {
+                    live_names.remove(&b.1);
+                }
+                if note.action() == Action::Update {
+                    live_names.insert(nullifier);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The admission nullifier of a verified candidate.
+fn admit_nullifier(candidate: &Candidate, fvk: &FullViewingKey) -> Option<[u8; 32]> {
+    candidate
+        .note_orchard
+        .zns_nullifier(
+            fvk,
+            NoteCommitTrapdoor::from_inner(candidate.rcm),
+            candidate.psi,
+        )
+        .map(|n| n.to_bytes())
+}
+
+/// The mint's `mark_released`: every live name whose tip this transaction
+/// spent ends its binding, recorded as an implicit release.
+fn mark_released_spent(
+    db_tx: &Transaction<'_>,
+    live_names: &mut HashSet<[u8; 32]>,
+    facts: &TxAnchorFacts,
+    height: u32,
+    txid: &[u8],
+    action_index: usize,
+) -> rusqlite::Result<()> {
+    for retirement in &facts.retirements {
+        let nf = retirement.nf.as_bytes();
+        if !live_names.remove(nf) {
+            continue;
+        }
+        let name: String = db_tx
+            .query_row(
+                "SELECT name FROM names WHERE nullifier = ?1",
+                params![nf],
+                |r| r.get(0),
+            )
+            .optional()?
+            .expect("live-name set mirrors the names table");
+        db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
+        db_tx.execute(
+            "INSERT OR IGNORE INTO implicit_releases (name, height, txid, action_index, nullifier)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, height as i64, txid, action_index as i64, nf],
+        )?;
+    }
+    Ok(())
+}
+
+/// The mint's `release_predecessor`: the tip was consumed without a valid
+/// successor, so the binding ends — recorded as an implicit release.
+#[allow(clippy::too_many_arguments)]
+fn end_binding_implicitly(
+    db_tx: &Transaction<'_>,
+    live_names: &mut HashSet<[u8; 32]>,
+    name: &str,
+    height: u32,
+    txid: &[u8],
+    action_index: usize,
+    consumed: &[u8; 32],
+) -> rusqlite::Result<()> {
+    live_names.remove(consumed);
+    db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
+    db_tx.execute(
+        "INSERT OR IGNORE INTO implicit_releases (name, height, txid, action_index, nullifier)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![name, height as i64, txid, action_index as i64, consumed],
+    )?;
+    Ok(())
+}
+
 /// The columns of one admitted candidate, written to the event log and the
 /// per-name tip in one call.
 struct AdmissionRow<'a> {
@@ -601,35 +705,6 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
     Ok(())
 }
 
-/// True when `consumed` is the derived nullifier of a genuine same-block
-/// update — one that discloses the block-start rcm and consumes the
-/// block-start binding note. The consumption is the consensus wall: only
-/// the mint's key can reveal that nullifier, so a forged update can never
-/// qualify. Cheap checks run before the crypto.
-fn spends_same_block_update(
-    candidates: &[Candidate],
-    start: Option<(Tip, [u8; 32])>,
-    consumed: [u8; 32],
-    fvk: &FullViewingKey,
-) -> bool {
-    let Some((start_tip, start_nf)) = start else {
-        return false;
-    };
-    candidates.iter().any(|candidate| {
-        matches!(candidate.note, NameNote::Update { .. })
-            && candidate.note.prev_rcm().map(|p| *p.as_bytes()) == Some(start_tip.rcm)
-            && candidate.action_nullifier == start_nf
-            && candidate
-                .note_orchard
-                .zns_nullifier(
-                    fvk,
-                    NoteCommitTrapdoor::from_inner(candidate.rcm),
-                    candidate.psi,
-                )
-                .is_some_and(|nf| nf.to_bytes() == consumed)
-    })
-}
-
 pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
 
@@ -641,6 +716,10 @@ pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
 
     tx.execute(
         "DELETE FROM name_events WHERE height > ?1",
+        params![fork_height as i64],
+    )?;
+    tx.execute(
+        "DELETE FROM implicit_releases WHERE height > ?1",
         params![fork_height as i64],
     )?;
     tx.execute(

@@ -54,6 +54,15 @@ CREATE TABLE IF NOT EXISTS names (
     memo         BLOB    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS implicit_releases (
+    name         TEXT    NOT NULL,
+    height       INTEGER NOT NULL,
+    txid         BLOB    NOT NULL,
+    action_index INTEGER NOT NULL,
+    nullifier    BLOB    NOT NULL,
+    PRIMARY KEY (name, height, txid, action_index)
+);
+
 CREATE TABLE IF NOT EXISTS anchor_facts (
     nullifier          BLOB    NOT NULL PRIMARY KEY,
     value              INTEGER NOT NULL,
