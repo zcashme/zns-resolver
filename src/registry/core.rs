@@ -31,7 +31,6 @@ struct Candidate<'a> {
     /// PR types the tip family.
     action_nullifier: [u8; 32],
     txid: [u8; 32],
-    tx_index: u32,
     memo: &'a [u8],
     note: NameNote<'a>,
     /// The published commitment the binding was verified against.
@@ -47,6 +46,14 @@ impl Candidate<'_> {
     fn name(&self) -> &str {
         self.note.name().as_str()
     }
+}
+
+/// One transaction's law context: its identity, its pre-transaction lineage
+/// snapshot, and its anchor facts. Canonical order comes from the Vec.
+struct TxLaw {
+    txid: [u8; 32],
+    snapshot: Lineage,
+    facts: TxAnchorFacts,
 }
 
 pub(crate) fn install_registry_config(
@@ -99,7 +106,6 @@ struct Source<'a> {
     cand_cmx: [u8; 32],
     memo: &'a [u8],
     txid: [u8; 32],
-    tx_index: u32,
     psi: pallas::Base,
     rcm: pallas::Scalar,
 }
@@ -136,7 +142,6 @@ pub(crate) fn apply_batch(
         let mut sources: Vec<Source> = Vec::new();
         for tx in block {
             let txid = *tx.txid.as_ref();
-            let tx_index = tx.tx_index;
             for output in &tx.relaxed_ironwood_outputs {
                 let (action_index, cand_note, action_nullifier, memo, _) = output;
 
@@ -182,20 +187,18 @@ pub(crate) fn apply_batch(
                     cand_cmx: cand_note.cmx().to_bytes(),
                     memo: memo.as_slice(),
                     txid,
-                    tx_index,
                     psi,
                     rcm,
                 });
             }
         }
-        let mut candidates: Vec<Candidate> = memos
+        let candidates: Vec<Candidate> = memos
             .iter()
             .zip(&sources)
             .map(|(memo, src)| Candidate {
                 action_index: src.action_index,
                 action_nullifier: src.action_nullifier,
                 txid: src.txid,
-                tx_index: src.tx_index,
                 memo: src.memo,
                 note: NameNote::parse(memo).expect("arena memo parsed at triage"),
                 cand_cmx: src.cand_cmx,
@@ -259,7 +262,7 @@ pub(crate) fn apply_batch(
         // lineage its own transaction was judged against.
         let mut txs: Vec<&WalletTx> = block.iter().collect();
         txs.sort_by_key(|tx| tx.tx_index);
-        let mut tx_law: HashMap<[u8; 32], (Lineage, TxAnchorFacts)> = HashMap::new();
+        let mut tx_law: Vec<TxLaw> = Vec::new();
         for tx in txs {
             let txid = *tx.txid.as_ref();
             let facts = TxAnchorFacts {
@@ -281,21 +284,18 @@ pub(crate) fn apply_batch(
             };
             let snapshot = lineage.clone();
             lineage.step_tx(&facts);
-            tx_law.insert(txid, (snapshot, facts));
+            tx_law.push(TxLaw {
+                txid,
+                snapshot,
+                facts,
+            });
         }
 
         // Consideration: canonical transaction order — the mint evaluates
         // transactions sequentially, each against the state its
         // predecessors left. The accept path admits at most one candidate
         // per transaction, so this is a total order over admissions.
-        apply_candidates(
-            &db_tx,
-            height,
-            &mut candidates,
-            &mut live_names,
-            &tx_law,
-            fvk,
-        )?;
+        apply_candidates(&db_tx, height, &candidates, &mut live_names, &tx_law, fvk)?;
     }
 
     set_checkpoint_in_tx(&db_tx, &scanned)?;
@@ -426,36 +426,34 @@ fn live_name_nullifiers(conn: &Connection) -> rusqlite::Result<HashSet<[u8; 32]>
 fn apply_candidates(
     db_tx: &Transaction<'_>,
     height: u32,
-    candidates: &mut [Candidate],
+    candidates: &[Candidate],
     live_names: &mut HashSet<[u8; 32]>,
-    tx_law: &HashMap<[u8; 32], (Lineage, TxAnchorFacts)>,
+    tx_law: &[TxLaw],
     fvk: &FullViewingKey,
 ) -> rusqlite::Result<()> {
-    // Canonical order: transaction index, then action index.
-    candidates.sort_by_key(|c| (c.tx_index, c.action_index));
-
+    // The accept path admits at most one candidate per transaction, so
+    // candidates index by transaction. The loop walks TRANSACTIONS in
+    // canonical order — including candidate-free ones, whose follow_spends
+    // behavior (ending the binding of every live name they spent) the mint
+    // applies to every transaction that is not exactly-one-candidate.
+    let mut candidate_by_tx: HashMap<[u8; 32], &Candidate> = HashMap::new();
     for candidate in candidates {
-        // Gate: law context — the candidate is judged against the lineage
-        // its own transaction was judged against.
-        let Some((snapshot, tx_facts)) = tx_law.get(&candidate.txid) else {
+        candidate_by_tx.insert(candidate.txid, candidate);
+    }
+
+    for law in tx_law {
+        let Some(candidate) = law
+            .facts
+            .has_single_name_note
+            .then(|| candidate_by_tx.get(&law.txid))
+            .flatten()
+        else {
+            // follow_spends: zero candidates, or two or more.
+            mark_released_spent(db_tx, live_names, &law.facts, height, &law.txid, 0)?;
             continue;
         };
-
-        // Gate: accept path — the mint offers exactly-one-candidate
-        // transactions to the law; everything else is follow_spends, and
-        // follow_spends ends the binding of every live name the transaction
-        // spent.
-        if !tx_facts.has_single_name_note {
-            mark_released_spent(
-                db_tx,
-                live_names,
-                tx_facts,
-                height,
-                &candidate.txid,
-                candidate.action_index,
-            )?;
-            continue;
-        }
+        let snapshot = &law.snapshot;
+        let tx_facts = &law.facts;
 
         let binding = read_tip_offline(db_tx, candidate.name())?;
         let note = &candidate.note;
@@ -1266,7 +1264,7 @@ mod admission {
     fn candidate<'a>(
         memos: &'a [Memo],
         i: usize,
-        tx_index: u32,
+        _tx_index: u32,
         action_index: usize,
         txid: [u8; 32],
         action: &str,
@@ -1296,7 +1294,6 @@ mod admission {
             action_index,
             action_nullifier,
             txid,
-            tx_index,
             memo: memo_bytes,
             note,
             cand_cmx: cmx.to_bytes(),
@@ -1312,18 +1309,16 @@ mod admission {
         adoptions: Vec<Adoption>,
         retirements: Vec<Retirement>,
         has_single_name_note: bool,
-    ) -> ([u8; 32], (Lineage, TxAnchorFacts)) {
-        (
+    ) -> TxLaw {
+        TxLaw {
             txid,
-            (
-                snapshot,
-                TxAnchorFacts {
-                    adoptions,
-                    retirements,
-                    has_single_name_note,
-                },
-            ),
-        )
+            snapshot,
+            facts: TxAnchorFacts {
+                adoptions,
+                retirements,
+                has_single_name_note,
+            },
+        }
     }
 
     fn count(conn: &Connection, sql: &str) -> i64 {
@@ -1343,7 +1338,7 @@ mod admission {
         let fvk = fvk();
 
         let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
-        let mut candidates = vec![candidate(
+        let candidates = vec![candidate(
             &memos,
             0,
             0,
@@ -1356,21 +1351,21 @@ mod admission {
         )];
         let snapshot = Lineage::new();
         let seeded = seeded_lineage(&[1]);
-        let tx_law = HashMap::from([tx_law_for(
+        let tx_law = vec![tx_law_for(
             [1; 32],
             seeded.clone(),
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
             true,
-        )]);
+        )];
         let mut live_names: HashSet<[u8; 32]> = HashSet::new();
         let mut lineage = seeded;
         let _ = snapshot;
 
         // the fold already consumed the block's facts before admission
-        lineage.step_tx(&tx_law[&[1; 32]].1);
+        lineage.step_tx(&tx_law[0].facts);
 
-        apply_candidates(&tx, 100, &mut candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
@@ -1384,12 +1379,12 @@ mod admission {
         let fvk = fvk();
 
         let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
-        let mut candidates = vec![candidate(
+        let candidates = vec![candidate(
             &memos, 0, 0, 0, [1; 32], "claim", "alice", [9; 32], // not a live anchor
             [0u8; 32],
         )];
         let seeded = seeded_lineage(&[1]);
-        let tx_law = HashMap::from([tx_law_for(
+        let tx_law = vec![tx_law_for(
             [1; 32],
             seeded.clone(),
             vec![],
@@ -1397,12 +1392,12 @@ mod admission {
                 nf: AnchorNf::from_bytes(&[9; 32]),
             }],
             true,
-        )]);
+        )];
         let mut live_names = HashSet::new();
         let mut lineage = seeded;
-        lineage.step_tx(&tx_law[&[1; 32]].1);
+        lineage.step_tx(&tx_law[0].facts);
 
-        apply_candidates(&tx, 100, &mut candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
@@ -1426,13 +1421,13 @@ mod admission {
         .unwrap();
 
         let memos = vec![memo_for("claim", "a", &[0u8; 32])];
-        let mut candidates = vec![candidate(
+        let candidates = vec![candidate(
             &memos, 0, 0, 0, [1; 32], "claim", "a",
             [0x5a; 32], // the claim action spends z's tip
             [0u8; 32],
         )];
         let seeded = seeded_lineage(&[1]);
-        let tx_law = HashMap::from([tx_law_for(
+        let tx_law = vec![tx_law_for(
             [1; 32],
             seeded.clone(),
             vec![],
@@ -1440,12 +1435,12 @@ mod admission {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
             true,
-        )]);
+        )];
         let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
         let mut lineage = seeded;
-        lineage.step_tx(&tx_law[&[1; 32]].1);
+        lineage.step_tx(&tx_law[0].facts);
 
-        apply_candidates(&tx, 100, &mut candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
 
         // z's binding ended; the claim did not land.
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
@@ -1492,7 +1487,7 @@ mod admission {
         let nullifier_u = admit_nullifier(&update, &fvk).expect("update nullifier");
 
         let seeded = seeded_lineage(&[1]);
-        let tx_law = HashMap::from([
+        let tx_law = vec![
             tx_law_for(
                 [1; 32],
                 seeded.clone(),
@@ -1511,15 +1506,15 @@ mod admission {
                 }],
                 true,
             ),
-        ]);
+        ];
 
         let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
         let mut lineage = seeded;
-        lineage.step_tx(&tx_law[&[1; 32]].1);
-        lineage.step_tx(&tx_law[&[2; 32]].1);
+        lineage.step_tx(&tx_law[0].facts);
+        lineage.step_tx(&tx_law[1].facts);
 
-        let mut candidates = vec![update, release];
-        apply_candidates(&tx, 100, &mut candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        let candidates = vec![update, release];
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
 
         // The update admitted; the stale release ended the binding.
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
@@ -1553,7 +1548,7 @@ mod admission {
             memo_for("claim", "a", &[0u8; 32]),
             memo_for("claim", "b", &[0u8; 32]),
         ];
-        let mut candidates = vec![
+        let candidates = vec![
             candidate(
                 &memos, 0, 0, 0, [1; 32], "claim", "a", [0x5a; 32], [0u8; 32],
             ),
@@ -1562,7 +1557,7 @@ mod admission {
             ),
         ];
         let seeded = seeded_lineage(&[1]);
-        let tx_law = HashMap::from([tx_law_for(
+        let tx_law = vec![tx_law_for(
             [1; 32],
             seeded.clone(),
             vec![],
@@ -1570,16 +1565,55 @@ mod admission {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
             false, // two candidates: follow_spends
-        )]);
+        )];
         let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
         let mut lineage = seeded;
-        lineage.step_tx(&tx_law[&[1; 32]].1);
+        lineage.step_tx(&tx_law[0].facts);
 
-        apply_candidates(&tx, 100, &mut candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
+    }
+
+    /// A candidate-free transaction that spends a live tip takes
+    /// follow_spends: the binding ends even though no candidate existed to
+    /// reject. The mint applies this to every transaction that is not
+    /// exactly-one-candidate.
+    #[test]
+    fn candidate_free_tx_spending_a_live_tip_ends_the_binding() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        // No candidates at all: a spend-only transaction.
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![tx_law_for(
+            [7; 32],
+            seeded.clone(),
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&[0x5a; 32]),
+            }],
+            false,
+        )];
+        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut lineage = seeded;
+        lineage.step_tx(&tx_law[0].facts);
+
+        let candidates: Vec<Candidate> = vec![];
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
     }
 
     fn seeded_lineage(anchors: &[u8]) -> Lineage {
