@@ -298,3 +298,148 @@ mod tests {
         assert!(!rewound.contains(&nf(2)));
     }
 }
+
+/// The resolver folds the same chain facts the mint folds; the vendored
+/// canon fixture is the executable cross-repo contract. Every scenario is
+/// replayed into the fold and the live anchor set must equal the mint's
+/// recorded pool after every event.
+#[cfg(test)]
+mod canon {
+    use super::*;
+    use serde::Deserialize;
+
+    const FIXTURE: &str = include_str!("../../tests/fixtures/canon-vectors-v1.json");
+
+    #[derive(Deserialize)]
+    struct Fixture {
+        version: String,
+        anchor_pool_size: usize,
+        scenarios: Vec<Scenario>,
+    }
+
+    #[derive(Deserialize)]
+    struct Scenario {
+        events: Vec<CanonEvent>,
+        trace: Vec<Trace>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum CanonEvent {
+        AdoptAnchor { height: u32, nullifier: String },
+        Claim { height: u32, spent_anchor: String, successor_anchor: String },
+        UnbackedClaim { height: u32, spent: Vec<String> },
+        Update { height: u32, prev_nullifier: String },
+        Release { height: u32, prev_nullifier: String },
+        Rewind { to_height: u32 },
+    }
+
+    #[derive(Deserialize)]
+    struct Trace {
+        anchor_pool: Vec<String>,
+    }
+
+    fn hex32(s: &str) -> AnchorNf {
+        let mut bytes = [0u8; 32];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("fixture hex");
+        }
+        AnchorNf::from_bytes(&bytes)
+    }
+
+    /// One applied event = one transaction group at a unique position.
+    struct Applied {
+        height: u32,
+        tx_index: u32,
+        facts: TxAnchorFacts,
+    }
+
+    fn fold(applied: &[Applied]) -> Lineage {
+        let mut order: Vec<&Applied> = applied.iter().collect();
+        order.sort_by_key(|a| (a.height, a.tx_index));
+        let mut lineage = Lineage::new();
+        for applied in order {
+            lineage.step_tx(&applied.facts);
+        }
+        lineage
+    }
+
+    fn assert_pool(lineage: &Lineage, pool: &[String]) {
+        assert_eq!(lineage.len(), pool.len(), "pool size");
+        for hex in pool {
+            assert!(lineage.contains(&hex32(hex)), "missing anchor {hex}");
+        }
+    }
+
+    #[test]
+    fn canon_vectors_pin_the_fold() {
+        let fixture: Fixture = serde_json::from_str(FIXTURE).expect("fixture parses");
+        assert_eq!(fixture.version, "canon-vectors-v1");
+        // The fixture pins the standing size across repos.
+        assert_eq!(fixture.anchor_pool_size, ANCHOR_POOL_SIZE);
+        assert_eq!(fixture.scenarios.len(), 7);
+
+        for scenario in &fixture.scenarios {
+            let mut applied: Vec<Applied> = Vec::new();
+            for (i, event) in scenario.events.iter().enumerate() {
+                let (height, facts) = match event {
+                    CanonEvent::AdoptAnchor { height, nullifier } => (
+                        *height,
+                        TxAnchorFacts {
+                            adoptions: vec![Adoption { nf: hex32(nullifier) }],
+                            retirements: vec![],
+                            has_single_name_note: false,
+                        },
+                    ),
+                    CanonEvent::Claim { height, spent_anchor, successor_anchor } => (
+                        *height,
+                        TxAnchorFacts {
+                            adoptions: vec![Adoption {
+                                nf: hex32(successor_anchor),
+                            }],
+                            retirements: vec![Retirement {
+                                nf: hex32(spent_anchor),
+                            }],
+                            has_single_name_note: true,
+                        },
+                    ),
+                    CanonEvent::UnbackedClaim { height, spent } => (
+                        *height,
+                        TxAnchorFacts {
+                            adoptions: vec![],
+                            retirements: spent
+                                .iter()
+                                .map(|s| Retirement { nf: hex32(s) })
+                                .collect(),
+                            has_single_name_note: true,
+                        },
+                    ),
+                    CanonEvent::Update { height, prev_nullifier }
+                    | CanonEvent::Release { height, prev_nullifier } => (
+                        *height,
+                        TxAnchorFacts {
+                            adoptions: vec![],
+                            retirements: vec![Retirement {
+                                nf: hex32(prev_nullifier),
+                            }],
+                            has_single_name_note: true,
+                        },
+                    ),
+                    CanonEvent::Rewind { to_height } => {
+                        applied.retain(|a| a.height <= *to_height);
+                        let lineage = fold(&applied);
+                        assert_pool(&lineage, &scenario.trace[i].anchor_pool);
+                        continue;
+                    }
+                };
+                applied.push(Applied {
+                    height,
+                    tx_index: i as u32,
+                    facts,
+                });
+                let lineage = fold(&applied);
+                assert_pool(&lineage, &scenario.trace[i].anchor_pool);
+            }
+        }
+    }
+}
