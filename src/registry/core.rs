@@ -52,6 +52,7 @@ impl Candidate<'_> {
 /// snapshot, and its anchor facts. Canonical order comes from the Vec.
 struct TxLaw {
     txid: [u8; 32],
+    tx_index: u32,
     snapshot: Lineage,
     facts: TxAnchorFacts,
 }
@@ -265,6 +266,7 @@ pub(crate) fn apply_batch(
         let mut tx_law: Vec<TxLaw> = Vec::new();
         for tx in txs {
             let txid = *tx.txid.as_ref();
+            let tx_index = tx.tx_index;
             let facts = TxAnchorFacts {
                 adoptions: tx
                     .ironwood_outputs
@@ -286,6 +288,7 @@ pub(crate) fn apply_batch(
             lineage.step_tx(&facts);
             tx_law.push(TxLaw {
                 txid,
+                tx_index,
                 snapshot,
                 facts,
             });
@@ -449,7 +452,15 @@ fn apply_candidates(
             .flatten()
         else {
             // follow_spends: zero candidates, or two or more.
-            mark_released_spent(db_tx, live_names, &law.facts, height, &law.txid, 0)?;
+            mark_released_spent(
+                db_tx,
+                live_names,
+                &law.facts,
+                height,
+                &law.txid,
+                law.tx_index,
+                0,
+            )?;
             continue;
         };
         let snapshot = &law.snapshot;
@@ -484,6 +495,7 @@ fn apply_candidates(
                         tx_facts,
                         height,
                         &candidate.txid,
+                        law.tx_index,
                         candidate.action_index,
                     )?;
                     continue;
@@ -517,6 +529,7 @@ fn apply_candidates(
                         cmx: &candidate.cand_cmx,
                         nullifier: nullifier.as_slice(),
                         txid: candidate.txid.as_slice(),
+                        tx_index: law.tx_index as i64,
                         action_index: candidate.action_index as i64,
                         memo: candidate.memo,
                     },
@@ -539,6 +552,7 @@ fn apply_candidates(
                         tx_facts,
                         height,
                         &candidate.txid,
+                        law.tx_index,
                         candidate.action_index,
                     )?;
                     continue;
@@ -556,6 +570,7 @@ fn apply_candidates(
                         candidate.name(),
                         height,
                         &candidate.txid,
+                        law.tx_index,
                         candidate.action_index,
                         &candidate.action_nullifier,
                     )?;
@@ -582,6 +597,7 @@ fn apply_candidates(
                         cmx: &candidate.cand_cmx,
                         nullifier: nullifier.as_slice(),
                         txid: candidate.txid.as_slice(),
+                        tx_index: law.tx_index as i64,
                         action_index: candidate.action_index as i64,
                         memo: candidate.memo,
                     },
@@ -618,6 +634,7 @@ fn mark_released_spent(
     facts: &TxAnchorFacts,
     height: u32,
     txid: &[u8],
+    tx_index: u32,
     action_index: usize,
 ) -> rusqlite::Result<()> {
     for retirement in &facts.retirements {
@@ -635,9 +652,9 @@ fn mark_released_spent(
             .expect("live-name set mirrors the names table");
         db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
         db_tx.execute(
-            "INSERT OR IGNORE INTO implicit_releases (name, height, txid, action_index, nullifier)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![name, height as i64, txid, action_index as i64, nf],
+            "INSERT OR IGNORE INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![name, height as i64, txid, tx_index as i64, action_index as i64, nf],
         )?;
     }
     Ok(())
@@ -652,15 +669,16 @@ fn end_binding_implicitly(
     name: &str,
     height: u32,
     txid: &[u8],
+    tx_index: u32,
     action_index: usize,
     consumed: &[u8; 32],
 ) -> rusqlite::Result<()> {
     live_names.remove(consumed);
     db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
     db_tx.execute(
-        "INSERT OR IGNORE INTO implicit_releases (name, height, txid, action_index, nullifier)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![name, height as i64, txid, action_index as i64, consumed],
+        "INSERT OR IGNORE INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![name, height as i64, txid, tx_index as i64, action_index as i64, consumed],
     )?;
     Ok(())
 }
@@ -679,6 +697,7 @@ struct AdmissionRow<'a> {
     cmx: &'a [u8],
     nullifier: &'a [u8],
     txid: &'a [u8],
+    tx_index: i64,
     action_index: i64,
     memo: &'a [u8],
 }
@@ -696,26 +715,28 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
         row.cmx,
         row.nullifier,
         row.txid,
+        row.tx_index,
         row.action_index,
         row.memo,
     ];
     db_tx.execute(
-        "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         sql_params,
     )?;
     if row.action == "release" {
         db_tx.execute("DELETE FROM names WHERE name = ?1", params![row.name])?;
     } else {
         db_tx.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT (name) DO UPDATE SET
                height = excluded.height, action = excluded.action, ua = excluded.ua,
                expires_at = excluded.expires_at,
                prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
                cmx = excluded.cmx, nullifier = excluded.nullifier,
-               txid = excluded.txid, action_index = excluded.action_index,
+               txid = excluded.txid, tx_index = excluded.tx_index,
+               action_index = excluded.action_index,
                memo = excluded.memo",
             sql_params,
         )?;
@@ -726,7 +747,11 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
 pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
 
-    let mut stmt = tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
+    let mut stmt = tx.prepare(
+        "SELECT name FROM name_events WHERE height > ?1
+         UNION
+         SELECT name FROM implicit_releases WHERE height > ?1",
+    )?;
     let affected: Vec<String> = stmt
         .query_map(params![fork_height as i64], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -1007,11 +1032,22 @@ fn set_checkpoint_in_tx(tx: &Transaction<'_>, scanned: &Cursor) -> rusqlite::Res
 /// memo must still parse and agree with its columns — a corrupt record fails
 /// the rewind loudly.
 fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
+    // The tip is the latest record across BOTH streams — explicit events and
+    // implicit releases — in canonical order. An implicit release ends the
+    // binding just as a proper release event does.
+    let latest_implicit: Option<(i64, i64, i64)> = tx
+        .query_row(
+            "SELECT height, tx_index, action_index FROM implicit_releases WHERE name = ?1
+             ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT 1",
+            params![name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
     let row = tx
         .query_row(
-            "SELECT action, memo, txid, height, action_index, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier
+            "SELECT action, memo, txid, height, tx_index, action_index, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier
              FROM name_events WHERE name = ?1
-             ORDER BY height DESC, rowid DESC LIMIT 1",
+             ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT 1",
             params![name],
             |row| {
                 Ok((
@@ -1020,13 +1056,14 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
-                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                     row.get::<_, Vec<u8>>(8)?,
                     row.get::<_, Vec<u8>>(9)?,
                     row.get::<_, Vec<u8>>(10)?,
                     row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, Vec<u8>>(12)?,
                 ))
             },
         )
@@ -1038,6 +1075,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
         memo,
         txid_b,
         height,
+        tx_index,
         action_index,
         ua_b,
         expires_col,
@@ -1050,6 +1088,12 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
     else {
         return Ok(());
     };
+    if let Some(implicit) = latest_implicit {
+        // An implicit release at or after the last event ends the binding.
+        if implicit >= (height, tx_index, action_index) {
+            return Ok(());
+        }
+    }
 
     // The restored record must still parse and agree with its columns.
     let zns_memo = Memo::from_bytes(&memo).map_err(|_| corrupt_record())?;
@@ -1060,8 +1104,8 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
 
     if matches!(action, Action::Claim | Action::Update) {
         tx.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 name,
                 height,
@@ -1074,6 +1118,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                 cmx_b,
                 nullifier_b,
                 txid_b,
+                tx_index,
                 action_index,
                 memo,
             ],
@@ -1144,6 +1189,116 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
         conn
+    }
+
+    /// A rewound implicit release restores the binding it ended: the name
+    /// returns to its last surviving event's state.
+    #[test]
+    fn rewound_implicit_release_restores_the_binding() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
+        insert_checkpoint(&conn, 42, 7);
+        // z: claim event at 90; implicit release at 100.
+        let memo =
+            b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', x'06', 0, 0, ?1)",
+            params![&memo[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', x'06', 0, 0, ?1)",
+            params![&memo[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+             VALUES ('z', 100, x'06', 0, 0, x'5a')",
+            [],
+        )
+        .unwrap();
+        // The implicit release had deleted the binding.
+        conn.execute("DELETE FROM names WHERE name = 'z'", [])
+            .unwrap();
+
+        rewind(&conn, 95).unwrap();
+
+        let tip: Option<String> = conn
+            .query_row("SELECT action FROM names WHERE name = 'z'", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .unwrap();
+        assert_eq!(tip.as_deref(), Some("claim"));
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM implicit_releases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    /// A surviving implicit release keeps the binding ended: a re-claim
+    /// above the fork is rewound away, and the rebuild does not resurrect
+    /// the pre-release event.
+    #[test]
+    fn surviving_implicit_release_keeps_the_binding_ended() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
+        insert_checkpoint(&conn, 42, 7);
+        let memo =
+            b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', x'06', 0, 0, ?1)",
+            params![&memo[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+             VALUES ('z', 95, x'06', 0, 0, x'5a')",
+            [],
+        )
+        .unwrap();
+        // A re-claim above the fork: rewinding past it must not resurrect
+        // the pre-release event.
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 100, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5b', x'08', 0, 0, x'09')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 100, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5b', x'08', 0, 0, x'09')",
+            [],
+        )
+        .unwrap();
+
+        rewind(&conn, 97).unwrap();
+
+        let z: i64 = conn
+            .query_row("SELECT COUNT(*) FROM names WHERE name = 'z'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(z, 0, "the surviving implicit release keeps z ended");
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM name_events WHERE name = 'z'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "only the pre-release event survives");
     }
 
     fn insert_checkpoint(conn: &Connection, height: u32, hash_byte: u8) {
@@ -1312,6 +1467,7 @@ mod admission {
     ) -> TxLaw {
         TxLaw {
             txid,
+            tx_index: 0,
             snapshot,
             facts: TxAnchorFacts {
                 adoptions,
@@ -1414,8 +1570,8 @@ mod admission {
 
         // "z" is live, its tip nullifier is 0x5a…
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
@@ -1466,8 +1622,8 @@ mod admission {
 
         // "z" is live with tip nullifier 0x5a and commitment rcm 0x02.
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
@@ -1538,8 +1694,8 @@ mod admission {
         let fvk = fvk();
 
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
@@ -1588,8 +1744,8 @@ mod admission {
         let fvk = fvk();
 
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
