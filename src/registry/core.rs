@@ -2,29 +2,44 @@
 
 use std::collections::{HashMap, HashSet};
 
-use orchard::keys::FullViewingKey;
+use orchard::keys::{FullViewingKey, Scope};
+use orchard::note::Note;
 use orchard::note::NoteCommitTrapdoor;
 use orchard::note::Nullifier;
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
-use seer_sync::sync::decrypt::RelaxedIronwoodOutput;
 use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
-use zns_verify::{Action, Memo, NameNote, PrimeField, Tip};
+use zns_verify::{pallas, Action, Memo, NameNote, PrimeField, Tip};
 
 use super::anchor_lineage::{Adoption, Lineage, Position, Retirement, TxAnchorFacts};
 use super::nf::AnchorNf;
 use super::notes;
 use super::{Event, Registration};
 
-/// One parse-gated candidate: a relaxed registry output whose memo parses as
-/// a name note. Parsed once at triage; every stage reads this form.
+/// One authenticated candidate: a relaxed registry output whose memo
+/// decodes to a name note that binds to its published commitment, is
+/// zero-valued, and is addressed to the registry — the mint's
+/// `decrypt_name_notes` gates. Parsed and verified once at triage; every
+/// stage reads this form. Flattened from the scan tuple so the admission
+/// boundary is constructible in tests.
 struct Candidate<'a> {
-    output: &'a RelaxedIronwoodOutput,
+    action_index: usize,
+    /// The candidate action's revealed nullifier — raw until the lifecycle
+    /// PR types the tip family.
+    action_nullifier: [u8; 32],
     txid: [u8; 32],
+    tx_index: u32,
     memo: &'a [u8],
     note: NameNote<'a>,
+    /// The published commitment the binding was verified against.
+    cand_cmx: [u8; 32],
+    /// The decrypted note: the source of the admission nullifier.
+    note_orchard: Note,
+    /// The verified opening of the ZNS binding.
+    psi: pallas::Base,
+    rcm: pallas::Scalar,
 }
 
 impl Candidate<'_> {
@@ -74,6 +89,20 @@ pub(crate) fn install_registry_config(
 /// considered first (WP §6.3). All inside one transaction, so readers see
 /// pre-batch or post-batch state, never partial. The connection lock makes
 /// this the sole mutator; tip reads and writes share the transaction.
+/// One triage survivor, pre-verification: everything `Candidate` needs
+/// except the parse, which borrows the per-block memo arena.
+struct Source<'a> {
+    action_index: usize,
+    action_nullifier: [u8; 32],
+    cand_note: Note,
+    cand_cmx: [u8; 32],
+    memo: &'a [u8],
+    txid: [u8; 32],
+    tx_index: u32,
+    psi: pallas::Base,
+    rcm: pallas::Scalar,
+}
+
 pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
@@ -94,44 +123,76 @@ pub(crate) fn apply_batch(
     for block in transactions.chunk_by(|a, b| a.height == b.height) {
         let height = u32::from(block[0].height);
 
-        // Triage: the cheap gates. Each surviving memo is parked in a
-        // per-block arena and parsed exactly once; candidates borrow the
-        // parsed form.
+        // Triage: the candidate lane. The gates are the mint's
+        // `decrypt_name_notes`, so the accept-path count is mint-exact: the
+        // memo decodes to a NameNote, binds to the published commitment, is
+        // zero-valued, and is addressed to the registry. Candidate
+        // authenticity is the recipient and binding gates — `is_sent` is
+        // merged lane routing, not a signal: third-party gifts and mint
+        // self-sends are both candidates. Each survivor's memo is parsed
+        // and verified once, into a per-block arena the candidates borrow.
+        let registry_recipient = fvk.to_ivk(Scope::External).address_at(0u32);
         let mut memos: Vec<Memo> = Vec::new();
-        let mut sources: Vec<(&RelaxedIronwoodOutput, [u8; 32])> = Vec::new();
+        let mut sources: Vec<Source> = Vec::new();
         for tx in block {
             let txid = *tx.txid.as_ref();
+            let tx_index = tx.tx_index;
             for output in &tx.relaxed_ironwood_outputs {
-                let (_, _, _, memo, is_sent) = output;
+                let (action_index, cand_note, action_nullifier, memo, _) = output;
 
-                // Gate: a name note exists only as a mint self-send.
-                if !is_sent {
-                    continue;
-                }
                 let Some(memo) = memo else {
                     continue;
                 };
                 let Ok(zns_memo) = Memo::from_bytes(memo) else {
                     continue;
                 };
+                // Gate: protocol parse. The kernel's structural rules are the
+                // authority — invalid statements never become candidates.
+                let Ok(note) = NameNote::parse(&zns_memo) else {
+                    continue;
+                };
+                // Gate: binding — the transition, hashed under the ZNS
+                // binding, must reproduce the published cmx.
+                let Some((psi, rcm)) =
+                    notes::verify_commitment(&note, cand_note.note(), &cand_note.cmx().to_bytes())
+                else {
+                    continue;
+                };
+                // Gate: shape — zero value, registry recipient.
+                if cand_note.note().value().inner() != 0
+                    || cand_note.note().recipient() != registry_recipient
+                {
+                    continue;
+                }
 
                 memos.push(zns_memo);
-                sources.push((output, txid));
+                sources.push(Source {
+                    action_index: *action_index,
+                    action_nullifier: action_nullifier.to_bytes(),
+                    cand_note: *cand_note.note(),
+                    cand_cmx: cand_note.cmx().to_bytes(),
+                    memo: memo.as_slice(),
+                    txid,
+                    tx_index,
+                    psi,
+                    rcm,
+                });
             }
         }
         let mut candidates: Vec<Candidate> = memos
             .iter()
             .zip(&sources)
-            .filter_map(|(memo, (output, txid))| {
-                // Gate: protocol parse. The kernel's structural rules are the
-                // authority — invalid statements never become candidates.
-                let note = NameNote::parse(memo).ok()?;
-                Some(Candidate {
-                    output,
-                    txid: *txid,
-                    memo: output.3.as_ref()?.as_slice(),
-                    note,
-                })
+            .map(|(memo, src)| Candidate {
+                action_index: src.action_index,
+                action_nullifier: src.action_nullifier,
+                txid: src.txid,
+                tx_index: src.tx_index,
+                memo: src.memo,
+                note: NameNote::parse(memo).expect("arena memo parsed at triage"),
+                cand_cmx: src.cand_cmx,
+                note_orchard: src.cand_note,
+                psi: src.psi,
+                rcm: src.rcm,
             })
             .collect();
 
@@ -243,7 +304,6 @@ pub(crate) fn apply_batch(
             });
 
             for candidate in release_first.into_iter().chain(rest) {
-                let cand = candidate.output.1;
                 let note = &candidate.note;
                 let ua = note.ua().as_str().to_string();
                 // A release carries no expiry; the row records the canonical
@@ -260,12 +320,9 @@ pub(crate) fn apply_batch(
                     continue;
                 };
 
-                // Gate: binding — the kernel recomputes the commitment from
-                // the transition fields and demands equality with the
-                // published cmx.
-                let Some((psi, rcm)) = notes::verify_commitment(note, candidate.output) else {
-                    continue;
-                };
+                // Gate: binding — verified at triage; the opening is carried.
+                let psi = candidate.psi;
+                let rcm = candidate.rcm;
 
                 // Gate: law context — the candidate is judged against the
                 // lineage its own transaction was judged against.
@@ -286,7 +343,7 @@ pub(crate) fn apply_batch(
                 // transaction, by the claim's own action; no live name note
                 // spent; a zero-value successor created; the name free
                 // (already enforced by the chain rule).
-                let consumed = AnchorNf::from_scan(candidate.output.2);
+                let consumed = AnchorNf::from_bytes(&candidate.action_nullifier);
                 let spent_a_live_name = tx_facts
                     .retirements
                     .iter()
@@ -299,16 +356,16 @@ pub(crate) fn apply_batch(
                             && tx_facts.adoptions.len() == 1
                     }
                     Action::Update => {
-                        binding.is_some_and(|b| b.1 == candidate.output.2.to_bytes())
+                        binding.is_some_and(|b| b.1 == candidate.action_nullifier)
                             && !snapshot.touches_live_anchor(tx_facts)
                     }
                     Action::Release => {
                         !snapshot.touches_live_anchor(tx_facts)
-                            && (binding.is_some_and(|b| b.1 == candidate.output.2.to_bytes())
+                            && (binding.is_some_and(|b| b.1 == candidate.action_nullifier)
                                 || spends_same_block_update(
                                     group,
                                     start,
-                                    candidate.output.2.to_bytes(),
+                                    candidate.action_nullifier,
                                     fvk,
                                 ))
                     }
@@ -318,8 +375,8 @@ pub(crate) fn apply_batch(
                 }
 
                 // Derived at admission, revealed at consumption.
-                let Some(nullifier) = cand
-                    .note()
+                let Some(nullifier) = candidate
+                    .note_orchard
                     .zns_nullifier(fvk, NoteCommitTrapdoor::from_inner(rcm), psi)
                     .map(|n| n.to_bytes())
                 else {
@@ -328,7 +385,7 @@ pub(crate) fn apply_batch(
 
                 let rcm_repr = rcm.to_repr();
                 let psi_repr = psi.to_repr();
-                let cmx = cand.cmx().to_bytes();
+                let cmx = candidate.cand_cmx;
 
                 record_admission(
                     &db_tx,
@@ -344,7 +401,7 @@ pub(crate) fn apply_batch(
                         cmx: cmx.as_slice(),
                         nullifier: nullifier.as_slice(),
                         txid: candidate.txid.as_slice(),
-                        action_index: candidate.output.0 as i64,
+                        action_index: candidate.action_index as i64,
                         memo: candidate.memo,
                     },
                 )?;
@@ -561,17 +618,15 @@ fn spends_same_block_update(
     candidates.iter().any(|candidate| {
         matches!(candidate.note, NameNote::Update { .. })
             && candidate.note.prev_rcm().map(|p| *p.as_bytes()) == Some(start_tip.rcm)
-            && candidate.output.2.to_bytes() == start_nf
-            && notes::verify_commitment(&candidate.note, candidate.output)
-                .and_then(|(psi, rcm)| {
-                    candidate
-                        .output
-                        .1
-                        .note()
-                        .zns_nullifier(fvk, NoteCommitTrapdoor::from_inner(rcm), psi)
-                        .map(|n| n.to_bytes())
-                })
-                .is_some_and(|nf| nf == consumed)
+            && candidate.action_nullifier == start_nf
+            && candidate
+                .note_orchard
+                .zns_nullifier(
+                    fvk,
+                    NoteCommitTrapdoor::from_inner(candidate.rcm),
+                    candidate.psi,
+                )
+                .is_some_and(|nf| nf.to_bytes() == consumed)
     })
 }
 
