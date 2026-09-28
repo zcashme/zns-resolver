@@ -82,18 +82,25 @@ pub(crate) fn apply_batch(
     let mut pending_tips: HashMap<String, (Tip, [u8; 32])> = HashMap::new();
     let db_tx = conn.unchecked_transaction()?;
 
-    // Persist received ironwood nullifiers.
+    // Persist received ironwood nullifiers — the anchor-lane facts, with
+    // the canonical position each fact occupies in the chain order.
     for tx_data in transactions {
-        let txid = *tx_data.txid.as_ref();
         let height = u32::from(tx_data.height);
+        let tx_index = tx_data.tx_index;
         for output in &tx_data.ironwood_outputs {
             if !output.is_sent {
                 if let Some(nf) = output.nf {
                     let nf = AnchorNf::from_scan(nf);
                     db_tx.execute(
-                        "INSERT OR IGNORE INTO watched_ironwood_notes (nullifier, txid, height, spent_height)
-                         VALUES (?1, ?2, ?3, NULL)",
-                        params![nf.as_bytes().as_slice(), txid.as_slice(), height as i64],
+                        "INSERT OR IGNORE INTO anchor_facts (nullifier, value, height, tx_index, action_index, spent_height)
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                        params![
+                            nf.as_bytes().as_slice(),
+                            output.note.value().inner() as i64,
+                            height as i64,
+                            tx_index as i64,
+                            output.index as i64,
+                        ],
                     )?;
                 }
             }
@@ -105,12 +112,18 @@ pub(crate) fn apply_batch(
     // spend.
     for tx_data in transactions {
         let height = u32::from(tx_data.height);
+        let tx_index = tx_data.tx_index;
         for spend in &tx_data.ironwood_spends {
             let nf = AnchorNf::from_scan(spend.nf);
             db_tx.execute(
-                "UPDATE watched_ironwood_notes SET spent_height = ?1
-                 WHERE nullifier = ?2 AND spent_height IS NULL",
-                params![height as i64, nf.as_bytes().as_slice()],
+                "UPDATE anchor_facts SET spent_height = ?1, spent_tx_index = ?2, spent_action_index = ?3
+                 WHERE nullifier = ?4 AND spent_height IS NULL",
+                params![
+                    height as i64,
+                    tx_index as i64,
+                    spend.index as i64,
+                    nf.as_bytes().as_slice()
+                ],
             )?;
         }
     }
@@ -385,11 +398,13 @@ pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
         params![fork_height as i64],
     )?;
     tx.execute(
-        "DELETE FROM watched_ironwood_notes WHERE height > ?1",
+        "DELETE FROM anchor_facts WHERE height > ?1",
         params![fork_height as i64],
     )?;
     tx.execute(
-        "UPDATE watched_ironwood_notes SET spent_height = NULL WHERE spent_height > ?1",
+        "UPDATE anchor_facts
+         SET spent_height = NULL, spent_tx_index = NULL, spent_action_index = NULL
+         WHERE spent_height > ?1",
         params![fork_height as i64],
     )?;
 
@@ -472,7 +487,7 @@ pub(crate) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Cursor>> 
 /// unspent watched ironwood notes plus every admitted name's nullifier.
 pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<AnchorNf>> {
     let mut statement = conn.prepare(
-        "SELECT nullifier FROM watched_ironwood_notes WHERE spent_height IS NULL
+        "SELECT nullifier FROM anchor_facts WHERE spent_height IS NULL
          UNION
          SELECT nullifier FROM names",
     )?;
@@ -821,9 +836,9 @@ mod tests {
         .unwrap();
         insert_checkpoint(&conn, 42, 7);
         conn.execute(
-            "INSERT INTO watched_ironwood_notes (nullifier, txid, height, spent_height)
-             VALUES (?1, ?2, 42, NULL)",
-            params![vec![1u8; 32], vec![2u8; 32]],
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, spent_height)
+             VALUES (?1, 0, 42, 0, 0, NULL)",
+            params![vec![1u8; 32]],
         )
         .unwrap();
 
@@ -833,7 +848,7 @@ mod tests {
         assert!(position.is_none()); // NULL hash: the next apply fixes it; a
                                      // restart meanwhile rescans from the birthday.
         let watched: u64 = conn
-            .query_row("SELECT COUNT(*) FROM watched_ironwood_notes", [], |row| {
+            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| {
                 row.get(0)
             })
             .unwrap();

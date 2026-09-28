@@ -54,11 +54,15 @@ CREATE TABLE IF NOT EXISTS names (
     memo         BLOB    NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS watched_ironwood_notes (
-    nullifier    BLOB    NOT NULL PRIMARY KEY,
-    txid         BLOB    NOT NULL,
-    height       INTEGER NOT NULL,
-    spent_height INTEGER
+CREATE TABLE IF NOT EXISTS anchor_facts (
+    nullifier          BLOB    NOT NULL PRIMARY KEY,
+    value              INTEGER NOT NULL,
+    height             INTEGER NOT NULL,
+    tx_index           INTEGER NOT NULL,
+    action_index       INTEGER NOT NULL,
+    spent_height       INTEGER,
+    spent_tx_index     INTEGER,
+    spent_action_index INTEGER
 );
 
 "#;
