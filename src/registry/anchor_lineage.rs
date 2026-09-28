@@ -5,8 +5,8 @@
 //! (`zns-mint` `AnchorPool` / `apply_block`): zero-value registry outputs
 //! adopt in canonical order while below standing size; a revealed
 //! nullifier retires whatever the rest of its transaction turned out to
-//! be; a transaction that created exactly one zero-value registry output
-//! joins that successor one-for-one, past standing size.
+//! be; a successor joins one-for-one, past standing size, only when
+//! exactly one live anchor retired.
 //!
 //! Because the fold is a pure function of facts, reorg correctness is
 //! inherited from the fact tables' rewind semantics: folding the facts
@@ -85,10 +85,18 @@ impl Lineage {
                 self.live.insert(adoption.nf);
             }
         }
+
+        let mut retired = 0;
         for retirement in &facts.retirements {
-            self.live.remove(&retirement.nf);
+            if self.live.remove(&retirement.nf) {
+                retired += 1;
+            }
         }
-        if facts.has_single_name_note && facts.has_successor() {
+
+        // One-for-one, mirroring the mint's retire_spent: a successor
+        // takes a seat only when exactly one live anchor retired —
+        // authority cannot be minted, only succeeded.
+        if retired == 1 && facts.has_single_name_note && facts.has_successor() {
             self.live.insert(facts.adoptions[0].nf);
         }
     }
@@ -255,6 +263,33 @@ mod tests {
         assert_eq!(lineage.len(), before);
         assert!(lineage.contains(&nf(200)));
         assert!(!lineage.contains(&nf(7)));
+    }
+
+    /// A successor-shaped output with no live anchor retired behind it
+    /// adopts nothing at standing size — the fold's mirror of the mint's
+    /// fix (zns-mint #233): authority cannot be minted, only succeeded.
+    /// (Below standing size the ceremony-filling loop adopts any
+    /// zero-value output, exactly as the mint's adopt_anchor does — the
+    /// gate governs the steady state.)
+    #[test]
+    fn unbacked_successor_adopts_nothing() {
+        let mut lineage = Lineage::new();
+        for i in 0..ANCHOR_POOL_SIZE {
+            lineage.step_tx(&TxAnchorFacts {
+                adoptions: vec![adopt(i as u8 + 1)],
+                retirements: vec![],
+                has_single_name_note: false,
+            });
+        }
+        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
+
+        lineage.step_tx(&TxAnchorFacts {
+            adoptions: vec![adopt(50)],
+            retirements: vec![retire(99)], // 99 is not a live anchor
+            has_single_name_note: true,
+        });
+        assert!(!lineage.contains(&nf(50)));
+        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
     }
 
     /// The reorg property: folding the facts that survive a rewind equals

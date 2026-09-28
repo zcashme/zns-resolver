@@ -30,9 +30,11 @@ authority — is a pure function of position-ordered chain facts:
    (`ANCHOR_POOL_SIZE = 40`, mirrors keygen's `NUM_ANCHORS`);
 2. a revealed nullifier **retires** whatever the rest of its transaction
    turned out to be;
-3. a transaction that presented exactly one name-note candidate (the
-   accept path) and created exactly one zero-value output adopts that
-   **successor** one-for-one, past standing size.
+3. a **successor** joins one-for-one, past standing size, only when
+   exactly one live anchor retired — authority cannot be minted, only
+   succeeded (mint lockstep: zns-mint #233). Below standing size the
+   ceremony-filling loop adopts any zero-value output, mirroring the
+   mint's `adopt_anchor`.
 
 `Lineage::step_tx` (`src/registry/anchor_lineage.rs`) folds one
 transaction's facts in exactly that order. It is never persisted: each
