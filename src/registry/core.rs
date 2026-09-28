@@ -1301,6 +1301,68 @@ mod tests {
         assert_eq!(events, 1, "only the pre-release event survives");
     }
 
+    /// A pre-lineage database (version 1: old watch table, no fact tables,
+    /// stale checkpoint) is wiped on open, so the next scan replays from
+    /// the birthday instead of resuming past history it cannot interpret.
+    #[test]
+    fn pre_lineage_database_is_wiped_clean() {
+        // A raw connection: the old-shape database predates the schema
+        // installer entirely (user_version 0, legacy watch table, stale
+        // checkpoint that would otherwise skip the ceremony).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE watched_ironwood_notes (
+                nullifier BLOB NOT NULL PRIMARY KEY,
+                txid BLOB NOT NULL,
+                height INTEGER NOT NULL,
+                spent_height INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE registry_account (
+                id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+                ufvk TEXT NOT NULL,
+                network TEXT NOT NULL,
+                birthday INTEGER NOT NULL,
+                sync_height INTEGER,
+                sync_hash BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
+        insert_checkpoint(&conn, 42, 7);
+
+        crate::registry::storage::install_schema(&conn).unwrap();
+
+        let watched = conn.query_row("SELECT COUNT(*) FROM watched_ironwood_notes", [], |r| {
+            r.get::<_, i64>(0)
+        });
+        assert!(
+            watched.is_err(),
+            "the legacy table is dropped, not merely emptied"
+        );
+        let position: Option<i64> = conn
+            .query_row("SELECT sync_height FROM registry_account", [], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert!(position.is_none(), "the stale checkpoint is wiped");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let facts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(facts, 0);
+    }
+
     fn insert_checkpoint(conn: &Connection, height: u32, hash_byte: u8) {
         conn.execute(
             "UPDATE registry_account SET sync_height = ?1, sync_hash = ?2 WHERE id = 0",

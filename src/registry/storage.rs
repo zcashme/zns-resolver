@@ -1,8 +1,11 @@
 //! Durable representation of the ZNS name index.
 
+use rusqlite::Connection;
+
 /// The SQL to create the name index tables (and supporting state).
 /// Run once by the writer connection at startup.
 pub(crate) const SCHEMA_SQL: &str = r#"
+PRAGMA user_version = 2;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;
@@ -79,3 +82,24 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
 );
 
 "#;
+
+/// Installs the schema, wiping pre-lineage databases. A database written
+/// before the anchor-fact tables cannot be upgraded in place: the old
+/// watch table lacks value and canonical-position data, and its names
+/// rows lack tx_index. The version gate drops everything and reinstalls,
+/// so the next open rescans from the configured birthday.
+pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::params;
+    let version: i64 = conn.query_row("PRAGMA user_version", params![], |r| r.get(0))?;
+    if version < 2 {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS registry_account;
+             DROP TABLE IF EXISTS name_events;
+             DROP TABLE IF EXISTS names;
+             DROP TABLE IF EXISTS watched_ironwood_notes;
+             DROP TABLE IF EXISTS anchor_facts;
+             DROP TABLE IF EXISTS implicit_releases;",
+        )?;
+    }
+    conn.execute_batch(SCHEMA_SQL)
+}
