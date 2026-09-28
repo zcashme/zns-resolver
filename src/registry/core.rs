@@ -51,26 +51,12 @@ pub(crate) fn install_registry_config(
     Ok(())
 }
 
-/// The main write path.
-///
-/// Runs in one transaction, in two layers. Bookkeeping records chain facts
-/// — received and spent nullifiers of the watch set; a registration ends
-/// only through an accepted release, never through a raw spend. Derivation
-/// considers each block's parse-gated candidates per name — a release
-/// disclosing the block-start accepted rcm is considered before the updates
-/// competing over it (WP §6.3) — through the chain rule, the binding
-/// verification, and the consumption proof: every accepted action spends a
-/// mint-owned note, except claims, which await the mint's anchor note.
-/// Verified values are written immediately — the event row and the per-name
-/// tip row — with the raw memo stored alongside. Tips are recorded in
-/// `pending_tips` so a later note for the same name in the same batch sees
-/// the updated tip.
-///
-/// Readers see either the pre-batch or post-batch state — never partial
-/// (WAL snapshot isolation + atomic commit).
-///
-/// SAFETY (TOCTOU on the tip): the tip reads and the writes run inside the
-/// same serialized call. No other DB operation can interleave.
+/// The main write path: bookkeeping first (received and spent ironwood
+/// nullifiers), then per-name candidate admission — chain rule, commitment
+/// binding, consumption proof; a release disclosing the block-start rcm is
+/// considered first (WP §6.3). All inside one transaction, so readers see
+/// pre-batch or post-batch state, never partial. The connection lock makes
+/// this the sole mutator; tip reads and writes share the transaction.
 pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
@@ -602,10 +588,8 @@ fn registry_config(conn: &Connection) -> rusqlite::Result<Option<(String, String
     .optional()
 }
 
-/// Plain `SELECT` of a name's live state — the tip plus the stored nullifier
-/// (for the consumption link). No transaction: used by `apply_batch` Phase 1.
-/// Safe alongside the Phase 2 tx because the serialized execution inside the
-/// Registry impl is the sole mutator.
+/// Plain `SELECT` of a name's live state — the tip plus the stored nullifier.
+/// Runs outside the batch transaction, before its writes open.
 fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<(Tip, [u8; 32])>> {
     conn.query_row(
         "SELECT action, rcm, nullifier FROM names WHERE name = ?1",
