@@ -5,7 +5,7 @@ use rusqlite::Connection;
 /// The SQL to create the name index tables (and supporting state).
 /// Run once by the writer connection at startup.
 pub(crate) const SCHEMA_SQL: &str = r#"
-PRAGMA user_version = 2;
+PRAGMA user_version = 1;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;
@@ -87,7 +87,9 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
 /// before the anchor-fact tables cannot be upgraded in place: the old
 /// watch table lacks value and canonical-position data, and its names
 /// rows lack tx_index. The version gate drops everything and reinstalls,
-/// so the next open rescans from the configured birthday.
+/// so the next open rescans from the configured birthday. There is no
+/// version 1 in the wild — the first versioned schema is 1, and every
+/// database that exists reads 0 (never versioned) until this runs.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::params;
     let version: i64 = conn.query_row("PRAGMA user_version", params![], |r| r.get(0))?;

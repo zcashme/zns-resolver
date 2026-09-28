@@ -1001,7 +1001,8 @@ fn registry_config(conn: &Connection) -> rusqlite::Result<Option<(String, String
 }
 
 /// Plain `SELECT` of a name's live state — the tip plus the stored nullifier.
-/// Runs outside the batch transaction, before its writes open.
+/// Runs inside the batch transaction, so a candidate reads the admissions of
+/// every earlier candidate in the same batch.
 fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<(Tip, [u8; 32])>> {
     conn.query_row(
         "SELECT action, rcm, nullifier FROM names WHERE name = ?1",
@@ -1133,7 +1134,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
 fn corrupt_record() -> rusqlite::Error {
     rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
-        Some("registry record is corrupt: memo and columns disagree".to_string()),
+        Some("registry record is corrupt".to_string()),
     )
 }
 
@@ -1356,7 +1357,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 1);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
