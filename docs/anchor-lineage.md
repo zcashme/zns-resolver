@@ -74,10 +74,15 @@ every event. Two implementations, one executable contract.
 
 ## Known residue
 
-- A spent tip with no admissible successor still keeps its binding here,
-  while the mint frees the name — lifecycle parity is PR #2.
+- Implicit releases (a consumed tip without a valid successor; a spent
+  foreign tip) land in the `implicit_releases` ledger rather than the
+  event log — no memo, so the read-time memo-parse invariant stands.
+  Surfacing them through the API is PR #2's remainder.
 - The claim law lives in two repos by copy-paste (pinned by the fixture).
   The endgame is one law as a `zns-verify` kernel consumed by both.
+- Clock checks (term expiry, liveness) are mint-side only — a clock-stale
+  transition is admitted here when the mint would free the name. That is
+  the M8 divergence, tracked separately.
 - The mint's `retire_spent` adopts a rejected claim's successor into its
   pool (facts first). The fold reproduces this only for accepted-shape
   transactions; the poisoned entries are inert (attacker notes can never

@@ -35,7 +35,7 @@ pub(crate) fn verify_commitment(
     verify_name_note_with_witness(note, g_d, pk_d, value, rho, cmx)
 }
 
-fn diversify_hash(diversifier: &[u8; 11]) -> [u8; 32] {
+pub(crate) fn diversify_hash(diversifier: &[u8; 11]) -> [u8; 32] {
     let hash = pallas::Point::hash_to_curve("z.cash:Orchard-gd");
     let point = hash(diversifier);
     if bool::from(point.is_identity()) {

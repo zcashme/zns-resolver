@@ -316,6 +316,7 @@ mod canon {
 
     #[derive(Deserialize)]
     struct Scenario {
+        name: String,
         events: Vec<CanonEvent>,
         trace: Vec<Trace>,
     }
@@ -392,6 +393,23 @@ mod canon {
         assert_eq!(fixture.version, "canon-vectors-v1");
         // The fixture pins the standing size across repos.
         assert_eq!(fixture.anchor_pool_size, ANCHOR_POOL_SIZE);
+
+        // The exact scenario set — a count alone would let a fixture edit
+        // silently drop the security regression vector.
+        let mut names: Vec<&str> = fixture.scenarios.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "backed_claim",
+                "ceremony_fill",
+                "claim_after_release",
+                "duplicate_claim",
+                "reorg",
+                "unbacked_claim",
+                "update_then_release",
+            ]
+        );
         assert_eq!(fixture.scenarios.len(), 7);
 
         for scenario in &fixture.scenarios {

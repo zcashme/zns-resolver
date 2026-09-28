@@ -9,8 +9,9 @@ use orchard::note::Nullifier;
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
 use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
+use zcash_address::unified::Encoding as _;
 use zcash_primitives::block::BlockHash;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, Parameters as _};
 use zns_verify::{pallas, Action, Memo, NameNote, PrimeField, Tip};
 
 use super::anchor_lineage::{Adoption, Lineage, Position, Retirement, TxAnchorFacts};
@@ -161,6 +162,15 @@ pub(crate) fn apply_batch(
                 if cand_note.note().value().inner() != 0
                     || cand_note.note().recipient() != registry_recipient
                 {
+                    continue;
+                }
+                // Gate: the bound UA must decode as a Unified Address on this
+                // network (restores 304193b, lost in the #27 refactor).
+                let ua = note.ua().as_str();
+                let Some((ua_network, _)) = zcash_address::unified::Address::decode(ua).ok() else {
+                    continue;
+                };
+                if ua_network != crate::NETWORK.network_type() {
                     continue;
                 }
 
@@ -432,8 +442,18 @@ fn apply_candidates(
         };
 
         // Gate: accept path — the mint offers exactly-one-candidate
-        // transactions to the law; everything else is follow_spends.
+        // transactions to the law; everything else is follow_spends, and
+        // follow_spends ends the binding of every live name the transaction
+        // spent.
         if !tx_facts.has_single_name_note {
+            mark_released_spent(
+                db_tx,
+                live_names,
+                tx_facts,
+                height,
+                &candidate.txid,
+                candidate.action_index,
+            )?;
             continue;
         }
 
@@ -1176,5 +1196,401 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(watched, 0);
+    }
+}
+
+#[cfg(test)]
+mod admission {
+    use super::*;
+    use crate::registry::storage::SCHEMA_SQL;
+    use orchard::keys::SpendingKey;
+    use orchard::note::NoteVersion;
+    use zcash_address::unified;
+    use zcash_protocol::consensus::NetworkType;
+    use zns_verify::zns_psi_rcm;
+
+    const RAW_ADDR: [u8; 43] = [
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    fn fvk() -> FullViewingKey {
+        FullViewingKey::from(&SpendingKey::from_bytes([7u8; 32]).expect("spending key"))
+    }
+
+    /// An orchard-only unified address for the active network.
+    fn test_ua() -> String {
+        let network = if cfg!(feature = "testnet") {
+            NetworkType::Test
+        } else {
+            NetworkType::Main
+        };
+        unified::Address::try_from_items(vec![unified::Receiver::Orchard([0x03; 43])])
+            .expect("orchard-only UA")
+            .encode(&network)
+    }
+
+    fn memo_for(action: &str, name: &str, prev: &[u8; 32]) -> Memo {
+        Memo::from_bytes(format!("ZNS:{action}:{name}:{}:none:{}", test_ua(), hex(prev)).as_bytes())
+            .expect("memo")
+    }
+
+    fn hex(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn nf(seed: u8) -> AnchorNf {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        AnchorNf::from_bytes(&bytes)
+    }
+
+    /// A zero-value note addressed to the test recipient.
+    fn test_note() -> Note {
+        use orchard::note::{RandomSeed, Rho};
+        use orchard::value::NoteValue;
+        let recipient = orchard::Address::from_raw_address_bytes(&RAW_ADDR)
+            .into_option()
+            .expect("address");
+        let rho = Rho::from_bytes(&[9u8; 32]).into_option().expect("rho");
+        let rseed = RandomSeed::from_bytes([4u8; 32], &rho)
+            .into_option()
+            .expect("rseed");
+        Note::from_parts(recipient, NoteValue::ZERO, rho, rseed, NoteVersion::V3)
+            .into_option()
+            .expect("note")
+    }
+
+    /// Builds a verified candidate the same way triage does.
+    #[allow(clippy::too_many_arguments)] // a fixture; grouping the args hides the shape
+    fn candidate<'a>(
+        memos: &'a [Memo],
+        i: usize,
+        tx_index: u32,
+        action_index: usize,
+        txid: [u8; 32],
+        action: &str,
+        name: &str,
+        action_nullifier: [u8; 32],
+        prev: [u8; 32],
+    ) -> Candidate<'a> {
+        let ua = test_ua();
+        let stored = &memos[i];
+        let note = NameNote::parse(stored).expect("parsed");
+        let memo_bytes = stored.text().expect("memo is utf-8").as_bytes();
+
+        let rho = zns_verify::Rho::from_bytes(&[9u8; 32]).expect("rho");
+        let (psi, rcm) = zns_psi_rcm(
+            action.as_bytes(),
+            name.as_bytes(),
+            ua.as_bytes(),
+            b"none",
+            &prev,
+        );
+        let diversifier: [u8; 11] = RAW_ADDR[..11].try_into().expect("diversifier");
+        let g_d = notes::diversify_hash(&diversifier);
+        let pk_d: [u8; 32] = RAW_ADDR[11..].try_into().expect("pk_d");
+        let cmx = zns_verify::note_commitment_cmx(g_d, pk_d, 0, rho, psi, rcm).expect("commitment");
+
+        Candidate {
+            action_index,
+            action_nullifier,
+            txid,
+            tx_index,
+            memo: memo_bytes,
+            note,
+            cand_cmx: cmx.to_bytes(),
+            note_orchard: test_note(),
+            psi,
+            rcm,
+        }
+    }
+
+    fn tx_law_for(
+        txid: [u8; 32],
+        snapshot: Lineage,
+        adoptions: Vec<Adoption>,
+        retirements: Vec<Retirement>,
+        has_single_name_note: bool,
+    ) -> ([u8; 32], (Lineage, TxAnchorFacts)) {
+        (
+            txid,
+            (
+                snapshot,
+                TxAnchorFacts {
+                    adoptions,
+                    retirements,
+                    has_single_name_note,
+                },
+            ),
+        )
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn
+    }
+
+    #[test]
+    fn backed_claim_binds_the_name() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let mut candidates = vec![candidate(
+            &memos,
+            0,
+            0,
+            0,
+            [1; 32],
+            "claim",
+            "alice",
+            *nf(1).as_bytes(),
+            [0u8; 32],
+        )];
+        let snapshot = Lineage::new();
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = HashMap::from([tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![Adoption { nf: nf(200) }],
+            vec![Retirement { nf: nf(1) }],
+            true,
+        )]);
+        let mut live_names: HashSet<[u8; 32]> = HashSet::new();
+        let mut lineage = seeded;
+        let _ = snapshot;
+
+        // the fold already consumed the block's facts before admission
+        lineage.step_tx(&tx_law[&[1; 32]].1);
+
+        apply_candidates(&tx, 100, &mut candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+    }
+
+    #[test]
+    fn unbacked_claim_is_rejected_without_state_change() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let mut candidates = vec![candidate(
+            &memos, 0, 0, 0, [1; 32], "claim", "alice", [9; 32], // not a live anchor
+            [0u8; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = HashMap::from([tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&[9; 32]),
+            }],
+            true,
+        )]);
+        let mut live_names = HashSet::new();
+        let mut lineage = seeded;
+        lineage.step_tx(&tx_law[&[1; 32]].1);
+
+        apply_candidates(&tx, 100, &mut candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+    }
+
+    /// Review finding 1, the flagged shape: a claim whose transaction spends
+    /// another name's live tip. The mint's mark_released ends that binding
+    /// and the claim is rejected.
+    #[test]
+    fn claim_spending_a_live_name_tip_ends_that_binding() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        // "z" is live, its tip nullifier is 0x5a…
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        let memos = vec![memo_for("claim", "a", &[0u8; 32])];
+        let mut candidates = vec![candidate(
+            &memos, 0, 0, 0, [1; 32], "claim", "a",
+            [0x5a; 32], // the claim action spends z's tip
+            [0u8; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = HashMap::from([tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&[0x5a; 32]),
+            }],
+            true,
+        )]);
+        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut lineage = seeded;
+        lineage.step_tx(&tx_law[&[1; 32]].1);
+
+        apply_candidates(&tx, 100, &mut candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        // z's binding ended; the claim did not land.
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+        let (rel_name, rel_nf): (String, Vec<u8>) = tx
+            .query_row("SELECT name, nullifier FROM implicit_releases", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(rel_name, "z");
+        assert_eq!(rel_nf, vec![0x5a; 32]);
+    }
+
+    /// The update-then-release shape in canonical order: the update lands,
+    /// and a stale-predecessor release ends the binding (the mint's
+    /// release_predecessor) — the ordering the release-first partition used
+    /// to emulate.
+    #[test]
+    fn update_then_stale_release_ends_the_binding() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        // "z" is live with tip nullifier 0x5a and commitment rcm 0x02.
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        // tx 1: the update consumes the tip. tx 2: the release consumes the
+        // update's tip but discloses the stale predecessor.
+        let memos = vec![
+            memo_for("update", "z", &[0x02; 32]),
+            memo_for("release", "z", &[0x02; 32]),
+        ];
+        let update = candidate(
+            &memos, 0, 0, 0, [1; 32], "update", "z", [0x5a; 32], [0x02; 32],
+        );
+        let release = candidate(
+            &memos, 1, 0, 0, [2; 32], "release", "z", [9; 32], [0x02; 32],
+        );
+        let nullifier_u = admit_nullifier(&update, &fvk).expect("update nullifier");
+
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = HashMap::from([
+            tx_law_for(
+                [1; 32],
+                seeded.clone(),
+                vec![],
+                vec![Retirement {
+                    nf: AnchorNf::from_bytes(&[0x5a; 32]),
+                }],
+                true,
+            ),
+            tx_law_for(
+                [2; 32],
+                seeded.clone(),
+                vec![],
+                vec![Retirement {
+                    nf: AnchorNf::from_bytes(&nullifier_u),
+                }],
+                true,
+            ),
+        ]);
+
+        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut lineage = seeded;
+        lineage.step_tx(&tx_law[&[1; 32]].1);
+        lineage.step_tx(&tx_law[&[2; 32]].1);
+
+        let mut candidates = vec![update, release];
+        apply_candidates(&tx, 100, &mut candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        // The update admitted; the stale release ended the binding.
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
+        let (rel_name, rel_nf): (String, Vec<u8>) = tx
+            .query_row("SELECT name, nullifier FROM implicit_releases", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(rel_name, "z");
+        assert_eq!(rel_nf, nullifier_u);
+    }
+
+    /// A transaction with two candidates takes follow_spends: nothing is
+    /// admitted, and spent live names end their bindings.
+    #[test]
+    fn multi_candidate_tx_takes_follow_spends() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        let memos = vec![
+            memo_for("claim", "a", &[0u8; 32]),
+            memo_for("claim", "b", &[0u8; 32]),
+        ];
+        let mut candidates = vec![
+            candidate(
+                &memos, 0, 0, 0, [1; 32], "claim", "a", [0x5a; 32], [0u8; 32],
+            ),
+            candidate(
+                &memos, 1, 0, 1, [1; 32], "claim", "b", [0x5a; 32], [0u8; 32],
+            ),
+        ];
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = HashMap::from([tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&[0x5a; 32]),
+            }],
+            false, // two candidates: follow_spends
+        )]);
+        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut lineage = seeded;
+        lineage.step_tx(&tx_law[&[1; 32]].1);
+
+        apply_candidates(&tx, 100, &mut candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
+    }
+
+    fn seeded_lineage(anchors: &[u8]) -> Lineage {
+        let mut lineage = Lineage::new();
+        for seed in anchors {
+            lineage.step_tx(&TxAnchorFacts {
+                adoptions: vec![Adoption { nf: nf(*seed) }],
+                retirements: vec![],
+                has_single_name_note: false,
+            });
+        }
+        lineage
     }
 }
