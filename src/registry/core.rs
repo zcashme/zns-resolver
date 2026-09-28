@@ -13,6 +13,7 @@ use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
 use zns_verify::{Action, Memo, NameNote, PrimeField, Tip};
 
+use super::nf::AnchorNf;
 use super::notes;
 use super::{Event, Registration};
 
@@ -88,10 +89,11 @@ pub(crate) fn apply_batch(
         for output in &tx_data.ironwood_outputs {
             if !output.is_sent {
                 if let Some(nf) = output.nf {
+                    let nf = AnchorNf::from_scan(nf);
                     db_tx.execute(
                         "INSERT OR IGNORE INTO watched_ironwood_notes (nullifier, txid, height, spent_height)
                          VALUES (?1, ?2, ?3, NULL)",
-                        params![nf.to_bytes().as_slice(), txid.as_slice(), height as i64],
+                        params![nf.as_bytes().as_slice(), txid.as_slice(), height as i64],
                     )?;
                 }
             }
@@ -104,11 +106,11 @@ pub(crate) fn apply_batch(
     for tx_data in transactions {
         let height = u32::from(tx_data.height);
         for spend in &tx_data.ironwood_spends {
-            let nf_bytes = spend.nf.to_bytes();
+            let nf = AnchorNf::from_scan(spend.nf);
             db_tx.execute(
                 "UPDATE watched_ironwood_notes SET spent_height = ?1
                  WHERE nullifier = ?2 AND spent_height IS NULL",
-                params![height as i64, nf_bytes.as_slice()],
+                params![height as i64, nf.as_bytes().as_slice()],
             )?;
         }
     }
@@ -412,7 +414,7 @@ pub(crate) fn resume(conn: &Connection) -> rusqlite::Result<Resume> {
     let checkpoint = checkpoint(conn)?;
     let ironwood: Vec<Nullifier> = ironwood_nullifiers(conn)?
         .into_iter()
-        .filter_map(|bytes| Option::from(Nullifier::from_bytes(&bytes)))
+        .filter_map(|nf| Option::from(Nullifier::from_bytes(nf.as_bytes())))
         .collect();
     let birthday = birthday(conn)?;
 
@@ -468,7 +470,7 @@ pub(crate) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Cursor>> 
 
 /// The watch-set: every nullifier whose consumption we must detect —
 /// unspent watched ironwood notes plus every admitted name's nullifier.
-pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
+pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<AnchorNf>> {
     let mut statement = conn.prepare(
         "SELECT nullifier FROM watched_ironwood_notes WHERE spent_height IS NULL
          UNION
@@ -476,7 +478,8 @@ pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8
     )?;
     let rows = statement.query_map([], |row| {
         let bytes: Vec<u8> = row.get(0)?;
-        bytes.try_into().map_err(|_| corrupt_record())
+        let nf: [u8; 32] = bytes.try_into().map_err(|_| corrupt_record())?;
+        Ok(AnchorNf::from_bytes(&nf))
     })?;
     rows.collect()
 }

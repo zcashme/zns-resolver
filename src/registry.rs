@@ -7,6 +7,7 @@ use zcash_protocol::consensus::Network;
 use zns_verify::Action;
 
 pub(crate) mod core;
+mod nf;
 mod notes;
 pub(crate) mod storage;
 
