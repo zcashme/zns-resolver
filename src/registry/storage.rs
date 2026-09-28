@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
     height             INTEGER NOT NULL,
     tx_index           INTEGER NOT NULL,
     action_index       INTEGER NOT NULL,
+    name_note_candidates INTEGER NOT NULL,
     spent_height       INTEGER,
     spent_tx_index     INTEGER,
     spent_action_index INTEGER

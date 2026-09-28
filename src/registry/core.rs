@@ -1,6 +1,6 @@
 //! Transactional core of the registry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use orchard::keys::FullViewingKey;
 use orchard::note::NoteCommitTrapdoor;
@@ -13,6 +13,7 @@ use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
 use zns_verify::{Action, Memo, NameNote, PrimeField, Tip};
 
+use super::anchor_lineage::{Adoption, Lineage, Position, Retirement, TxAnchorFacts};
 use super::nf::AnchorNf;
 use super::notes;
 use super::{Event, Registration};
@@ -82,51 +83,11 @@ pub(crate) fn apply_batch(
     let mut pending_tips: HashMap<String, (Tip, [u8; 32])> = HashMap::new();
     let db_tx = conn.unchecked_transaction()?;
 
-    // Persist received ironwood nullifiers — the anchor-lane facts, with
-    // the canonical position each fact occupies in the chain order.
-    for tx_data in transactions {
-        let height = u32::from(tx_data.height);
-        let tx_index = tx_data.tx_index;
-        for output in &tx_data.ironwood_outputs {
-            if !output.is_sent {
-                if let Some(nf) = output.nf {
-                    let nf = AnchorNf::from_scan(nf);
-                    db_tx.execute(
-                        "INSERT OR IGNORE INTO anchor_facts (nullifier, value, height, tx_index, action_index, spent_height)
-                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-                        params![
-                            nf.as_bytes().as_slice(),
-                            output.note.value().inner() as i64,
-                            height as i64,
-                            tx_index as i64,
-                            output.index as i64,
-                        ],
-                    )?;
-                }
-            }
-        }
-    }
+    // The lineage as of the batch start, folded from the stored facts; the
+    // live name nullifiers feed the claim law's no-name-spend condition.
+    let mut lineage = load_lineage(&db_tx)?;
+    let mut live_names: HashSet<[u8; 32]> = live_name_nullifiers(&db_tx)?;
 
-    // Mark spent nullifiers of the watch set — bookkeeping only: a
-    // registration ends through an accepted release, never through a raw
-    // spend.
-    for tx_data in transactions {
-        let height = u32::from(tx_data.height);
-        let tx_index = tx_data.tx_index;
-        for spend in &tx_data.ironwood_spends {
-            let nf = AnchorNf::from_scan(spend.nf);
-            db_tx.execute(
-                "UPDATE anchor_facts SET spent_height = ?1, spent_tx_index = ?2, spent_action_index = ?3
-                 WHERE nullifier = ?4 AND spent_height IS NULL",
-                params![
-                    height as i64,
-                    tx_index as i64,
-                    spend.index as i64,
-                    nf.as_bytes().as_slice()
-                ],
-            )?;
-        }
-    }
     // Derivation: consider each block's candidates per name. A name note
     // references the accepted predecessor and authenticates by consuming
     // mint-owned money; the resolver's only decisions are order and state.
@@ -173,6 +134,85 @@ pub(crate) fn apply_batch(
                 })
             })
             .collect();
+
+        // The accept-path marker per transaction: the mint offers
+        // exactly-one-candidate transactions to the law; every other
+        // transaction is follow_spends.
+        let mut candidate_counts: HashMap<[u8; 32], usize> = HashMap::new();
+        for candidate in &candidates {
+            *candidate_counts.entry(candidate.txid).or_insert(0) += 1;
+        }
+
+        // Bookkeeping: the block's anchor facts land with their canonical
+        // positions and candidate counts.
+        for tx_data in block {
+            let txid = *tx_data.txid.as_ref();
+            let block_height = u32::from(tx_data.height);
+            let tx_index = tx_data.tx_index;
+            let candidate_count = candidate_counts.get(&txid).copied().unwrap_or(0);
+            for output in &tx_data.ironwood_outputs {
+                if !output.is_sent {
+                    if let Some(nf) = output.nf {
+                        let nf = AnchorNf::from_scan(nf);
+                        db_tx.execute(
+                            "INSERT OR IGNORE INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                            params![
+                                nf.as_bytes().as_slice(),
+                                output.note.value().inner() as i64,
+                                block_height as i64,
+                                tx_index as i64,
+                                output.index as i64,
+                                candidate_count as i64,
+                            ],
+                        )?;
+                    }
+                }
+            }
+            for spend in &tx_data.ironwood_spends {
+                let nf = AnchorNf::from_scan(spend.nf);
+                db_tx.execute(
+                    "UPDATE anchor_facts SET spent_height = ?1, spent_tx_index = ?2, spent_action_index = ?3
+                     WHERE nullifier = ?4 AND spent_height IS NULL",
+                    params![
+                        block_height as i64,
+                        tx_index as i64,
+                        spend.index as i64,
+                        nf.as_bytes().as_slice()
+                    ],
+                )?;
+            }
+        }
+
+        // Per-transaction anchor facts and pre-transaction lineage
+        // snapshots, in canonical order: a candidate is judged against the
+        // lineage its own transaction was judged against.
+        let mut txs: Vec<&WalletTx> = block.iter().collect();
+        txs.sort_by_key(|tx| tx.tx_index);
+        let mut tx_law: HashMap<[u8; 32], (Lineage, TxAnchorFacts)> = HashMap::new();
+        for tx in txs {
+            let txid = *tx.txid.as_ref();
+            let facts = TxAnchorFacts {
+                adoptions: tx
+                    .ironwood_outputs
+                    .iter()
+                    .filter(|o| !o.is_sent && o.note.value().inner() == 0)
+                    .filter_map(|o| o.nf.map(AnchorNf::from_scan))
+                    .map(|nf| Adoption { nf })
+                    .collect(),
+                retirements: tx
+                    .ironwood_spends
+                    .iter()
+                    .map(|s| Retirement {
+                        nf: AnchorNf::from_scan(s.nf),
+                    })
+                    .collect(),
+                has_single_name_note: candidate_counts.get(&txid).copied().unwrap_or(0) == 1,
+            };
+            let snapshot = lineage.clone();
+            lineage.step_tx(&facts);
+            tx_law.insert(txid, (snapshot, facts));
+        }
 
         // Grouping: stable sort by name, then the same chunk_by the blocks
         // use — scan order preserved within each name.
@@ -228,17 +268,48 @@ pub(crate) fn apply_batch(
                     continue;
                 };
 
+                // Gate: law context — the candidate is judged against the
+                // lineage its own transaction was judged against.
+                let Some((snapshot, tx_facts)) = tx_law.get(&candidate.txid) else {
+                    continue;
+                };
+
+                // Gate: accept path — the mint offers exactly-one-candidate
+                // transactions to the law; everything else is follow_spends.
+                if !tx_facts.has_single_name_note {
+                    continue;
+                }
+
                 // Gate: auth — the action consumed mint-owned money. A
                 // nullifier is public to compute; only the mint's key can
-                // reveal one on chain. Claims consume nothing yet — the
-                // anchor note is the mint-side piece still missing.
-                let consumed = candidate.output.2.to_bytes();
+                // reveal one on chain. The claim law is the mint's
+                // `accept_claim`: exactly one live anchor spent by this
+                // transaction, by the claim's own action; no live name note
+                // spent; a zero-value successor created; the name free
+                // (already enforced by the chain rule).
+                let consumed = AnchorNf::from_scan(candidate.output.2);
+                let spent_a_live_name = tx_facts
+                    .retirements
+                    .iter()
+                    .any(|r| live_names.contains(r.nf.as_bytes()));
                 let auth = match note.action() {
-                    Action::Claim => true,
-                    Action::Update => binding.is_some_and(|b| b.1 == consumed),
+                    Action::Claim => {
+                        snapshot.contains(&consumed)
+                            && snapshot.live_retirements(tx_facts) == 1
+                            && !spent_a_live_name
+                            && tx_facts.adoptions.len() == 1
+                    }
+                    Action::Update => {
+                        binding.is_some_and(|b| b.1 == candidate.output.2.to_bytes())
+                    }
                     Action::Release => {
-                        binding.is_some_and(|b| b.1 == consumed)
-                            || spends_same_block_update(group, start, consumed, fvk)
+                        binding.is_some_and(|b| b.1 == candidate.output.2.to_bytes())
+                            || spends_same_block_update(
+                                group,
+                                start,
+                                candidate.output.2.to_bytes(),
+                                fvk,
+                            )
                     }
                 };
                 if !auth {
@@ -277,6 +348,14 @@ pub(crate) fn apply_batch(
                     },
                 )?;
 
+                // Mirror the tip change into the live-name set.
+                if let Some(b) = binding {
+                    live_names.remove(&b.1);
+                }
+                if note.action() != Action::Release {
+                    live_names.insert(nullifier);
+                }
+
                 let tip = (
                     Tip {
                         action: note.action(),
@@ -293,6 +372,119 @@ pub(crate) fn apply_batch(
     set_checkpoint_in_tx(&db_tx, &scanned)?;
     db_tx.commit()?;
     Ok(())
+}
+
+/// Folds the stored anchor facts into the lineage as of the last checkpoint.
+/// The facts are replayed in canonical order; each zero-value received note
+/// is an adoption at its own position, each spent zero-value note a
+/// retirement at its spending position, and a transaction's candidate count
+/// carries the accept-path marker.
+fn load_lineage(conn: &Connection) -> rusqlite::Result<Lineage> {
+    let mut stmt = conn.prepare(
+        "SELECT nullifier, value, height, tx_index, action_index, name_note_candidates,
+                spent_height, spent_tx_index, spent_action_index
+         FROM anchor_facts",
+    )?;
+    let mut events: Vec<(Position, FactEvent)> = Vec::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
+        ))
+    })?;
+    for row in rows {
+        let (nf, value, height, tx_index, action_index, cands, spent_h, spent_tx, spent_a) = row?;
+        if value != 0 {
+            continue;
+        }
+        let nf_bytes: [u8; 32] = nf.try_into().map_err(|_| corrupt_record())?;
+        let nf = AnchorNf::from_bytes(&nf_bytes);
+        let adopt_at = Position {
+            height: height as u32,
+            tx_index: tx_index as u32,
+            action_index: action_index as u32,
+        };
+        events.push((
+            adopt_at,
+            FactEvent::Adoption {
+                nf,
+                name_note_candidates: cands,
+            },
+        ));
+        if let (Some(sh), Some(stx), Some(sa)) = (spent_h, spent_tx, spent_a) {
+            events.push((
+                Position {
+                    height: sh as u32,
+                    tx_index: stx as u32,
+                    action_index: sa as u32,
+                },
+                FactEvent::Retirement(nf),
+            ));
+        }
+    }
+    events.sort_by_key(|(pos, _)| *pos);
+
+    // Group by transaction, in canonical order.
+    let mut lineage = Lineage::new();
+    for group in events.chunk_by(|a, b| {
+        (a.0.height, a.0.tx_index) == (b.0.height, b.0.tx_index)
+    }) {
+        let mut facts = TxAnchorFacts::default();
+        for (_, event) in group.iter().copied() {
+            match event {
+                FactEvent::Adoption {
+                    nf,
+                    name_note_candidates,
+                } => {
+                    facts.has_single_name_note = name_note_candidates == 1;
+                    facts.adoptions.push(Adoption { nf });
+                }
+                FactEvent::Retirement(nf) => facts.retirements.push(Retirement { nf }),
+            }
+        }
+        lineage.step_tx(&facts);
+    }
+    // An empty lineage past the ceremony height means the scan began after
+    // the keygen ceremony: every claim will be rejected (fail closed).
+    tracing::debug!(
+        anchors = lineage.len(),
+        empty = lineage.is_empty(),
+        "anchor lineage folded from facts"
+    );
+    Ok(lineage)
+}
+
+/// One replayed fact: an adoption carrying its transaction's candidate
+/// count (the accept-path marker), or a retirement.
+#[derive(Debug, Clone, Copy)]
+enum FactEvent {
+    Adoption {
+        nf: AnchorNf,
+        name_note_candidates: i64,
+    },
+    Retirement(AnchorNf),
+}
+
+/// The live name tips' nullifiers — the claim law's "spends no live name
+/// note" set.
+fn live_name_nullifiers(conn: &Connection) -> rusqlite::Result<HashSet<[u8; 32]>> {
+    let mut stmt = conn.prepare("SELECT nullifier FROM names")?;
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut set = HashSet::new();
+    for bytes in rows {
+        let bytes: Vec<u8> = bytes?;
+        if let Ok(nf) = <[u8; 32]>::try_from(bytes) {
+            set.insert(nf);
+        }
+    }
+    Ok(set)
 }
 
 /// The columns of one admitted candidate, written to the event log and the
@@ -836,8 +1028,8 @@ mod tests {
         .unwrap();
         insert_checkpoint(&conn, 42, 7);
         conn.execute(
-            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, spent_height)
-             VALUES (?1, 0, 42, 0, 0, NULL)",
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 0, 42, 0, 0, 0, NULL)",
             params![vec![1u8; 32]],
         )
         .unwrap();

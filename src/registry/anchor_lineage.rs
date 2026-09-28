@@ -108,15 +108,6 @@ impl Lineage {
             .count()
     }
 
-    /// Whether any of the transaction's retirements hits a live anchor —
-    /// the mint's `predecessor_spent` guard for updates and releases.
-    pub(crate) fn touches_live_anchor(&self, facts: &TxAnchorFacts) -> bool {
-        facts
-            .retirements
-            .iter()
-            .any(|r| self.live.contains(&r.nf))
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.live.len()
     }
@@ -134,14 +125,6 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         AnchorNf::from_bytes(&bytes)
-    }
-
-    fn pos(height: u32) -> Position {
-        Position {
-            height,
-            tx_index: 0,
-            action_index: 0,
-        }
     }
 
     fn adopt(seed: u8) -> Adoption {
