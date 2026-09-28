@@ -82,9 +82,13 @@ every event. Two implementations, one executable contract.
   Surfacing them through the API is PR #2's remainder.
 - The claim law lives in two repos by copy-paste (pinned by the fixture).
   The endgame is one law as a `zns-verify` kernel consumed by both.
-- Clock checks (term expiry, liveness) are mint-side only — a clock-stale
-  transition is admitted here when the mint would free the name. That is
-  the M8 divergence, tracked separately.
+- ~~Clock checks (term expiry, liveness) are mint-side only~~ — FIXED in
+  the lifecycle PR: seer-sync threads `(height, time)` per block; the
+  resolver persists `block_times`, evaluates each block's rules at its
+  MTP (median of the trailing eleven, the block included — the mint
+  tracker's semantics), and a clock-due update ends the binding exactly
+  as the mint's `release_predecessor` does. Releases stay legal after
+  either clock.
 - The mint's `retire_spent` adopts a rejected claim's successor into its
   pool (facts first). The fold reproduces this only for accepted-shape
   transactions; the poisoned entries are inert (attacker notes can never

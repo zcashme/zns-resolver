@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS name_events (
     txid         BLOB    NOT NULL,
     tx_index     INTEGER NOT NULL,
     action_index INTEGER NOT NULL,
+    confirmed_mtp INTEGER NOT NULL,
     memo         BLOB    NOT NULL,
     PRIMARY KEY (name, height, txid, action_index)
 );
@@ -56,7 +57,13 @@ CREATE TABLE IF NOT EXISTS names (
     txid         BLOB    NOT NULL,
     tx_index     INTEGER NOT NULL,
     action_index INTEGER NOT NULL,
+    confirmed_mtp INTEGER NOT NULL,
     memo         BLOB    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS block_times (
+    height INTEGER NOT NULL PRIMARY KEY,
+    time   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS implicit_releases (

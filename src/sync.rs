@@ -75,9 +75,10 @@ impl Account for Registry {
         &self,
         at: SeerCursor,
         transactions: &[WalletTx],
+        block_times: &[(u32, u64)],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let conn = self.db.lock();
-        core::apply_batch(&conn, at, transactions, &self.fvk)?;
+        core::apply_batch(&conn, at, transactions, block_times, &self.fvk)?;
         Ok(())
     }
 }
