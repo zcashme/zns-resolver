@@ -1,9 +1,9 @@
 //! Name-note admission checks: the chain rule and binding verification.
 
 use group::{Group, GroupEncoding};
+use orchard::note::Note;
 use pasta_curves::arithmetic::CurveExt;
 use pasta_curves::pallas;
-use seer_sync::sync::decrypt::RelaxedIronwoodOutput;
 use zns_verify::verify::verify_name_note_with_witness;
 use zns_verify::{prev_rcm_for, ExtractedNoteCommitment as ZnsCmx, PrevRcm, Rho, Tip};
 
@@ -22,20 +22,20 @@ pub(crate) fn check_chain_rule(
 /// the published `cmx`. Returns the re-derived opening `(ψ, rcm)`.
 pub(crate) fn verify_commitment(
     note: &zns_verify::NameNote<'_>,
-    cand: &RelaxedIronwoodOutput,
+    cand_note: &Note,
+    cand_cmx: &[u8; 32],
 ) -> Option<(pallas::Base, pallas::Scalar)> {
-    let (_, cand, _, _, _) = cand;
-    let rho = Rho::from_bytes(&cand.note().rho().to_bytes())?;
-    let cmx = ZnsCmx::from_bytes(&cand.cmx().to_bytes())?;
-    let raw = cand.note().recipient().to_raw_address_bytes();
+    let rho = Rho::from_bytes(&cand_note.rho().to_bytes())?;
+    let cmx = ZnsCmx::from_bytes(cand_cmx)?;
+    let raw = cand_note.recipient().to_raw_address_bytes();
     let diversifier: [u8; 11] = raw[..11].try_into().expect("raw address is 43 bytes");
     let pk_d: [u8; 32] = raw[11..].try_into().expect("raw address is 43 bytes");
     let g_d = diversify_hash(&diversifier);
-    let value = cand.note().value().inner();
+    let value = cand_note.value().inner();
     verify_name_note_with_witness(note, g_d, pk_d, value, rho, cmx)
 }
 
-fn diversify_hash(diversifier: &[u8; 11]) -> [u8; 32] {
+pub(crate) fn diversify_hash(diversifier: &[u8; 11]) -> [u8; 32] {
     let hash = pallas::Point::hash_to_curve("z.cash:Orchard-gd");
     let point = hash(diversifier);
     if bool::from(point.is_identity()) {

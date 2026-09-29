@@ -1,20 +1,61 @@
 //! Transactional core of the registry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use orchard::keys::FullViewingKey;
+use orchard::keys::{FullViewingKey, Scope};
+use orchard::note::Note;
 use orchard::note::NoteCommitTrapdoor;
 use orchard::note::Nullifier;
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
-use seer_sync::sync::decrypt::RelaxedIronwoodOutput;
 use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
+use zcash_address::unified::Encoding as _;
 use zcash_primitives::block::BlockHash;
-use zcash_protocol::consensus::BlockHeight;
-use zns_verify::{Action, Memo, NameNote, PrimeField, Tip};
+use zcash_protocol::consensus::{BlockHeight, Parameters as _};
+use zns_verify::{pallas, Action, Memo, NameNote, PrimeField, Tip};
 
+use super::anchor_lineage::{Adoption, Lineage, Position, Retirement, TxAnchorFacts};
+use super::nf::AnchorNf;
 use super::notes;
 use super::{Event, Registration};
+
+/// One authenticated candidate: a relaxed registry output whose memo
+/// decodes to a name note that binds to its published commitment, is
+/// zero-valued, and is addressed to the registry — the mint's
+/// `decrypt_name_notes` gates. Parsed and verified once at triage; every
+/// stage reads this form. Flattened from the scan tuple so the admission
+/// boundary is constructible in tests.
+struct Candidate<'a> {
+    action_index: usize,
+    /// The candidate action's revealed nullifier — raw until the lifecycle
+    /// PR types the tip family.
+    action_nullifier: [u8; 32],
+    txid: [u8; 32],
+    memo: &'a [u8],
+    note: NameNote<'a>,
+    /// The published commitment the binding was verified against.
+    cand_cmx: [u8; 32],
+    /// The decrypted note: the source of the admission nullifier.
+    note_orchard: Note,
+    /// The verified opening of the ZNS binding.
+    psi: pallas::Base,
+    rcm: pallas::Scalar,
+}
+
+impl Candidate<'_> {
+    fn name(&self) -> &str {
+        self.note.name().as_str()
+    }
+}
+
+/// One transaction's law context: its identity, its pre-transaction lineage
+/// snapshot, and its anchor facts. Canonical order comes from the Vec.
+struct TxLaw {
+    txid: [u8; 32],
+    tx_index: u32,
+    snapshot: Lineage,
+    facts: TxAnchorFacts,
+}
 
 pub(crate) fn install_registry_config(
     conn: &Connection,
@@ -51,84 +92,60 @@ pub(crate) fn install_registry_config(
     Ok(())
 }
 
-/// The main write path.
-///
-/// Runs in one transaction, in two layers. Bookkeeping records chain facts
-/// — received and spent nullifiers of the watch set; a registration ends
-/// only through an accepted release, never through a raw spend. Derivation
-/// considers each block's parse-gated candidates per name — a release
-/// disclosing the block-start accepted rcm is considered before the updates
-/// competing over it (WP §6.3) — through the chain rule, the binding
-/// verification, and the consumption proof: every accepted action spends a
-/// mint-owned note, except claims, which await the mint's anchor note.
-/// Verified values are written immediately — the event row and the per-name
-/// tip row — with the raw memo stored alongside. Tips are recorded in
-/// `pending_tips` so a later note for the same name in the same batch sees
-/// the updated tip.
-///
-/// Readers see either the pre-batch or post-batch state — never partial
-/// (WAL snapshot isolation + atomic commit).
-///
-/// SAFETY (TOCTOU on the tip): the tip reads and the writes run inside the
-/// same serialized call. No other DB operation can interleave.
+/// One triage survivor, pre-verification: everything `Candidate` needs
+/// except the parse, which borrows the per-block memo arena.
+struct Source<'a> {
+    action_index: usize,
+    action_nullifier: [u8; 32],
+    cand_note: Note,
+    cand_cmx: [u8; 32],
+    memo: &'a [u8],
+    txid: [u8; 32],
+    psi: pallas::Base,
+    rcm: pallas::Scalar,
+}
+
+/// The main write path: triage and anchor-fact bookkeeping, then candidate
+/// admission in canonical transaction order. Admission applies the chain rule,
+/// commitment binding, consumption proof, and implicit-release behavior.
+/// All work runs in one transaction, so readers see pre-batch or post-batch
+/// state, never partial. The connection lock makes this the sole mutator;
+/// tip reads and writes share the transaction.
 pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
     transactions: &[WalletTx],
     fvk: &FullViewingKey,
 ) -> rusqlite::Result<()> {
-    let mut pending_tips: HashMap<String, (Tip, [u8; 32])> = HashMap::new();
     let db_tx = conn.unchecked_transaction()?;
 
-    // Persist received ironwood nullifiers.
-    for tx_data in transactions {
-        let txid = *tx_data.txid.as_ref();
-        let height = u32::from(tx_data.height);
-        for output in &tx_data.ironwood_outputs {
-            if !output.is_sent {
-                if let Some(nf) = output.nf {
-                    db_tx.execute(
-                        "INSERT OR IGNORE INTO watched_ironwood_notes (nullifier, txid, height, spent_height)
-                         VALUES (?1, ?2, ?3, NULL)",
-                        params![nf.to_bytes().as_slice(), txid.as_slice(), height as i64],
-                    )?;
-                }
-            }
-        }
-    }
+    // The lineage as of the batch start, folded from the stored facts; the
+    // live name nullifiers feed the claim law's no-name-spend condition.
+    let mut lineage = load_lineage(&db_tx)?;
+    let mut live_names: HashSet<[u8; 32]> = live_name_nullifiers(&db_tx)?;
 
-    // Mark spent nullifiers of the watch set — bookkeeping only: a
-    // registration ends through an accepted release, never through a raw
-    // spend.
-    for tx_data in transactions {
-        let height = u32::from(tx_data.height);
-        for spend in &tx_data.ironwood_spends {
-            let nf_bytes = spend.nf.to_bytes();
-            db_tx.execute(
-                "UPDATE watched_ironwood_notes SET spent_height = ?1
-                 WHERE nullifier = ?2 AND spent_height IS NULL",
-                params![height as i64, nf_bytes.as_slice()],
-            )?;
-        }
-    }
     // Derivation: consider each block's candidates per name. A name note
     // references the accepted predecessor and authenticates by consuming
     // mint-owned money; the resolver's only decisions are order and state.
     for block in transactions.chunk_by(|a, b| a.height == b.height) {
         let height = u32::from(block[0].height);
 
-        // Triage: the cheap gates. The name is the grouping key; every
-        // other value is derived where it is used.
-        let mut candidates: Vec<(String, &RelaxedIronwoodOutput, [u8; 32])> = Vec::new();
+        // Triage: the candidate lane. The gates are the mint's
+        // `decrypt_name_notes`, so the accept-path count is mint-exact: the
+        // memo decodes to a NameNote, binds to the published commitment, is
+        // zero-valued, and is addressed to the registry. Candidate
+        // authenticity is the recipient and binding gates — `is_sent` is
+        // merged lane routing, not a signal: third-party gifts and mint
+        // self-sends are both candidates. Each survivor's memo is parsed
+        // and verified once, into a per-block arena the candidates borrow.
+        let registry_recipient = fvk.to_ivk(Scope::External).address_at(0u32);
+        let mut memos: Vec<Memo> = Vec::new();
+        let mut sources: Vec<Source> = Vec::new();
         for tx in block {
             let txid = *tx.txid.as_ref();
-            for candidate in &tx.relaxed_ironwood_outputs {
-                let (_, _, _, memo, is_sent) = candidate;
+            for output in &tx.relaxed_ironwood_outputs {
+                let (action_index, cand_note, action_nullifier, memo, _) = output;
 
-                // Gate: a name note exists only as a mint self-send.
-                if !is_sent {
-                    continue;
-                }
                 let Some(memo) = memo else {
                     continue;
                 };
@@ -137,180 +154,151 @@ pub(crate) fn apply_batch(
                 };
                 // Gate: protocol parse. The kernel's structural rules are the
                 // authority — invalid statements never become candidates.
-                let Some(note) = NameNote::parse(&zns_memo).ok() else {
+                let Ok(note) = NameNote::parse(&zns_memo) else {
                     continue;
                 };
+                // Gate: binding — the transition, hashed under the ZNS
+                // binding, must reproduce the published cmx.
+                let Some((psi, rcm)) =
+                    notes::verify_commitment(&note, cand_note.note(), &cand_note.cmx().to_bytes())
+                else {
+                    continue;
+                };
+                // Gate: shape — zero value, registry recipient.
+                if cand_note.note().value().inner() != 0
+                    || cand_note.note().recipient() != registry_recipient
+                {
+                    continue;
+                }
+                // Gate: the bound UA must decode as a Unified Address on this
+                // network (restores 304193b, lost in the #27 refactor).
+                let ua = note.ua().as_str();
+                let Some((ua_network, _)) = zcash_address::unified::Address::decode(ua).ok() else {
+                    continue;
+                };
+                if ua_network != crate::NETWORK.network_type() {
+                    continue;
+                }
 
-                candidates.push((note.name().as_str().to_string(), candidate, txid));
-            }
-        }
-
-        // Grouping: stable sort by name, then the same chunk_by the blocks
-        // use — scan order preserved within each name.
-        candidates.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Consideration: per name, with the name's whole candidate set and
-        // its state in scope. A release disclosing the block-start accepted
-        // rcm is considered before the updates competing over it — it
-        // references a predecessor the state still holds, and may spend a
-        // note the state has not yet recorded.
-        for group in candidates.chunk_by(|a, b| a.0 == b.0) {
-            let name = &group[0].0;
-            let mut binding = match pending_tips.get(name) {
-                Some(b) => Some(*b),
-                None => read_tip_offline(&db_tx, name)?,
-            };
-            let start = binding;
-
-            // Consideration order: releases disclosing the block-start
-            // accepted rcm first, scan order among them; then everything
-            // else in scan order.
-            let (release_first, rest): (Vec<_>, Vec<_>) =
-                group.iter().partition(|(_, candidate, _)| {
-                    let Some(memo) = candidate.3 else {
-                        return false;
-                    };
-                    let Ok(zns_memo) = Memo::from_bytes(&memo) else {
-                        return false;
-                    };
-                    let Ok(note) = NameNote::parse(&zns_memo) else {
-                        return false;
-                    };
-                    matches!(note, NameNote::Release { .. })
-                        && start.is_some_and(|(t, _)| {
-                            t.action != Action::Release
-                                && note.prev_rcm().map(|p| *p.as_bytes()) == Some(t.rcm)
-                        })
+                memos.push(zns_memo);
+                sources.push(Source {
+                    action_index: *action_index,
+                    action_nullifier: action_nullifier.to_bytes(),
+                    cand_note: *cand_note.note(),
+                    cand_cmx: cand_note.cmx().to_bytes(),
+                    memo: memo.as_slice(),
+                    txid,
+                    psi,
+                    rcm,
                 });
-
-            for (_, candidate, txid) in release_first.into_iter().chain(rest) {
-                let candidate = *candidate;
-                let txid = *txid;
-                let (_, cand, _, _, _) = candidate;
-
-                let Some(memo) = candidate.3 else {
-                    continue;
-                };
-                let Ok(zns_memo) = Memo::from_bytes(&memo) else {
-                    continue;
-                };
-                let Some(note) = NameNote::parse(&zns_memo).ok() else {
-                    continue;
-                };
-                let ua = note.ua().as_str().to_string();
-                // A release carries no expiry; the row records the canonical
-                // "none" spelling.
-                let expires_at = note
-                    .expires_at()
-                    .map(|e| e.field_bytes().to_string())
-                    .unwrap_or_else(|| "none".to_string());
-
-                // Gate: chain rule — the disclosed prev_rcm extends the tip.
-                let Some(expected_prev) =
-                    notes::check_chain_rule(binding.as_ref().map(|b| &b.0), &note)
-                else {
-                    continue;
-                };
-
-                // Gate: binding — the kernel recomputes the commitment from
-                // the transition fields and demands equality with the
-                // published cmx.
-                let Some((psi, rcm)) = notes::verify_commitment(&note, candidate) else {
-                    continue;
-                };
-
-                // Gate: auth — the action consumed mint-owned money. A
-                // nullifier is public to compute; only the mint's key can
-                // reveal one on chain. Claims consume nothing yet — the
-                // anchor note is the mint-side piece still missing.
-                let consumed = candidate.2.to_bytes();
-                let auth = match note.action() {
-                    Action::Claim => true,
-                    Action::Update => binding.is_some_and(|b| b.1 == consumed),
-                    Action::Release => {
-                        binding.is_some_and(|b| b.1 == consumed)
-                            || spends_same_block_update(group, start, consumed, fvk)
-                    }
-                };
-                if !auth {
-                    continue;
-                }
-
-                // Derived at admission, revealed at consumption.
-                let Some(nullifier) = cand
-                    .note()
-                    .zns_nullifier(fvk, NoteCommitTrapdoor::from_inner(rcm), psi)
-                    .map(|n| n.to_bytes())
-                else {
-                    continue;
-                };
-
-                let rcm_repr = rcm.to_repr();
-                let psi_repr = psi.to_repr();
-                let cmx = cand.cmx().to_bytes();
-
-                db_tx.execute(
-                    "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    params![
-                        name,
-                        height as i64,
-                        note.action().as_str(),
-                        ua,
-                        expires_at,
-                        expected_prev.as_slice(),
-                        rcm_repr.as_slice(),
-                        psi_repr.as_slice(),
-                        cmx.as_slice(),
-                        nullifier.as_slice(),
-                        txid.as_slice(),
-                        candidate.0 as i64,
-                        memo.as_slice(),
-                    ],
-                )?;
-
-                if note.action() == Action::Release {
-                    db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
-                } else {
-                    db_tx.execute(
-                    "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                     ON CONFLICT (name) DO UPDATE SET
-                       height = excluded.height, action = excluded.action, ua = excluded.ua,
-                       expires_at = excluded.expires_at,
-                       prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
-                       cmx = excluded.cmx, nullifier = excluded.nullifier,
-                       txid = excluded.txid, action_index = excluded.action_index,
-                       memo = excluded.memo",
-                    params![
-                        name,
-                        height as i64,
-                        note.action().as_str(),
-                        ua,
-                        expires_at,
-                        expected_prev.as_slice(),
-                        rcm_repr.as_slice(),
-                        psi_repr.as_slice(),
-                        cmx.as_slice(),
-                        nullifier.as_slice(),
-                        txid.as_slice(),
-                        candidate.0 as i64,
-                        memo.as_slice(),
-                    ],
-                )?;
-                }
-
-                let tip = (
-                    Tip {
-                        action: note.action(),
-                        rcm: rcm_repr,
-                    },
-                    nullifier,
-                );
-                pending_tips.insert(name.clone(), tip);
-                binding = Some(tip);
             }
         }
+        let candidates: Vec<Candidate> = memos
+            .iter()
+            .zip(&sources)
+            .map(|(memo, src)| Candidate {
+                action_index: src.action_index,
+                action_nullifier: src.action_nullifier,
+                txid: src.txid,
+                memo: src.memo,
+                note: NameNote::parse(memo).expect("arena memo parsed at triage"),
+                cand_cmx: src.cand_cmx,
+                note_orchard: src.cand_note,
+                psi: src.psi,
+                rcm: src.rcm,
+            })
+            .collect();
+
+        // The accept-path marker per transaction: the mint offers
+        // exactly-one-candidate transactions to the law; every other
+        // transaction is follow_spends.
+        let mut candidate_counts: HashMap<[u8; 32], usize> = HashMap::new();
+        for candidate in &candidates {
+            *candidate_counts.entry(candidate.txid).or_insert(0) += 1;
+        }
+
+        // Bookkeeping: the block's anchor facts land with their canonical
+        // positions and candidate counts.
+        for tx_data in block {
+            let txid = *tx_data.txid.as_ref();
+            let block_height = u32::from(tx_data.height);
+            let tx_index = tx_data.tx_index;
+            let candidate_count = candidate_counts.get(&txid).copied().unwrap_or(0);
+            for output in &tx_data.ironwood_outputs {
+                if !output.is_sent {
+                    if let Some(nf) = output.nf {
+                        let nf = AnchorNf::from_scan(nf);
+                        db_tx.execute(
+                            "INSERT OR IGNORE INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                            params![
+                                nf.as_bytes().as_slice(),
+                                output.note.value().inner() as i64,
+                                block_height as i64,
+                                tx_index as i64,
+                                output.index as i64,
+                                candidate_count as i64,
+                            ],
+                        )?;
+                    }
+                }
+            }
+            for spend in &tx_data.ironwood_spends {
+                let nf = AnchorNf::from_scan(spend.nf);
+                db_tx.execute(
+                    "UPDATE anchor_facts SET spent_height = ?1, spent_tx_index = ?2, spent_action_index = ?3
+                     WHERE nullifier = ?4 AND spent_height IS NULL",
+                    params![
+                        block_height as i64,
+                        tx_index as i64,
+                        spend.index as i64,
+                        nf.as_bytes().as_slice()
+                    ],
+                )?;
+            }
+        }
+
+        // Per-transaction anchor facts and pre-transaction lineage
+        // snapshots, in canonical order: a candidate is judged against the
+        // lineage its own transaction was judged against.
+        let mut txs: Vec<&WalletTx> = block.iter().collect();
+        txs.sort_by_key(|tx| tx.tx_index);
+        let mut tx_law: Vec<TxLaw> = Vec::new();
+        for tx in txs {
+            let txid = *tx.txid.as_ref();
+            let tx_index = tx.tx_index;
+            let facts = TxAnchorFacts {
+                adoptions: tx
+                    .ironwood_outputs
+                    .iter()
+                    .filter(|o| !o.is_sent && o.note.value().inner() == 0)
+                    .filter_map(|o| o.nf.map(AnchorNf::from_scan))
+                    .map(|nf| Adoption { nf })
+                    .collect(),
+                retirements: tx
+                    .ironwood_spends
+                    .iter()
+                    .map(|s| Retirement {
+                        nf: AnchorNf::from_scan(s.nf),
+                    })
+                    .collect(),
+                has_single_name_note: candidate_counts.get(&txid).copied().unwrap_or(0) == 1,
+            };
+            let snapshot = lineage.clone();
+            lineage.step_tx(height, &facts);
+            tx_law.push(TxLaw {
+                txid,
+                tx_index,
+                snapshot,
+                facts,
+            });
+        }
+
+        // Consideration: canonical transaction order — the mint evaluates
+        // transactions sequentially, each against the state its
+        // predecessors left. The accept path admits at most one candidate
+        // per transaction, so this is a total order over admissions.
+        apply_candidates(&db_tx, height, &candidates, &mut live_names, &tx_law, fvk)?;
     }
 
     set_checkpoint_in_tx(&db_tx, &scanned)?;
@@ -318,49 +306,455 @@ pub(crate) fn apply_batch(
     Ok(())
 }
 
-/// True when `consumed` is the derived nullifier of a genuine same-block
-/// update — one that discloses the block-start rcm and consumes the
-/// block-start binding note. The consumption is the consensus wall: only
-/// the mint's key can reveal that nullifier, so a forged update can never
-/// qualify. Cheap checks run before the crypto.
-fn spends_same_block_update(
-    candidates: &[(String, &RelaxedIronwoodOutput, [u8; 32])],
-    start: Option<(Tip, [u8; 32])>,
-    consumed: [u8; 32],
+/// Folds the stored anchor facts into the lineage as of the last checkpoint.
+/// The facts are replayed in canonical order; each zero-value received note
+/// is an adoption at its own position, each spent zero-value note a
+/// retirement at its spending position, and a transaction's candidate count
+/// carries the accept-path marker.
+fn load_lineage(conn: &Connection) -> rusqlite::Result<Lineage> {
+    let mut stmt = conn.prepare(
+        "SELECT nullifier, value, height, tx_index, action_index, name_note_candidates,
+                spent_height, spent_tx_index, spent_action_index
+         FROM anchor_facts",
+    )?;
+    let mut events: Vec<(Position, FactEvent)> = Vec::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
+        ))
+    })?;
+    for row in rows {
+        let (nf, value, height, tx_index, action_index, cands, spent_h, spent_tx, spent_a) = row?;
+        if value != 0 {
+            continue;
+        }
+        let nf_bytes: [u8; 32] = nf.try_into().map_err(|_| corrupt_record())?;
+        let nf = AnchorNf::from_bytes(&nf_bytes);
+        let adopt_at = Position {
+            height: height as u32,
+            tx_index: tx_index as u32,
+            action_index: action_index as u32,
+        };
+        events.push((
+            adopt_at,
+            FactEvent::Adoption {
+                nf,
+                name_note_candidates: cands,
+            },
+        ));
+        if let (Some(sh), Some(stx), Some(sa)) = (spent_h, spent_tx, spent_a) {
+            events.push((
+                Position {
+                    height: sh as u32,
+                    tx_index: stx as u32,
+                    action_index: sa as u32,
+                },
+                FactEvent::Retirement(nf),
+            ));
+        }
+    }
+    events.sort_by_key(|(pos, _)| *pos);
+
+    // Group by transaction, in canonical order.
+    let mut lineage = Lineage::new();
+    for group in events.chunk_by(|a, b| (a.0.height, a.0.tx_index) == (b.0.height, b.0.tx_index)) {
+        let height = group[0].0.height;
+        let mut facts = TxAnchorFacts::default();
+        for (_, event) in group.iter().copied() {
+            match event {
+                FactEvent::Adoption {
+                    nf,
+                    name_note_candidates,
+                } => {
+                    facts.has_single_name_note = name_note_candidates == 1;
+                    facts.adoptions.push(Adoption { nf });
+                }
+                FactEvent::Retirement(nf) => facts.retirements.push(Retirement { nf }),
+            }
+        }
+        lineage.step_tx(height, &facts);
+    }
+    // An empty lineage past the ceremony height means the scan began after
+    // the keygen ceremony: every claim will be rejected (fail closed).
+    tracing::debug!(
+        anchors = lineage.len(),
+        empty = lineage.is_empty(),
+        adoption_closed = lineage.adoption_closed(),
+        established = lineage.established(),
+        "anchor lineage folded from facts"
+    );
+    Ok(lineage)
+}
+
+/// One replayed fact: an adoption carrying its transaction's candidate
+/// count (the accept-path marker), or a retirement.
+#[derive(Debug, Clone, Copy)]
+enum FactEvent {
+    Adoption {
+        nf: AnchorNf,
+        name_note_candidates: i64,
+    },
+    Retirement(AnchorNf),
+}
+
+/// The live name tips' nullifiers — the claim law's "spends no live name
+/// note" set.
+fn live_name_nullifiers(conn: &Connection) -> rusqlite::Result<HashSet<[u8; 32]>> {
+    let mut stmt = conn.prepare("SELECT nullifier FROM names")?;
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut set = HashSet::new();
+    for bytes in rows {
+        let bytes: Vec<u8> = bytes?;
+        if let Ok(nf) = <[u8; 32]>::try_from(bytes) {
+            set.insert(nf);
+        }
+    }
+    Ok(set)
+}
+
+/// The law, in canonical transaction order. The accept path admits at most
+/// one candidate per transaction; each candidate is judged against the
+/// lineage snapshot and live-name state of its own position, and every
+/// admission is visible to later candidates in the same batch.
+///
+/// A transaction that consumes the live tip without a valid successor ends
+/// that binding (the mint's `release_predecessor`), and a transaction that
+/// spends any other live name tip ends that binding too (the mint's
+/// `mark_released`) — both recorded as implicit releases.
+fn apply_candidates(
+    db_tx: &Transaction<'_>,
+    height: u32,
+    candidates: &[Candidate],
+    live_names: &mut HashSet<[u8; 32]>,
+    tx_law: &[TxLaw],
     fvk: &FullViewingKey,
-) -> bool {
-    let Some((start_tip, start_nf)) = start else {
-        return false;
-    };
-    candidates.iter().any(|(_, candidate, _)| {
-        let Some(memo) = candidate.3 else {
-            return false;
+) -> rusqlite::Result<()> {
+    // The accept path admits at most one candidate per transaction, so
+    // candidates index by transaction. The loop walks TRANSACTIONS in
+    // canonical order — including candidate-free ones, whose follow_spends
+    // behavior (ending the binding of every live name they spent) the mint
+    // applies to every transaction that is not exactly-one-candidate.
+    let mut candidate_by_tx: HashMap<[u8; 32], &Candidate> = HashMap::new();
+    for candidate in candidates {
+        candidate_by_tx.insert(candidate.txid, candidate);
+    }
+
+    for law in tx_law {
+        let Some(candidate) = law
+            .facts
+            .has_single_name_note
+            .then(|| candidate_by_tx.get(&law.txid))
+            .flatten()
+        else {
+            // follow_spends: zero candidates, or two or more.
+            mark_released_spent(
+                db_tx,
+                live_names,
+                &law.facts,
+                height,
+                &law.txid,
+                law.tx_index,
+                0,
+            )?;
+            continue;
         };
-        let Ok(zns_memo) = Memo::from_bytes(&memo) else {
-            return false;
-        };
-        let Ok(note) = NameNote::parse(&zns_memo) else {
-            return false;
-        };
-        matches!(note, NameNote::Update { .. })
-            && note.prev_rcm().map(|p| *p.as_bytes()) == Some(start_tip.rcm)
-            && candidate.2.to_bytes() == start_nf
-            && notes::verify_commitment(&note, candidate)
-                .and_then(|(psi, rcm)| {
-                    candidate
-                        .1
-                        .note()
-                        .zns_nullifier(fvk, NoteCommitTrapdoor::from_inner(rcm), psi)
-                        .map(|n| n.to_bytes())
-                })
-                .is_some_and(|nf| nf == consumed)
-    })
+        let snapshot = &law.snapshot;
+        let tx_facts = &law.facts;
+
+        let binding = read_tip_offline(db_tx, candidate.name())?;
+        let note = &candidate.note;
+        let tip_consumed = binding
+            .as_ref()
+            .is_some_and(|b| b.1 == candidate.action_nullifier);
+        let spent_a_live_name = tx_facts
+            .retirements
+            .iter()
+            .any(|r| live_names.contains(r.nf.as_bytes()));
+
+        match note.action() {
+            Action::Claim => {
+                // Gate: claim law — the mint's accept_claim: exactly one
+                // live anchor spent by this transaction, by the claim's own
+                // action; no live name note spent; a zero-value successor
+                // created.
+                let law_ok = snapshot.contains(&AnchorNf::from_bytes(&candidate.action_nullifier))
+                    && snapshot.live_retirements(tx_facts) == 1
+                    && !spent_a_live_name
+                    && tx_facts.adoptions.len() == 1;
+                if !law_ok {
+                    // The mint's mark_released: every live name this
+                    // transaction spent ends its binding.
+                    mark_released_spent(
+                        db_tx,
+                        live_names,
+                        tx_facts,
+                        height,
+                        &candidate.txid,
+                        law.tx_index,
+                        candidate.action_index,
+                    )?;
+                    continue;
+                }
+
+                // Gate: chain rule — a claim's predecessor is zero, which
+                // also requires the name free.
+                let Some(expected_prev) =
+                    notes::check_chain_rule(binding.as_ref().map(|b| &b.0), note)
+                else {
+                    continue;
+                };
+
+                let Some(nullifier) = admit_nullifier(candidate, fvk) else {
+                    continue;
+                };
+                record_admission(
+                    db_tx,
+                    &AdmissionRow {
+                        name: candidate.name(),
+                        height: height as i64,
+                        action: note.action().as_str(),
+                        ua: note.ua().as_str(),
+                        expires_at: &note
+                            .expires_at()
+                            .map(|e| e.field_bytes().to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        prev_rcm: expected_prev.as_slice(),
+                        rcm: candidate.rcm.to_repr().as_slice(),
+                        psi: candidate.psi.to_repr().as_slice(),
+                        cmx: &candidate.cand_cmx,
+                        nullifier: nullifier.as_slice(),
+                        txid: candidate.txid.as_slice(),
+                        tx_index: law.tx_index as i64,
+                        action_index: candidate.action_index as i64,
+                        memo: candidate.memo,
+                    },
+                )?;
+                live_names.insert(nullifier);
+            }
+            Action::Update | Action::Release => {
+                // Gate: predecessor — the transaction must consume this
+                // name's live tip, only this name's, and no anchor. Anything
+                // else is follow_spends: every spent live name ends its
+                // binding.
+                let spent_other_live = tx_facts.retirements.iter().any(|r| {
+                    live_names.contains(r.nf.as_bytes())
+                        && r.nf.as_bytes() != &candidate.action_nullifier
+                });
+                if !tip_consumed || spent_other_live || snapshot.touches_live_anchor(tx_facts) {
+                    mark_released_spent(
+                        db_tx,
+                        live_names,
+                        tx_facts,
+                        height,
+                        &candidate.txid,
+                        law.tx_index,
+                        candidate.action_index,
+                    )?;
+                    continue;
+                }
+
+                // The tip was consumed: a valid successor advances an update
+                // or lands a proper release; an invalid one ends the binding
+                // — the mint's release_predecessor.
+                let Some(expected_prev) =
+                    notes::check_chain_rule(binding.as_ref().map(|b| &b.0), note)
+                else {
+                    end_binding_implicitly(
+                        db_tx,
+                        live_names,
+                        candidate.name(),
+                        height,
+                        &candidate.txid,
+                        law.tx_index,
+                        candidate.action_index,
+                        &candidate.action_nullifier,
+                    )?;
+                    continue;
+                };
+
+                let Some(nullifier) = admit_nullifier(candidate, fvk) else {
+                    continue;
+                };
+                record_admission(
+                    db_tx,
+                    &AdmissionRow {
+                        name: candidate.name(),
+                        height: height as i64,
+                        action: note.action().as_str(),
+                        ua: note.ua().as_str(),
+                        expires_at: &note
+                            .expires_at()
+                            .map(|e| e.field_bytes().to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        prev_rcm: expected_prev.as_slice(),
+                        rcm: candidate.rcm.to_repr().as_slice(),
+                        psi: candidate.psi.to_repr().as_slice(),
+                        cmx: &candidate.cand_cmx,
+                        nullifier: nullifier.as_slice(),
+                        txid: candidate.txid.as_slice(),
+                        tx_index: law.tx_index as i64,
+                        action_index: candidate.action_index as i64,
+                        memo: candidate.memo,
+                    },
+                )?;
+                if let Some(b) = binding {
+                    live_names.remove(&b.1);
+                }
+                if note.action() == Action::Update {
+                    live_names.insert(nullifier);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The admission nullifier of a verified candidate.
+fn admit_nullifier(candidate: &Candidate, fvk: &FullViewingKey) -> Option<[u8; 32]> {
+    candidate
+        .note_orchard
+        .zns_nullifier(
+            fvk,
+            NoteCommitTrapdoor::from_inner(candidate.rcm),
+            candidate.psi,
+        )
+        .map(|n| n.to_bytes())
+}
+
+/// The mint's `mark_released`: every live name whose tip this transaction
+/// spent ends its binding, recorded as an implicit release.
+fn mark_released_spent(
+    db_tx: &Transaction<'_>,
+    live_names: &mut HashSet<[u8; 32]>,
+    facts: &TxAnchorFacts,
+    height: u32,
+    txid: &[u8],
+    tx_index: u32,
+    action_index: usize,
+) -> rusqlite::Result<()> {
+    for retirement in &facts.retirements {
+        let nf = retirement.nf.as_bytes();
+        if !live_names.remove(nf) {
+            continue;
+        }
+        let name: String = db_tx
+            .query_row(
+                "SELECT name FROM names WHERE nullifier = ?1",
+                params![nf],
+                |r| r.get(0),
+            )
+            .optional()?
+            .expect("live-name set mirrors the names table");
+        db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
+        db_tx.execute(
+            "INSERT OR IGNORE INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![name, height as i64, txid, tx_index as i64, action_index as i64, nf],
+        )?;
+    }
+    Ok(())
+}
+
+/// The mint's `release_predecessor`: the tip was consumed without a valid
+/// successor, so the binding ends — recorded as an implicit release.
+#[allow(clippy::too_many_arguments)]
+fn end_binding_implicitly(
+    db_tx: &Transaction<'_>,
+    live_names: &mut HashSet<[u8; 32]>,
+    name: &str,
+    height: u32,
+    txid: &[u8],
+    tx_index: u32,
+    action_index: usize,
+    consumed: &[u8; 32],
+) -> rusqlite::Result<()> {
+    live_names.remove(consumed);
+    db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
+    db_tx.execute(
+        "INSERT OR IGNORE INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![name, height as i64, txid, tx_index as i64, action_index as i64, consumed],
+    )?;
+    Ok(())
+}
+
+/// The columns of one admitted candidate, written to the event log and the
+/// per-name tip in one call.
+struct AdmissionRow<'a> {
+    name: &'a str,
+    height: i64,
+    action: &'a str,
+    ua: &'a str,
+    expires_at: &'a str,
+    prev_rcm: &'a [u8],
+    rcm: &'a [u8],
+    psi: &'a [u8],
+    cmx: &'a [u8],
+    nullifier: &'a [u8],
+    txid: &'a [u8],
+    tx_index: i64,
+    action_index: i64,
+    memo: &'a [u8],
+}
+
+fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite::Result<()> {
+    let sql_params = params![
+        row.name,
+        row.height,
+        row.action,
+        row.ua,
+        row.expires_at,
+        row.prev_rcm,
+        row.rcm,
+        row.psi,
+        row.cmx,
+        row.nullifier,
+        row.txid,
+        row.tx_index,
+        row.action_index,
+        row.memo,
+    ];
+    db_tx.execute(
+        "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        sql_params,
+    )?;
+    if row.action == "release" {
+        db_tx.execute("DELETE FROM names WHERE name = ?1", params![row.name])?;
+    } else {
+        db_tx.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT (name) DO UPDATE SET
+               height = excluded.height, action = excluded.action, ua = excluded.ua,
+               expires_at = excluded.expires_at,
+               prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
+               cmx = excluded.cmx, nullifier = excluded.nullifier,
+               txid = excluded.txid, tx_index = excluded.tx_index,
+               action_index = excluded.action_index,
+               memo = excluded.memo",
+            sql_params,
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
 
-    let mut stmt = tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
+    let mut stmt = tx.prepare(
+        "SELECT name FROM name_events WHERE height > ?1
+         UNION
+         SELECT name FROM implicit_releases WHERE height > ?1",
+    )?;
     let affected: Vec<String> = stmt
         .query_map(params![fork_height as i64], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -371,11 +765,17 @@ pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
         params![fork_height as i64],
     )?;
     tx.execute(
-        "DELETE FROM watched_ironwood_notes WHERE height > ?1",
+        "DELETE FROM implicit_releases WHERE height > ?1",
         params![fork_height as i64],
     )?;
     tx.execute(
-        "UPDATE watched_ironwood_notes SET spent_height = NULL WHERE spent_height > ?1",
+        "DELETE FROM anchor_facts WHERE height > ?1",
+        params![fork_height as i64],
+    )?;
+    tx.execute(
+        "UPDATE anchor_facts
+         SET spent_height = NULL, spent_tx_index = NULL, spent_action_index = NULL
+         WHERE spent_height > ?1",
         params![fork_height as i64],
     )?;
 
@@ -400,7 +800,7 @@ pub(crate) fn resume(conn: &Connection) -> rusqlite::Result<Resume> {
     let checkpoint = checkpoint(conn)?;
     let ironwood: Vec<Nullifier> = ironwood_nullifiers(conn)?
         .into_iter()
-        .filter_map(|bytes| Option::from(Nullifier::from_bytes(&bytes)))
+        .filter_map(|nf| Option::from(Nullifier::from_bytes(nf.as_bytes())))
         .collect();
     let birthday = birthday(conn)?;
 
@@ -456,15 +856,16 @@ pub(crate) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Cursor>> 
 
 /// The watch-set: every nullifier whose consumption we must detect —
 /// unspent watched ironwood notes plus every admitted name's nullifier.
-pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
+pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<AnchorNf>> {
     let mut statement = conn.prepare(
-        "SELECT nullifier FROM watched_ironwood_notes WHERE spent_height IS NULL
+        "SELECT nullifier FROM anchor_facts WHERE spent_height IS NULL
          UNION
          SELECT nullifier FROM names",
     )?;
     let rows = statement.query_map([], |row| {
         let bytes: Vec<u8> = row.get(0)?;
-        bytes.try_into().map_err(|_| corrupt_record())
+        let nf: [u8; 32] = bytes.try_into().map_err(|_| corrupt_record())?;
+        Ok(AnchorNf::from_bytes(&nf))
     })?;
     rows.collect()
 }
@@ -602,10 +1003,9 @@ fn registry_config(conn: &Connection) -> rusqlite::Result<Option<(String, String
     .optional()
 }
 
-/// Plain `SELECT` of a name's live state — the tip plus the stored nullifier
-/// (for the consumption link). No transaction: used by `apply_batch` Phase 1.
-/// Safe alongside the Phase 2 tx because the serialized execution inside the
-/// Registry impl is the sole mutator.
+/// Plain `SELECT` of a name's live state — the tip plus the stored nullifier.
+/// Runs inside the batch transaction, so a candidate reads the admissions of
+/// every earlier candidate in the same batch.
 fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<(Tip, [u8; 32])>> {
     conn.query_row(
         "SELECT action, rcm, nullifier FROM names WHERE name = ?1",
@@ -636,11 +1036,22 @@ fn set_checkpoint_in_tx(tx: &Transaction<'_>, scanned: &Cursor) -> rusqlite::Res
 /// memo must still parse and agree with its columns — a corrupt record fails
 /// the rewind loudly.
 fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
+    // The tip is the latest record across BOTH streams — explicit events and
+    // implicit releases — in canonical order. An implicit release ends the
+    // binding just as a proper release event does.
+    let latest_implicit: Option<(i64, i64, i64)> = tx
+        .query_row(
+            "SELECT height, tx_index, action_index FROM implicit_releases WHERE name = ?1
+             ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT 1",
+            params![name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
     let row = tx
         .query_row(
-            "SELECT action, memo, txid, height, action_index, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier
+            "SELECT action, memo, txid, height, tx_index, action_index, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier
              FROM name_events WHERE name = ?1
-             ORDER BY height DESC, rowid DESC LIMIT 1",
+             ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT 1",
             params![name],
             |row| {
                 Ok((
@@ -649,13 +1060,14 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
-                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                     row.get::<_, Vec<u8>>(8)?,
                     row.get::<_, Vec<u8>>(9)?,
                     row.get::<_, Vec<u8>>(10)?,
                     row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, Vec<u8>>(12)?,
                 ))
             },
         )
@@ -667,6 +1079,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
         memo,
         txid_b,
         height,
+        tx_index,
         action_index,
         ua_b,
         expires_col,
@@ -679,6 +1092,12 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
     else {
         return Ok(());
     };
+    if let Some(implicit) = latest_implicit {
+        // An implicit release at or after the last event ends the binding.
+        if implicit >= (height, tx_index, action_index) {
+            return Ok(());
+        }
+    }
 
     // The restored record must still parse and agree with its columns.
     let zns_memo = Memo::from_bytes(&memo).map_err(|_| corrupt_record())?;
@@ -689,8 +1108,8 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
 
     if matches!(action, Action::Claim | Action::Update) {
         tx.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, action_index, memo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 name,
                 height,
@@ -703,6 +1122,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                 cmx_b,
                 nullifier_b,
                 txid_b,
+                tx_index,
                 action_index,
                 memo,
             ],
@@ -717,7 +1137,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
 fn corrupt_record() -> rusqlite::Error {
     rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
-        Some("registry record is corrupt: memo and columns disagree".to_string()),
+        Some("registry record is corrupt".to_string()),
     )
 }
 
@@ -775,6 +1195,218 @@ mod tests {
         conn
     }
 
+    /// A rewound implicit release restores the binding it ended: the name
+    /// returns to its last surviving event's state.
+    #[test]
+    fn rewound_implicit_release_restores_the_binding() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
+        insert_checkpoint(&conn, 42, 7);
+        // z: claim event at 90; implicit release at 100.
+        let memo =
+            b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', x'06', 0, 0, ?1)",
+            params![&memo[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', x'06', 0, 0, ?1)",
+            params![&memo[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+             VALUES ('z', 100, x'06', 0, 0, x'5a')",
+            [],
+        )
+        .unwrap();
+        // The implicit release had deleted the binding.
+        conn.execute("DELETE FROM names WHERE name = 'z'", [])
+            .unwrap();
+
+        rewind(&conn, 95).unwrap();
+
+        let tip: Option<String> = conn
+            .query_row("SELECT action FROM names WHERE name = 'z'", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .unwrap();
+        assert_eq!(tip.as_deref(), Some("claim"));
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM implicit_releases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    /// A surviving implicit release keeps the binding ended: a re-claim
+    /// above the fork is rewound away, and the rebuild does not resurrect
+    /// the pre-release event.
+    #[test]
+    fn surviving_implicit_release_keeps_the_binding_ended() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
+        insert_checkpoint(&conn, 42, 7);
+        let memo =
+            b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', x'06', 0, 0, ?1)",
+            params![&memo[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+             VALUES ('z', 95, x'06', 0, 0, x'5a')",
+            [],
+        )
+        .unwrap();
+        // A re-claim above the fork: rewinding past it must not resurrect
+        // the pre-release event.
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 100, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5b', x'08', 0, 0, x'09')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 100, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5b', x'08', 0, 0, x'09')",
+            [],
+        )
+        .unwrap();
+
+        rewind(&conn, 97).unwrap();
+
+        let z: i64 = conn
+            .query_row("SELECT COUNT(*) FROM names WHERE name = 'z'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(z, 0, "the surviving implicit release keeps z ended");
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM name_events WHERE name = 'z'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "only the pre-release event survives");
+    }
+
+    /// A pre-lineage database (user_version 0: old watch table, no fact
+    /// tables, stale checkpoint) is wiped on open, so the next scan replays
+    /// from the birthday instead of resuming past history it cannot interpret.
+    #[test]
+    fn pre_lineage_database_is_wiped_clean() {
+        // A raw connection: the old-shape database predates the schema
+        // installer entirely (user_version 0, legacy watch table, stale
+        // checkpoint that would otherwise skip the ceremony).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE watched_ironwood_notes (
+                nullifier BLOB NOT NULL PRIMARY KEY,
+                txid BLOB NOT NULL,
+                height INTEGER NOT NULL,
+                spent_height INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE registry_account (
+                id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+                ufvk TEXT NOT NULL,
+                network TEXT NOT NULL,
+                birthday INTEGER NOT NULL,
+                sync_height INTEGER,
+                sync_hash BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
+        insert_checkpoint(&conn, 42, 7);
+
+        crate::registry::storage::install_schema(&conn).unwrap();
+
+        let watched = conn.query_row("SELECT COUNT(*) FROM watched_ironwood_notes", [], |r| {
+            r.get::<_, i64>(0)
+        });
+        assert!(
+            watched.is_err(),
+            "the legacy table is dropped, not merely emptied"
+        );
+        let position: Option<i64> = conn
+            .query_row("SELECT sync_height FROM registry_account", [], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert!(position.is_none(), "the stale checkpoint is wiped");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let facts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(facts, 0);
+    }
+
+    /// Schema version 1 is the current schema. Opening it again must not
+    /// drop the index — the gate used to be `version < 2` while the schema
+    /// wrote version 1, so every startup wiped the database.
+    #[test]
+    fn current_schema_survives_reinstall() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
+        insert_checkpoint(&conn, 42, 7);
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 0, 10, 0, 0, 0, NULL)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+
+        crate::registry::storage::install_schema(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let facts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(facts, 1, "anchor facts survive a second install");
+        let position: Option<i64> = conn
+            .query_row("SELECT sync_height FROM registry_account", [], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert_eq!(
+            position,
+            Some(42),
+            "the checkpoint survives a second install"
+        );
+    }
+
     fn insert_checkpoint(conn: &Connection, height: u32, hash_byte: u8) {
         conn.execute(
             "UPDATE registry_account SET sync_height = ?1, sync_hash = ?2 WHERE id = 0",
@@ -808,9 +1440,9 @@ mod tests {
         .unwrap();
         insert_checkpoint(&conn, 42, 7);
         conn.execute(
-            "INSERT INTO watched_ironwood_notes (nullifier, txid, height, spent_height)
-             VALUES (?1, ?2, 42, NULL)",
-            params![vec![1u8; 32], vec![2u8; 32]],
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 0, 42, 0, 0, 0, NULL)",
+            params![vec![1u8; 32]],
         )
         .unwrap();
 
@@ -820,10 +1452,444 @@ mod tests {
         assert!(position.is_none()); // NULL hash: the next apply fixes it; a
                                      // restart meanwhile rescans from the birthday.
         let watched: u64 = conn
-            .query_row("SELECT COUNT(*) FROM watched_ironwood_notes", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(watched, 0);
+    }
+}
+
+#[cfg(test)]
+mod admission {
+    use super::*;
+    use crate::registry::storage::SCHEMA_SQL;
+    use orchard::keys::SpendingKey;
+    use orchard::note::NoteVersion;
+    use zcash_address::unified;
+    use zcash_protocol::consensus::NetworkType;
+    use zns_verify::zns_psi_rcm;
+
+    const RAW_ADDR: [u8; 43] = [
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    fn fvk() -> FullViewingKey {
+        FullViewingKey::from(&SpendingKey::from_bytes([7u8; 32]).expect("spending key"))
+    }
+
+    /// An orchard-only unified address for the active network.
+    fn test_ua() -> String {
+        let network = if cfg!(feature = "testnet") {
+            NetworkType::Test
+        } else {
+            NetworkType::Main
+        };
+        unified::Address::try_from_items(vec![unified::Receiver::Orchard([0x03; 43])])
+            .expect("orchard-only UA")
+            .encode(&network)
+    }
+
+    fn memo_for(action: &str, name: &str, prev: &[u8; 32]) -> Memo {
+        Memo::from_bytes(format!("ZNS:{action}:{name}:{}:none:{}", test_ua(), hex(prev)).as_bytes())
+            .expect("memo")
+    }
+
+    fn hex(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn nf(seed: u8) -> AnchorNf {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        AnchorNf::from_bytes(&bytes)
+    }
+
+    /// A zero-value note addressed to the test recipient.
+    fn test_note() -> Note {
+        use orchard::note::{RandomSeed, Rho};
+        use orchard::value::NoteValue;
+        let recipient = orchard::Address::from_raw_address_bytes(&RAW_ADDR)
+            .into_option()
+            .expect("address");
+        let rho = Rho::from_bytes(&[9u8; 32]).into_option().expect("rho");
+        let rseed = RandomSeed::from_bytes([4u8; 32], &rho)
+            .into_option()
+            .expect("rseed");
+        Note::from_parts(recipient, NoteValue::ZERO, rho, rseed, NoteVersion::V3)
+            .into_option()
+            .expect("note")
+    }
+
+    /// Builds a verified candidate the same way triage does.
+    #[allow(clippy::too_many_arguments)] // a fixture; grouping the args hides the shape
+    fn candidate<'a>(
+        memos: &'a [Memo],
+        i: usize,
+        _tx_index: u32,
+        action_index: usize,
+        txid: [u8; 32],
+        action: &str,
+        name: &str,
+        action_nullifier: [u8; 32],
+        prev: [u8; 32],
+    ) -> Candidate<'a> {
+        let ua = test_ua();
+        let stored = &memos[i];
+        let note = NameNote::parse(stored).expect("parsed");
+        let memo_bytes = stored.text().expect("memo is utf-8").as_bytes();
+
+        let rho = zns_verify::Rho::from_bytes(&[9u8; 32]).expect("rho");
+        let (psi, rcm) = zns_psi_rcm(
+            action.as_bytes(),
+            name.as_bytes(),
+            ua.as_bytes(),
+            b"none",
+            &prev,
+        );
+        let diversifier: [u8; 11] = RAW_ADDR[..11].try_into().expect("diversifier");
+        let g_d = notes::diversify_hash(&diversifier);
+        let pk_d: [u8; 32] = RAW_ADDR[11..].try_into().expect("pk_d");
+        let cmx = zns_verify::note_commitment_cmx(g_d, pk_d, 0, rho, psi, rcm).expect("commitment");
+
+        Candidate {
+            action_index,
+            action_nullifier,
+            txid,
+            memo: memo_bytes,
+            note,
+            cand_cmx: cmx.to_bytes(),
+            note_orchard: test_note(),
+            psi,
+            rcm,
+        }
+    }
+
+    fn tx_law_for(
+        txid: [u8; 32],
+        snapshot: Lineage,
+        adoptions: Vec<Adoption>,
+        retirements: Vec<Retirement>,
+        has_single_name_note: bool,
+    ) -> TxLaw {
+        TxLaw {
+            txid,
+            tx_index: 0,
+            snapshot,
+            facts: TxAnchorFacts {
+                adoptions,
+                retirements,
+                has_single_name_note,
+            },
+        }
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn
+    }
+
+    #[test]
+    fn backed_claim_binds_the_name() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let candidates = vec![candidate(
+            &memos,
+            0,
+            0,
+            0,
+            [1; 32],
+            "claim",
+            "alice",
+            *nf(1).as_bytes(),
+            [0u8; 32],
+        )];
+        let snapshot = Lineage::new();
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![Adoption { nf: nf(200) }],
+            vec![Retirement { nf: nf(1) }],
+            true,
+        )];
+        let mut live_names: HashSet<[u8; 32]> = HashSet::new();
+        let mut lineage = seeded;
+        let _ = snapshot;
+
+        // the fold already consumed the block's facts before admission
+        lineage.step_tx(100, &tx_law[0].facts);
+
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+    }
+
+    #[test]
+    fn unbacked_claim_is_rejected_without_state_change() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let candidates = vec![candidate(
+            &memos, 0, 0, 0, [1; 32], "claim", "alice", [9; 32], // not a live anchor
+            [0u8; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&[9; 32]),
+            }],
+            true,
+        )];
+        let mut live_names = HashSet::new();
+        let mut lineage = seeded;
+        lineage.step_tx(100, &tx_law[0].facts);
+
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+    }
+
+    /// Review finding 1, the flagged shape: a claim whose transaction spends
+    /// another name's live tip. The mint's mark_released ends that binding
+    /// and the claim is rejected.
+    #[test]
+    fn claim_spending_a_live_name_tip_ends_that_binding() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        // "z" is live, its tip nullifier is 0x5a…
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        let memos = vec![memo_for("claim", "a", &[0u8; 32])];
+        let candidates = vec![candidate(
+            &memos, 0, 0, 0, [1; 32], "claim", "a",
+            [0x5a; 32], // the claim action spends z's tip
+            [0u8; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&[0x5a; 32]),
+            }],
+            true,
+        )];
+        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut lineage = seeded;
+        lineage.step_tx(100, &tx_law[0].facts);
+
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        // z's binding ended; the claim did not land.
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+        let (rel_name, rel_nf): (String, Vec<u8>) = tx
+            .query_row("SELECT name, nullifier FROM implicit_releases", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(rel_name, "z");
+        assert_eq!(rel_nf, vec![0x5a; 32]);
+    }
+
+    /// The update-then-release shape in canonical order: the update lands,
+    /// and a stale-predecessor release ends the binding (the mint's
+    /// release_predecessor) — the ordering the release-first partition used
+    /// to emulate.
+    #[test]
+    fn update_then_stale_release_ends_the_binding() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        // "z" is live with tip nullifier 0x5a and commitment rcm 0x02.
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        // tx 1: the update consumes the tip. tx 2: the release consumes the
+        // update's tip but discloses the stale predecessor.
+        let memos = vec![
+            memo_for("update", "z", &[0x02; 32]),
+            memo_for("release", "z", &[0x02; 32]),
+        ];
+        let update = candidate(
+            &memos, 0, 0, 0, [1; 32], "update", "z", [0x5a; 32], [0x02; 32],
+        );
+        let release = candidate(
+            &memos, 1, 0, 0, [2; 32], "release", "z", [9; 32], [0x02; 32],
+        );
+        let nullifier_u = admit_nullifier(&update, &fvk).expect("update nullifier");
+
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![
+            tx_law_for(
+                [1; 32],
+                seeded.clone(),
+                vec![],
+                vec![Retirement {
+                    nf: AnchorNf::from_bytes(&[0x5a; 32]),
+                }],
+                true,
+            ),
+            tx_law_for(
+                [2; 32],
+                seeded.clone(),
+                vec![],
+                vec![Retirement {
+                    nf: AnchorNf::from_bytes(&nullifier_u),
+                }],
+                true,
+            ),
+        ];
+
+        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut lineage = seeded;
+        lineage.step_tx(100, &tx_law[0].facts);
+        lineage.step_tx(100, &tx_law[1].facts);
+
+        let candidates = vec![update, release];
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        // The update admitted; the stale release ended the binding.
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
+        let (rel_name, rel_nf): (String, Vec<u8>) = tx
+            .query_row("SELECT name, nullifier FROM implicit_releases", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(rel_name, "z");
+        assert_eq!(rel_nf, nullifier_u);
+    }
+
+    /// A transaction with two candidates takes follow_spends: nothing is
+    /// admitted, and spent live names end their bindings.
+    #[test]
+    fn multi_candidate_tx_takes_follow_spends() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        let memos = vec![
+            memo_for("claim", "a", &[0u8; 32]),
+            memo_for("claim", "b", &[0u8; 32]),
+        ];
+        let candidates = vec![
+            candidate(
+                &memos, 0, 0, 0, [1; 32], "claim", "a", [0x5a; 32], [0u8; 32],
+            ),
+            candidate(
+                &memos, 1, 0, 1, [1; 32], "claim", "b", [0x5a; 32], [0u8; 32],
+            ),
+        ];
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&[0x5a; 32]),
+            }],
+            false, // two candidates: follow_spends
+        )];
+        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut lineage = seeded;
+        lineage.step_tx(100, &tx_law[0].facts);
+
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
+    }
+
+    /// A candidate-free transaction that spends a live tip takes
+    /// follow_spends: the binding ends even though no candidate existed to
+    /// reject. The mint applies this to every transaction that is not
+    /// exactly-one-candidate.
+    #[test]
+    fn candidate_free_tx_spending_a_live_tip_ends_the_binding() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        // No candidates at all: a spend-only transaction.
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![tx_law_for(
+            [7; 32],
+            seeded.clone(),
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&[0x5a; 32]),
+            }],
+            false,
+        )];
+        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut lineage = seeded;
+        lineage.step_tx(100, &tx_law[0].facts);
+
+        let candidates: Vec<Candidate> = vec![];
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+    }
+
+    fn seeded_lineage(anchors: &[u8]) -> Lineage {
+        let mut lineage = Lineage::new();
+        for seed in anchors {
+            lineage.step_tx(
+                0,
+                &TxAnchorFacts {
+                    adoptions: vec![Adoption { nf: nf(*seed) }],
+                    retirements: vec![],
+                    has_single_name_note: false,
+                },
+            );
+        }
+        lineage
     }
 }

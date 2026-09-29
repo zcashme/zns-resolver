@@ -27,8 +27,11 @@ testnet = []
 
 [dependencies]
 # ZNS fork of seer-sync — relaxed Ironwood scan (Name Note candidates) via `zns-decrypt`.
-seer-sync = { git = "https://github.com/zcashme/seer-sync.git", tag = "seer-sync-v0.4.0", default-features = false, features = ["zns-decrypt"] }
+# rev is the merged watch-list fix (seer-sync #3). Switch back to a tag when
+# seer-sync-v0.4.1 is cut. Do not move the seer-sync-v0.4.0 tag.
+seer-sync = { git = "https://github.com/zcashme/seer-sync.git", rev = "707d8d930a57215957fcd99ab2d143ce4173801d", default-features = false, features = ["zns-decrypt"] }
 zns-verify = { git = "https://github.com/zcashme/zns-verify.git", tag = "v0.1.1" }
+zcash_address = "0.13"
 orchard = { version = "0.15.5", default-features = false, features = ["std"] }
 zcash_protocol = { version = "0.10", default-features = false, features = ["std"] }
 zcash_primitives = { version = "0.29", default-features = false }
@@ -47,3 +50,5 @@ tracing-subscriber = { version = "0.3", default-features = true }
 # ZNS orchard fork; keeps package name `orchard` so the patched crates.io dep unifies
 # the whole graph (zcash_keys, zcash_primitives, etc.).
 orchard = { git = "https://github.com/zcashme/orchard.git", tag = "zns-orchard-v0.15.5.2" }
+[dev-dependencies]
+serde_json = "1"

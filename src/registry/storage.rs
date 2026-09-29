@@ -1,8 +1,11 @@
 //! Durable representation of the ZNS name index.
 
+use rusqlite::Connection;
+
 /// The SQL to create the name index tables (and supporting state).
 /// Run once by the writer connection at startup.
 pub(crate) const SCHEMA_SQL: &str = r#"
+PRAGMA user_version = 1;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;
@@ -31,6 +34,7 @@ CREATE TABLE IF NOT EXISTS name_events (
     cmx          BLOB    NOT NULL,
     nullifier    BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
+    tx_index     INTEGER NOT NULL,
     action_index INTEGER NOT NULL,
     memo         BLOB    NOT NULL,
     PRIMARY KEY (name, height, txid, action_index)
@@ -50,15 +54,55 @@ CREATE TABLE IF NOT EXISTS names (
     cmx          BLOB    NOT NULL,
     nullifier    BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
+    tx_index     INTEGER NOT NULL,
     action_index INTEGER NOT NULL,
     memo         BLOB    NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS watched_ironwood_notes (
-    nullifier    BLOB    NOT NULL PRIMARY KEY,
-    txid         BLOB    NOT NULL,
+CREATE TABLE IF NOT EXISTS implicit_releases (
+    name         TEXT    NOT NULL,
     height       INTEGER NOT NULL,
-    spent_height INTEGER
+    txid         BLOB    NOT NULL,
+    tx_index     INTEGER NOT NULL,
+    action_index INTEGER NOT NULL,
+    nullifier    BLOB    NOT NULL,
+    PRIMARY KEY (name, height, txid, action_index)
+);
+
+CREATE TABLE IF NOT EXISTS anchor_facts (
+    nullifier          BLOB    NOT NULL PRIMARY KEY,
+    value              INTEGER NOT NULL,
+    height             INTEGER NOT NULL,
+    tx_index           INTEGER NOT NULL,
+    action_index       INTEGER NOT NULL,
+    name_note_candidates INTEGER NOT NULL,
+    spent_height       INTEGER,
+    spent_tx_index     INTEGER,
+    spent_action_index INTEGER
 );
 
 "#;
+
+/// Installs the schema, wiping pre-lineage databases. A database written
+/// before the anchor-fact tables cannot be upgraded in place: the old
+/// watch table lacks value and canonical-position data, and its names
+/// rows lack tx_index. The version gate drops everything and reinstalls,
+/// so the next open rescans from the configured birthday. There is no
+/// version 1 in the wild — the first versioned schema is 1, and every
+/// database that exists reads 0 (never versioned) until this runs. A
+/// database already at version 1 is left in place.
+pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::params;
+    let version: i64 = conn.query_row("PRAGMA user_version", params![], |r| r.get(0))?;
+    if version < 1 {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS registry_account;
+             DROP TABLE IF EXISTS name_events;
+             DROP TABLE IF EXISTS names;
+             DROP TABLE IF EXISTS watched_ironwood_notes;
+             DROP TABLE IF EXISTS anchor_facts;
+             DROP TABLE IF EXISTS implicit_releases;",
+        )?;
+    }
+    conn.execute_batch(SCHEMA_SQL)
+}

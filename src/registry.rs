@@ -6,7 +6,9 @@ use rusqlite::Connection;
 use zcash_protocol::consensus::Network;
 use zns_verify::Action;
 
+mod anchor_lineage;
 pub(crate) mod core;
+mod nf;
 mod notes;
 pub(crate) mod storage;
 
@@ -20,7 +22,7 @@ pub(crate) struct Db(Arc<Mutex<Connection>>);
 impl Db {
     pub(crate) fn open(ufvk: &str, birthday: u32, db_path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
-        conn.execute_batch(storage::SCHEMA_SQL)?;
+        storage::install_schema(&conn)?;
         let net_str = if crate::NETWORK == Network::MainNetwork {
             "main"
         } else {
