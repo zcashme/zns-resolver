@@ -1775,7 +1775,7 @@ dependencies = [
 [[package]]
 name = "seer-sync"
 version = "0.4.0"
-source = "git+https://github.com/zcashme/seer-sync.git?tag=seer-sync-v0.4.0#df6e65402285334350d81add34b95aa0a8535a70"
+source = "git+https://github.com/zcashme/seer-sync.git?rev=707d8d930a57215957fcd99ab2d143ce4173801d#707d8d930a57215957fcd99ab2d143ce4173801d"
 dependencies = [
  "http",
  "orchard",
