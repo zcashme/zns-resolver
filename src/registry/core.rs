@@ -92,12 +92,6 @@ pub(crate) fn install_registry_config(
     Ok(())
 }
 
-/// The main write path: bookkeeping first (received and spent ironwood
-/// nullifiers), then per-name candidate admission — chain rule, commitment
-/// binding, consumption proof; a release disclosing the block-start rcm is
-/// considered first (WP §6.3). All inside one transaction, so readers see
-/// pre-batch or post-batch state, never partial. The connection lock makes
-/// this the sole mutator; tip reads and writes share the transaction.
 /// One triage survivor, pre-verification: everything `Candidate` needs
 /// except the parse, which borrows the per-block memo arena.
 struct Source<'a> {
@@ -111,6 +105,12 @@ struct Source<'a> {
     rcm: pallas::Scalar,
 }
 
+/// The main write path: triage and anchor-fact bookkeeping, then candidate
+/// admission in canonical transaction order. Admission applies the chain rule,
+/// commitment binding, consumption proof, and implicit-release behavior.
+/// All work runs in one transaction, so readers see pre-batch or post-batch
+/// state, never partial. The connection lock makes this the sole mutator;
+/// tip reads and writes share the transaction.
 pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
