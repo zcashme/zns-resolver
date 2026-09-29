@@ -285,7 +285,7 @@ pub(crate) fn apply_batch(
                 has_single_name_note: candidate_counts.get(&txid).copied().unwrap_or(0) == 1,
             };
             let snapshot = lineage.clone();
-            lineage.step_tx(&facts);
+            lineage.step_tx(height, &facts);
             tx_law.push(TxLaw {
                 txid,
                 tx_index,
@@ -366,6 +366,7 @@ fn load_lineage(conn: &Connection) -> rusqlite::Result<Lineage> {
     // Group by transaction, in canonical order.
     let mut lineage = Lineage::new();
     for group in events.chunk_by(|a, b| (a.0.height, a.0.tx_index) == (b.0.height, b.0.tx_index)) {
+        let height = group[0].0.height;
         let mut facts = TxAnchorFacts::default();
         for (_, event) in group.iter().copied() {
             match event {
@@ -379,13 +380,15 @@ fn load_lineage(conn: &Connection) -> rusqlite::Result<Lineage> {
                 FactEvent::Retirement(nf) => facts.retirements.push(Retirement { nf }),
             }
         }
-        lineage.step_tx(&facts);
+        lineage.step_tx(height, &facts);
     }
     // An empty lineage past the ceremony height means the scan began after
     // the keygen ceremony: every claim will be rejected (fail closed).
     tracing::debug!(
         anchors = lineage.len(),
         empty = lineage.is_empty(),
+        adoption_closed = lineage.adoption_closed(),
+        established = lineage.established(),
         "anchor lineage folded from facts"
     );
     Ok(lineage)
@@ -1622,7 +1625,7 @@ mod admission {
         let _ = snapshot;
 
         // the fold already consumed the block's facts before admission
-        lineage.step_tx(&tx_law[0].facts);
+        lineage.step_tx(100, &tx_law[0].facts);
 
         apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
 
@@ -1654,7 +1657,7 @@ mod admission {
         )];
         let mut live_names = HashSet::new();
         let mut lineage = seeded;
-        lineage.step_tx(&tx_law[0].facts);
+        lineage.step_tx(100, &tx_law[0].facts);
 
         apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
 
@@ -1697,7 +1700,7 @@ mod admission {
         )];
         let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
         let mut lineage = seeded;
-        lineage.step_tx(&tx_law[0].facts);
+        lineage.step_tx(100, &tx_law[0].facts);
 
         apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
 
@@ -1769,8 +1772,8 @@ mod admission {
 
         let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
         let mut lineage = seeded;
-        lineage.step_tx(&tx_law[0].facts);
-        lineage.step_tx(&tx_law[1].facts);
+        lineage.step_tx(100, &tx_law[0].facts);
+        lineage.step_tx(100, &tx_law[1].facts);
 
         let candidates = vec![update, release];
         apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
@@ -1827,7 +1830,7 @@ mod admission {
         )];
         let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
         let mut lineage = seeded;
-        lineage.step_tx(&tx_law[0].facts);
+        lineage.step_tx(100, &tx_law[0].facts);
 
         apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
 
@@ -1866,7 +1869,7 @@ mod admission {
         )];
         let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
         let mut lineage = seeded;
-        lineage.step_tx(&tx_law[0].facts);
+        lineage.step_tx(100, &tx_law[0].facts);
 
         let candidates: Vec<Candidate> = vec![];
         apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
@@ -1878,11 +1881,14 @@ mod admission {
     fn seeded_lineage(anchors: &[u8]) -> Lineage {
         let mut lineage = Lineage::new();
         for seed in anchors {
-            lineage.step_tx(&TxAnchorFacts {
-                adoptions: vec![Adoption { nf: nf(*seed) }],
-                retirements: vec![],
-                has_single_name_note: false,
-            });
+            lineage.step_tx(
+                0,
+                &TxAnchorFacts {
+                    adoptions: vec![Adoption { nf: nf(*seed) }],
+                    retirements: vec![],
+                    has_single_name_note: false,
+                },
+            );
         }
         lineage
     }

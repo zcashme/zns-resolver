@@ -3,10 +3,11 @@
 //! The lineage is never maintained — it is recomputed from chain facts.
 //! The rules mirror the mint's claim-anchor semantics exactly
 //! (`zns-mint` `AnchorPool` / `apply_block`): zero-value registry outputs
-//! adopt in canonical order while below standing size; a revealed
-//! nullifier retires whatever the rest of its transaction turned out to
-//! be; a successor joins one-for-one, past standing size, only when
-//! exactly one live anchor retired.
+//! adopt in canonical order until the pool first reaches standing size;
+//! a later shrink does not reopen ceremony filling. A revealed nullifier
+//! retires whatever the rest of its transaction turned out to be; a
+//! successor joins one-for-one — including while the pool is short —
+//! only when exactly one live anchor retired.
 //!
 //! Because the fold is a pure function of facts, reorg correctness is
 //! inherited from the fact tables' rewind semantics: folding the facts
@@ -64,10 +65,15 @@ impl TxAnchorFacts {
     }
 }
 
-/// The set of nullifiers that currently confer claim authority.
+/// The set of nullifiers that currently confer claim authority, plus the
+/// block where ceremony adoption first reached standing size.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Lineage {
     live: BTreeSet<AnchorNf>,
+    /// Block where ceremony adoption first reached standing size.
+    /// Later ordinary outputs do not refill a shrunken pool. Cleared
+    /// only when a rewind removes that block from the fact stream.
+    established: Option<u32>,
 }
 
 impl Lineage {
@@ -75,14 +81,27 @@ impl Lineage {
         Self::default()
     }
 
+    /// Whether ceremony adoption has already reached standing size.
+    pub(crate) fn adoption_closed(&self) -> bool {
+        self.established.is_some()
+    }
+
+    /// Block where ceremony adoption first reached standing size.
+    pub(crate) fn established(&self) -> Option<u32> {
+        self.established
+    }
+
     /// Advances the lineage across one transaction, in the mint's order:
-    /// ceremony adoptions (capped at standing size, canonical order), then
-    /// retirements (facts follow the chain whatever the verdict), then the
-    /// one-for-one successor when the output shape is exactly one.
-    pub(crate) fn step_tx(&mut self, facts: &TxAnchorFacts) {
+    /// ceremony adoptions (until first standing size, canonical order),
+    /// then retirements (facts follow the chain whatever the verdict),
+    /// then the one-for-one successor when the output shape is exactly one.
+    pub(crate) fn step_tx(&mut self, height: u32, facts: &TxAnchorFacts) {
         for adoption in &facts.adoptions {
-            if self.live.len() < ANCHOR_POOL_SIZE {
-                self.live.insert(adoption.nf);
+            if self.adoption_closed() || self.live.len() >= ANCHOR_POOL_SIZE {
+                continue;
+            }
+            if self.live.insert(adoption.nf) && self.live.len() == ANCHOR_POOL_SIZE {
+                self.established = Some(height);
             }
         }
 
@@ -95,7 +114,9 @@ impl Lineage {
 
         // One-for-one, mirroring the mint's retire_spent: a successor
         // takes a seat only when exactly one live anchor retired —
-        // authority cannot be minted, only succeeded.
+        // authority cannot be minted, only succeeded. This insert is
+        // independent of ceremony close: a backed successor still
+        // enters while the pool is short.
         if retired == 1 && facts.has_single_name_note && facts.has_successor() {
             self.live.insert(facts.adoptions[0].nf);
         }
@@ -150,26 +171,32 @@ mod tests {
         Retirement { nf: nf(seed) }
     }
 
+    fn ceremony_adopt(seed: u8) -> TxAnchorFacts {
+        TxAnchorFacts {
+            adoptions: vec![adopt(seed)],
+            retirements: vec![],
+            has_single_name_note: false,
+        }
+    }
+
+    fn fill_to_standing_size(lineage: &mut Lineage, height: u32) {
+        for i in 0..ANCHOR_POOL_SIZE {
+            lineage.step_tx(height, &ceremony_adopt(i as u8 + 1));
+        }
+    }
+
     /// Ceremony filling stops at standing size; extras never enter — and a
     /// tx with no name-note candidate takes `follow_spends` (successor
     /// `None`), so a stray zero-value output cannot join past the cap.
     #[test]
     fn adoption_is_capped_at_standing_size() {
         let mut lineage = Lineage::new();
-        for i in 0..ANCHOR_POOL_SIZE {
-            lineage.step_tx(&TxAnchorFacts {
-                adoptions: vec![adopt(i as u8 + 1)],
-                retirements: vec![],
-                has_single_name_note: false,
-            });
-        }
+        fill_to_standing_size(&mut lineage, 1);
         assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
+        assert!(lineage.adoption_closed());
+        assert_eq!(lineage.established(), Some(1));
 
-        lineage.step_tx(&TxAnchorFacts {
-            adoptions: vec![adopt(u8::MAX)],
-            retirements: vec![],
-            has_single_name_note: false,
-        });
+        lineage.step_tx(2, &ceremony_adopt(u8::MAX));
         assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
         assert!(!lineage.contains(&nf(u8::MAX)));
     }
@@ -178,16 +205,15 @@ mod tests {
     #[test]
     fn retirement_follows_the_chain_fact() {
         let mut lineage = Lineage::new();
-        lineage.step_tx(&TxAnchorFacts {
-            adoptions: vec![adopt(1)],
-            retirements: vec![],
-            has_single_name_note: false,
-        });
-        lineage.step_tx(&TxAnchorFacts {
-            adoptions: vec![],
-            retirements: vec![retire(1)],
-            has_single_name_note: false,
-        });
+        lineage.step_tx(1, &ceremony_adopt(1));
+        lineage.step_tx(
+            2,
+            &TxAnchorFacts {
+                adoptions: vec![],
+                retirements: vec![retire(1)],
+                has_single_name_note: false,
+            },
+        );
         assert!(lineage.is_empty());
     }
 
@@ -195,21 +221,18 @@ mod tests {
     #[test]
     fn successor_joins_past_standing_size() {
         let mut lineage = Lineage::new();
-        for i in 0..ANCHOR_POOL_SIZE {
-            lineage.step_tx(&TxAnchorFacts {
-                adoptions: vec![adopt(i as u8 + 1)],
-                retirements: vec![],
-                has_single_name_note: false,
-            });
-        }
+        fill_to_standing_size(&mut lineage, 1);
         // A backed claim: exactly one name-note candidate (the accept path),
         // spends one live anchor, creates one zero-value output. The
         // successor takes the retired anchor's seat.
-        lineage.step_tx(&TxAnchorFacts {
-            adoptions: vec![adopt(200)],
-            retirements: vec![retire(1)],
-            has_single_name_note: true,
-        });
+        lineage.step_tx(
+            2,
+            &TxAnchorFacts {
+                adoptions: vec![adopt(200)],
+                retirements: vec![retire(1)],
+                has_single_name_note: true,
+            },
+        );
         assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
         assert!(!lineage.contains(&nf(1)));
         assert!(lineage.contains(&nf(200)));
@@ -220,17 +243,16 @@ mod tests {
     #[test]
     fn multi_adoption_tx_gets_no_successor_insert() {
         let mut lineage = Lineage::new();
-        lineage.step_tx(&TxAnchorFacts {
-            adoptions: vec![adopt(1)],
-            retirements: vec![],
-            has_single_name_note: false,
-        });
-        lineage.step_tx(&TxAnchorFacts {
-            adoptions: vec![adopt(2), adopt(3)],
-            retirements: vec![retire(1)],
-            has_single_name_note: true,
-        });
-        // Both adoptions entered (below standing size), the retirement
+        lineage.step_tx(1, &ceremony_adopt(1));
+        lineage.step_tx(
+            2,
+            &TxAnchorFacts {
+                adoptions: vec![adopt(2), adopt(3)],
+                retirements: vec![retire(1)],
+                has_single_name_note: true,
+            },
+        );
+        // Both adoptions entered (ceremony still open), the retirement
         // followed the fact, and the successor insert never fired — the
         // output shape is not `exactly one`.
         assert!(lineage.contains(&nf(2)));
@@ -245,20 +267,17 @@ mod tests {
     #[test]
     fn within_tx_order_adopts_then_retires_then_successor() {
         let mut lineage = Lineage::new();
-        for i in 0..ANCHOR_POOL_SIZE {
-            lineage.step_tx(&TxAnchorFacts {
-                adoptions: vec![adopt(i as u8 + 1)],
-                retirements: vec![],
-                has_single_name_note: false,
-            });
-        }
+        fill_to_standing_size(&mut lineage, 1);
         let before = lineage.len();
 
-        lineage.step_tx(&TxAnchorFacts {
-            adoptions: vec![adopt(200)],
-            retirements: vec![retire(7)],
-            has_single_name_note: true,
-        });
+        lineage.step_tx(
+            2,
+            &TxAnchorFacts {
+                adoptions: vec![adopt(200)],
+                retirements: vec![retire(7)],
+                has_single_name_note: true,
+            },
+        );
 
         assert_eq!(lineage.len(), before);
         assert!(lineage.contains(&nf(200)));
@@ -268,28 +287,78 @@ mod tests {
     /// A successor-shaped output with no live anchor retired behind it
     /// adopts nothing at standing size — the fold's mirror of the mint's
     /// fix (zns-mint #233): authority cannot be minted, only succeeded.
-    /// (Below standing size the ceremony-filling loop adopts any
-    /// zero-value output, exactly as the mint's adopt_anchor does — the
-    /// gate governs the steady state.)
+    /// After ceremony close the filling loop adopts nothing either.
     #[test]
     fn unbacked_successor_adopts_nothing() {
         let mut lineage = Lineage::new();
-        for i in 0..ANCHOR_POOL_SIZE {
-            lineage.step_tx(&TxAnchorFacts {
-                adoptions: vec![adopt(i as u8 + 1)],
-                retirements: vec![],
-                has_single_name_note: false,
-            });
-        }
+        fill_to_standing_size(&mut lineage, 1);
         assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
 
-        lineage.step_tx(&TxAnchorFacts {
-            adoptions: vec![adopt(50)],
-            retirements: vec![retire(99)], // 99 is not a live anchor
-            has_single_name_note: true,
-        });
+        lineage.step_tx(
+            2,
+            &TxAnchorFacts {
+                adoptions: vec![adopt(50)],
+                retirements: vec![retire(99)], // 99 is not a live anchor
+                has_single_name_note: true,
+            },
+        );
         assert!(!lineage.contains(&nf(50)));
         assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
+    }
+
+    /// Ceremony close is one-time: a later shrink does not reopen filling.
+    /// A one-for-one successor still enters while the pool is short.
+    /// Folding facts that survive a rewind drops the close only when the
+    /// completion block itself is gone.
+    #[test]
+    fn ceremony_adoption_stays_closed_after_the_pool_shrinks() {
+        let mut lineage = Lineage::new();
+        fill_to_standing_size(&mut lineage, 100);
+        assert!(lineage.adoption_closed());
+        assert_eq!(lineage.established(), Some(100));
+
+        // Candidate-free Registry spend: both anchors leave, no successor.
+        lineage.step_tx(
+            101,
+            &TxAnchorFacts {
+                adoptions: vec![],
+                retirements: vec![retire(1), retire(2)],
+                has_single_name_note: false,
+            },
+        );
+        lineage.step_tx(102, &ceremony_adopt(0xF0));
+        assert!(!lineage.contains(&nf(0xF0)));
+        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE - 2);
+        assert!(lineage.adoption_closed());
+
+        // A backed successor still replaces the one anchor it spends.
+        lineage.step_tx(
+            103,
+            &TxAnchorFacts {
+                adoptions: vec![adopt(201)],
+                retirements: vec![retire(3)],
+                has_single_name_note: true,
+            },
+        );
+        assert!(lineage.contains(&nf(201)));
+        lineage.step_tx(104, &ceremony_adopt(202));
+        assert!(!lineage.contains(&nf(202)));
+
+        // Rewind to the completion block: still closed, all 40 restored.
+        let mut at_completion = Lineage::new();
+        fill_to_standing_size(&mut at_completion, 100);
+        assert!(at_completion.adoption_closed());
+        assert_eq!(at_completion.len(), ANCHOR_POOL_SIZE);
+        at_completion.step_tx(100, &ceremony_adopt(203));
+        assert!(!at_completion.contains(&nf(203)));
+
+        // Rewind before completion: the ceremony can be reconstructed.
+        let mut before = Lineage::new();
+        assert!(!before.adoption_closed());
+        assert_eq!(before.len(), 0);
+        before.step_tx(100, &ceremony_adopt(1));
+        assert!(before.contains(&nf(1)));
+        assert!(!before.adoption_closed());
     }
 
     /// The reorg property: folding the facts that survive a rewind equals
@@ -300,31 +369,23 @@ mod tests {
     fn fold_over_rewound_facts_equals_fold_over_winning_chain() {
         // Winning chain: anchor 1 adopted at h10, retired at h12 by a claim
         // whose successor is anchor 2.
-        let mut facts = TxAnchorFacts {
-            adoptions: vec![adopt(1)],
-            retirements: vec![],
-            has_single_name_note: false,
-        };
+        let mut facts = ceremony_adopt(1);
         let mut lineage = Lineage::new();
-        lineage.step_tx(&facts);
+        lineage.step_tx(10, &facts);
 
         facts = TxAnchorFacts {
             adoptions: vec![adopt(2)],
             retirements: vec![retire(1)],
             has_single_name_note: true,
         };
-        lineage.step_tx(&facts);
+        lineage.step_tx(12, &facts);
         assert!(lineage.contains(&nf(2)));
 
         // A rewind below h12 un-spends the retirement: the surviving fact
         // stream is just the adoption of anchor 1. Folding it from scratch
         // must match a lineage rebuilt only from surviving facts.
         let mut rewound = Lineage::new();
-        rewound.step_tx(&TxAnchorFacts {
-            adoptions: vec![adopt(1)],
-            retirements: vec![],
-            has_single_name_note: false,
-        });
+        rewound.step_tx(10, &ceremony_adopt(1));
         assert!(rewound.contains(&nf(1)));
         assert_eq!(rewound.len(), 1);
         assert!(!rewound.contains(&nf(2)));
@@ -333,8 +394,8 @@ mod tests {
 
 /// The resolver folds the same chain facts the mint folds; the vendored
 /// canon fixture is the executable cross-repo contract. Every scenario is
-/// replayed into the fold and the live anchor set must equal the mint's
-/// recorded pool after every event.
+/// replayed into the fold; the live set and `adoption_closed` must equal
+/// the mint's recorded snapshot after every event.
 #[cfg(test)]
 mod canon {
     use super::*;
@@ -363,6 +424,12 @@ mod canon {
             height: u32,
             nullifier: String,
         },
+        /// Candidate-free Registry spend: live anchors in `spent` leave,
+        /// and no successor is seated.
+        Retire {
+            height: u32,
+            spent: Vec<String>,
+        },
         Claim {
             height: u32,
             spent_anchor: String,
@@ -388,6 +455,7 @@ mod canon {
     #[derive(Deserialize)]
     struct Trace {
         anchor_pool: Vec<String>,
+        adoption_closed: bool,
     }
 
     fn hex32(s: &str) -> AnchorNf {
@@ -410,16 +478,21 @@ mod canon {
         order.sort_by_key(|a| (a.height, a.tx_index));
         let mut lineage = Lineage::new();
         for applied in order {
-            lineage.step_tx(&applied.facts);
+            lineage.step_tx(applied.height, &applied.facts);
         }
         lineage
     }
 
-    fn assert_pool(lineage: &Lineage, pool: &[String]) {
-        assert_eq!(lineage.len(), pool.len(), "pool size");
-        for hex in pool {
+    fn assert_snapshot(lineage: &Lineage, trace: &Trace) {
+        assert_eq!(lineage.len(), trace.anchor_pool.len(), "pool size");
+        for hex in &trace.anchor_pool {
             assert!(lineage.contains(&hex32(hex)), "missing anchor {hex}");
         }
+        assert_eq!(
+            lineage.adoption_closed(),
+            trace.adoption_closed,
+            "adoption_closed"
+        );
     }
 
     #[test]
@@ -437,6 +510,7 @@ mod canon {
             names,
             [
                 "backed_claim",
+                "ceremony_closes_once",
                 "ceremony_fill",
                 "claim_after_release",
                 "duplicate_claim",
@@ -445,7 +519,7 @@ mod canon {
                 "update_then_release",
             ]
         );
-        assert_eq!(fixture.scenarios.len(), 7);
+        assert_eq!(fixture.scenarios.len(), 8);
 
         for scenario in &fixture.scenarios {
             let mut applied: Vec<Applied> = Vec::new();
@@ -458,6 +532,17 @@ mod canon {
                                 nf: hex32(nullifier),
                             }],
                             retirements: vec![],
+                            has_single_name_note: false,
+                        },
+                    ),
+                    CanonEvent::Retire { height, spent } => (
+                        *height,
+                        TxAnchorFacts {
+                            adoptions: vec![],
+                            retirements: spent
+                                .iter()
+                                .map(|s| Retirement { nf: hex32(s) })
+                                .collect(),
                             has_single_name_note: false,
                         },
                     ),
@@ -508,7 +593,7 @@ mod canon {
                     CanonEvent::Rewind { to_height } => {
                         applied.retain(|a| a.height <= *to_height);
                         let lineage = fold(&applied);
-                        assert_pool(&lineage, &scenario.trace[i].anchor_pool);
+                        assert_snapshot(&lineage, &scenario.trace[i]);
                         continue;
                     }
                 };
@@ -518,7 +603,7 @@ mod canon {
                     facts,
                 });
                 let lineage = fold(&applied);
-                assert_pool(&lineage, &scenario.trace[i].anchor_pool);
+                assert_snapshot(&lineage, &scenario.trace[i]);
             }
         }
     }

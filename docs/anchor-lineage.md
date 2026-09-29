@@ -26,22 +26,24 @@ The live anchor set — the nullifiers that currently confer claim
 authority — is a pure function of position-ordered chain facts:
 
 1. zero-value registry outputs **adopt** in canonical order
-   (height, tx_index, action_index) while below standing size
-   (`ANCHOR_POOL_SIZE = 40`, mirrors keygen's `NUM_ANCHORS`);
+   (height, tx_index, action_index) until the pool first reaches
+   standing size (`ANCHOR_POOL_SIZE = 40`, mirrors keygen's
+   `NUM_ANCHORS`). The fold records that completion block; a later
+   shrink does not reopen filling;
 2. a revealed nullifier **retires** whatever the rest of its transaction
-   turned out to be;
-3. a **successor** joins one-for-one, past standing size, only when
-   exactly one live anchor retired — authority cannot be minted, only
-   succeeded (mint lockstep: zns-mint #233). Below standing size the
-   ceremony-filling loop adopts any zero-value output, mirroring the
-   mint's `adopt_anchor`.
+   turned out to be — including a candidate-free Registry spend;
+3. a **successor** joins one-for-one — including while the pool is
+   short — only when exactly one live anchor retired. Authority cannot
+   be minted, only succeeded (mint lockstep: zns-mint #233). Ordinary
+   zero-value outputs after close stay out.
 
 `Lineage::step_tx` (`src/registry/anchor_lineage.rs`) folds one
 transaction's facts in exactly that order. It is never persisted: each
 batch folds the stored facts (`anchor_facts` table) into the state at
 batch start, then steps the batch's own transactions, snapshotting the
 pre-transaction state so every candidate is judged against the lineage its
-transaction was judged against.
+transaction was judged against. Rewind drops the close only when the
+completion block itself is removed from the fact stream.
 
 Consequences:
 
@@ -70,9 +72,10 @@ anchor is malformed.
 ## The canon contract
 
 `tests/fixtures/canon-vectors-v1.json` is vendored from zns-mint
-(provenance in `tests/fixtures/README.md`). All seven scenarios replay
-into the fold; the live set must equal the mint's recorded pool after
-every event. Two implementations, one executable contract.
+(provenance in `tests/fixtures/README.md`). All eight scenarios replay
+into the fold; the live set and `adoption_closed` must equal the mint's
+recorded snapshot after every event. Two implementations, one executable
+contract.
 
 ## Known residue
 
