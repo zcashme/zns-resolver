@@ -1302,9 +1302,9 @@ mod tests {
         assert_eq!(events, 1, "only the pre-release event survives");
     }
 
-    /// A pre-lineage database (version 1: old watch table, no fact tables,
-    /// stale checkpoint) is wiped on open, so the next scan replays from
-    /// the birthday instead of resuming past history it cannot interpret.
+    /// A pre-lineage database (user_version 0: old watch table, no fact
+    /// tables, stale checkpoint) is wiped on open, so the next scan replays
+    /// from the birthday instead of resuming past history it cannot interpret.
     #[test]
     fn pre_lineage_database_is_wiped_clean() {
         // A raw connection: the old-shape database predates the schema
@@ -1362,6 +1362,46 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(facts, 0);
+    }
+
+    /// Schema version 1 is the current schema. Opening it again must not
+    /// drop the index — the gate used to be `version < 2` while the schema
+    /// wrote version 1, so every startup wiped the database.
+    #[test]
+    fn current_schema_survives_reinstall() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
+        insert_checkpoint(&conn, 42, 7);
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 0, 10, 0, 0, 0, NULL)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+
+        crate::registry::storage::install_schema(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let facts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(facts, 1, "anchor facts survive a second install");
+        let position: Option<i64> = conn
+            .query_row("SELECT sync_height FROM registry_account", [], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert_eq!(
+            position,
+            Some(42),
+            "the checkpoint survives a second install"
+        );
     }
 
     fn insert_checkpoint(conn: &Connection, height: u32, hash_byte: u8) {

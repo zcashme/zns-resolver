@@ -89,11 +89,12 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
 /// rows lack tx_index. The version gate drops everything and reinstalls,
 /// so the next open rescans from the configured birthday. There is no
 /// version 1 in the wild — the first versioned schema is 1, and every
-/// database that exists reads 0 (never versioned) until this runs.
+/// database that exists reads 0 (never versioned) until this runs. A
+/// database already at version 1 is left in place.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::params;
     let version: i64 = conn.query_row("PRAGMA user_version", params![], |r| r.get(0))?;
-    if version < 2 {
+    if version < 1 {
         conn.execute_batch(
             "DROP TABLE IF EXISTS registry_account;
              DROP TABLE IF EXISTS name_events;
