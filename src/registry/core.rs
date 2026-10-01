@@ -37,6 +37,9 @@ struct Candidate<'a> {
     /// The verified opening of the ZNS binding.
     psi: pallas::Base,
     rcm: pallas::Scalar,
+    /// Tests force the underivable-nullifier path.
+    #[cfg(test)]
+    fail_nullifier: bool,
 }
 
 impl Candidate<'_> {
@@ -143,14 +146,17 @@ pub(crate) fn apply_batch(
                 let (action_index, cand_note, _action_nullifier, memo, _) = output;
 
                 let Some(memo) = memo else {
+                    candidate_dropped("missing memo", &txid, *action_index);
                     continue;
                 };
                 let Ok(zns_memo) = Memo::from_bytes(memo) else {
+                    candidate_dropped("undecodable memo", &txid, *action_index);
                     continue;
                 };
                 // Gate: protocol parse. The kernel's structural rules are the
                 // authority — invalid statements never become candidates.
                 let Ok(note) = NameNote::parse(&zns_memo) else {
+                    candidate_dropped("memo is not a name note", &txid, *action_index);
                     continue;
                 };
                 // Gate: binding — the transition, hashed under the ZNS
@@ -158,21 +164,27 @@ pub(crate) fn apply_batch(
                 let Some((psi, rcm)) =
                     notes::verify_commitment(&note, cand_note.note(), &cand_note.cmx().to_bytes())
                 else {
+                    candidate_dropped("commitment does not bind", &txid, *action_index);
                     continue;
                 };
                 // Gate: shape — zero value, registry recipient.
-                if cand_note.note().value().inner() != 0
-                    || cand_note.note().recipient() != registry_recipient
-                {
+                if cand_note.note().value().inner() != 0 {
+                    candidate_dropped("value is not zero", &txid, *action_index);
+                    continue;
+                }
+                if cand_note.note().recipient() != registry_recipient {
+                    candidate_dropped("recipient is not the registry", &txid, *action_index);
                     continue;
                 }
                 // Gate: the bound UA must decode as a Unified Address on this
                 // network (restores 304193b, lost in the #27 refactor).
                 let ua = note.ua().as_str();
                 let Some((ua_network, _)) = zcash_address::unified::Address::decode(ua).ok() else {
+                    candidate_dropped("ua does not decode", &txid, *action_index);
                     continue;
                 };
                 if ua_network != crate::NETWORK.network_type() {
+                    candidate_dropped("ua is for another network", &txid, *action_index);
                     continue;
                 }
 
@@ -203,6 +215,8 @@ pub(crate) fn apply_batch(
                 note_orchard: src.cand_note,
                 psi: src.psi,
                 rcm: src.rcm,
+                #[cfg(test)]
+                fail_nullifier: false,
             });
         }
 
@@ -242,7 +256,7 @@ pub(crate) fn apply_batch(
             }
             for spend in &tx_data.ironwood_spends {
                 let nf = AnchorNf::from_scan(spend.nf);
-                db_tx.execute(
+                let updated = db_tx.execute(
                     "UPDATE anchor_facts SET spent_height = ?1, spent_tx_index = ?2, spent_action_index = ?3
                      WHERE nullifier = ?4 AND spent_height IS NULL",
                     params![
@@ -252,6 +266,16 @@ pub(crate) fn apply_batch(
                         nf.as_bytes().as_slice()
                     ],
                 )?;
+                // Name-tip spends are watched and revealed here, and they are
+                // not anchor facts. Any other miss is a spend we cannot place.
+                if updated == 0 && !live_names.contains(nf.as_bytes()) {
+                    tracing::debug!(
+                        nullifier = ?nf.as_bytes(),
+                        height = block_height,
+                        tx_index,
+                        "spend matched no anchor fact"
+                    );
+                }
             }
         }
 
@@ -410,8 +434,11 @@ fn live_name_nullifiers(conn: &Connection) -> rusqlite::Result<HashSet<[u8; 32]>
     let mut set = HashSet::new();
     for bytes in rows {
         let bytes: Vec<u8> = bytes?;
+        let len = bytes.len();
         if let Ok(nf) = <[u8; 32]>::try_from(bytes) {
             set.insert(nf);
+        } else {
+            tracing::warn!(len, "name nullifier has an unexpected length");
         }
     }
     Ok(set)
@@ -509,10 +536,17 @@ fn apply_candidates(
                 let Some(expected_prev) =
                     notes::check_chain_rule(binding.as_ref().map(|b| &b.0), note)
                 else {
+                    admission_dropped("chain rule", candidate.name(), &candidate.txid, height);
                     continue;
                 };
 
                 let Some(nullifier) = admit_nullifier(candidate, fvk) else {
+                    admission_dropped(
+                        "nullifier underivable",
+                        candidate.name(),
+                        &candidate.txid,
+                        height,
+                    );
                     continue;
                 };
                 record_admission(
@@ -567,6 +601,7 @@ fn apply_candidates(
                 let Some(expected_prev) =
                     notes::check_chain_rule(binding.as_ref().map(|b| &b.0), note)
                 else {
+                    admission_dropped("chain rule", candidate.name(), &candidate.txid, height);
                     if let Some(consumed) = tip_nf {
                         end_binding_implicitly(
                             db_tx,
@@ -583,6 +618,27 @@ fn apply_candidates(
                 };
 
                 let Some(nullifier) = admit_nullifier(candidate, fvk) else {
+                    // The tip was spent on chain. Leaving the names row in
+                    // place would keep serving a note that can never be spent
+                    // again.
+                    admission_dropped(
+                        "nullifier underivable",
+                        candidate.name(),
+                        &candidate.txid,
+                        height,
+                    );
+                    if let Some(consumed) = tip_nf {
+                        end_binding_implicitly(
+                            db_tx,
+                            live_names,
+                            candidate.name(),
+                            height,
+                            &candidate.txid,
+                            law.tx_index,
+                            candidate.action_index,
+                            &consumed,
+                        )?;
+                    }
                     continue;
                 };
                 record_admission(
@@ -619,8 +675,20 @@ fn apply_candidates(
     Ok(())
 }
 
+fn candidate_dropped(reason: &'static str, txid: &[u8; 32], action_index: usize) {
+    tracing::debug!(reason, txid = ?txid, action_index, "candidate dropped");
+}
+
+fn admission_dropped(reason: &'static str, name: &str, txid: &[u8; 32], height: u32) {
+    tracing::warn!(reason, name, txid = ?txid, height, "admission dropped");
+}
+
 /// The admission nullifier of a verified candidate.
 fn admit_nullifier(candidate: &Candidate, fvk: &FullViewingKey) -> Option<[u8; 32]> {
+    #[cfg(test)]
+    if candidate.fail_nullifier {
+        return None;
+    }
     candidate
         .note_orchard
         .zns_nullifier(
@@ -803,7 +871,16 @@ pub(crate) fn resume(conn: &Connection) -> rusqlite::Result<Resume> {
     let checkpoint = checkpoint(conn)?;
     let ironwood: Vec<Nullifier> = ironwood_nullifiers(conn)?
         .into_iter()
-        .filter_map(|nf| Option::from(Nullifier::from_bytes(nf.as_bytes())))
+        .filter_map(|nf| {
+            let bytes = *nf.as_bytes();
+            match Option::from(Nullifier::from_bytes(&bytes)) {
+                Some(decoded) => Some(decoded),
+                None => {
+                    tracing::warn!(nullifier = ?bytes, "watch-set nullifier failed to decode");
+                    None
+                }
+            }
+        })
         .collect();
     let birthday = birthday(conn)?;
 
@@ -1602,6 +1679,7 @@ mod admission {
             note_orchard: test_note(),
             psi,
             rcm,
+            fail_nullifier: false,
         }
     }
 
@@ -1846,6 +1924,47 @@ mod admission {
             .unwrap();
         assert_eq!(rel_name, "z");
         assert_eq!(rel_nf, nullifier_u);
+    }
+
+    /// The tip was spent and the chain rule passed, but the successor
+    /// nullifier cannot be derived. The binding ends; the spent name does
+    /// not stay resolvable.
+    #[test]
+    fn update_whose_nullifier_cannot_be_derived_ends_the_binding() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        let memos = vec![memo_for("update", "z", &[0x02; 32])];
+        let mut update = candidate(&memos, 0, 0, 0, [1; 32], "update", "z", [0x02; 32]);
+        update.fail_nullifier = true;
+        assert!(admit_nullifier(&update, &fvk).is_none());
+
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![tx_law_for(
+            [1; 32],
+            seeded,
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&[0x5a; 32]),
+            }],
+            true,
+        )];
+        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+
+        apply_candidates(&tx, 100, &[update], &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+        assert!(!live_names.contains(&[0x5a; 32]));
     }
 
     /// The mint spends the live tip in one action and writes the release
