@@ -13,9 +13,7 @@ use crate::registry::Db;
 
 use zcash_address::ZcashAddress;
 
-use super::records::{
-    EventsPage, NameEvent, NameRecord, Paginated, ResolveResult, Status,
-};
+use super::records::{EventsPage, NameEvent, NameRecord, Paginated, ResolveResult, Status};
 
 /// The network head as published live by the tip publisher: `None` until the
 /// first poll lands.
@@ -136,8 +134,8 @@ impl ZnsApiServer for JsonRpcApi {
         // The empty query lists all registrations — the page-through form
         // explorers and sitemaps build on.
         if query.is_empty() {
-            let (regs, _) = core::list_registrations(&conn, limit_u32, offset_u32)
-                .map_err(RpcError::from)?;
+            let (regs, _) =
+                core::list_registrations(&conn, limit_u32, offset_u32).map_err(RpcError::from)?;
             return Ok(ResolveResult::Many(
                 regs.into_iter().map(NameRecord::from).collect(),
             ));
