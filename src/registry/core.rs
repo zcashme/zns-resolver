@@ -188,20 +188,23 @@ pub(crate) fn apply_batch(
                 });
             }
         }
-        let candidates: Vec<Candidate> = memos
-            .iter()
-            .zip(&sources)
-            .map(|(memo, src)| Candidate {
+        let mut candidates = Vec::with_capacity(memos.len());
+        for (memo, src) in memos.iter().zip(&sources) {
+            // Triage already parsed this memo. A second failure aborts the
+            // batch instead of panicking while the database lock is held.
+            let note = NameNote::parse(memo)
+                .map_err(|_| invariant_failure("name note failed to reparse after triage"))?;
+            candidates.push(Candidate {
                 action_index: src.action_index,
                 txid: src.txid,
                 memo: src.memo,
-                note: NameNote::parse(memo).expect("arena memo parsed at triage"),
+                note,
                 cand_cmx: src.cand_cmx,
                 note_orchard: src.cand_note,
                 psi: src.psi,
                 rcm: src.rcm,
-            })
-            .collect();
+            });
+        }
 
         // The accept-path marker per transaction: the mint offers
         // exactly-one-candidate transactions to the law; every other
@@ -641,7 +644,7 @@ fn mark_released_spent(
 ) -> rusqlite::Result<()> {
     for retirement in &facts.retirements {
         let nf = retirement.nf.as_bytes();
-        if !live_names.remove(nf) {
+        if !live_names.contains(nf) {
             continue;
         }
         let name: String = db_tx
@@ -651,7 +654,8 @@ fn mark_released_spent(
                 |r| r.get(0),
             )
             .optional()?
-            .expect("live-name set mirrors the names table");
+            .ok_or_else(|| invariant_failure("live-name set does not match the names table"))?;
+        live_names.remove(nf);
         db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
         db_tx.execute(
             "INSERT OR IGNORE INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
@@ -1134,9 +1138,15 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
 /// parses, or disagrees with its identity columns. Corrupt and must not be
 /// served.
 fn corrupt_record() -> rusqlite::Error {
+    invariant_failure("registry record is corrupt")
+}
+
+/// A state the scan must not commit: the batch returns this and rolls back
+/// instead of panicking under the database lock.
+fn invariant_failure(detail: &str) -> rusqlite::Error {
     rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
-        Some("registry record is corrupt".to_string()),
+        Some(detail.to_string()),
     )
 }
 
@@ -1454,6 +1464,40 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(watched, 0);
+    }
+
+    /// The live-name set claimed a nullifier the names table does not have.
+    /// That used to panic under the database lock.
+    #[test]
+    fn mark_released_errors_when_the_names_row_is_missing() {
+        let conn = database();
+        let tx = conn.unchecked_transaction().unwrap();
+        let nf = [0x5a_u8; 32];
+        let mut live_names = HashSet::from([nf]);
+        let facts = TxAnchorFacts {
+            adoptions: vec![],
+            retirements: vec![Retirement {
+                nf: AnchorNf::from_bytes(&nf),
+            }],
+            has_single_name_note: false,
+        };
+
+        let error =
+            mark_released_spent(&tx, &mut live_names, &facts, 100, &[1; 32], 0, 0).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("live-name set does not match the names table"),
+            "{error}"
+        );
+        assert!(live_names.contains(&nf));
+        let releases: i64 = tx
+            .query_row("SELECT COUNT(*) FROM implicit_releases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(releases, 0);
     }
 }
 

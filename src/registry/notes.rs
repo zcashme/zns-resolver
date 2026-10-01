@@ -28,8 +28,8 @@ pub(crate) fn verify_commitment(
     let rho = Rho::from_bytes(&cand_note.rho().to_bytes())?;
     let cmx = ZnsCmx::from_bytes(cand_cmx)?;
     let raw = cand_note.recipient().to_raw_address_bytes();
-    let diversifier: [u8; 11] = raw[..11].try_into().expect("raw address is 43 bytes");
-    let pk_d: [u8; 32] = raw[11..].try_into().expect("raw address is 43 bytes");
+    let diversifier: [u8; 11] = raw[..11].try_into().ok()?;
+    let pk_d: [u8; 32] = raw[11..].try_into().ok()?;
     let g_d = diversify_hash(&diversifier);
     let value = cand_note.value().inner();
     verify_name_note_with_witness(note, g_d, pk_d, value, rho, cmx)
