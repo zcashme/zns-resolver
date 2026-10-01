@@ -8,23 +8,13 @@ describe("ZNS", () => {
   let zns: ZNS;
 
   beforeEach(() => {
-    zns = new ZNS();
+    zns = new ZNS({ url: "https://resolver.example" });
   });
 
   describe("constructor", () => {
-    it("defaults to testnet", () => {
-      const z = new ZNS();
-      expect(z.network).toBe("testnet");
-    });
-
-    it("accepts network option", () => {
-      const z = new ZNS({ network: "mainnet" });
-      expect(z.network).toBe("mainnet");
-    });
-
-    it("accepts custom url", () => {
-      const z = new ZNS({ url: "https://custom.example.com" });
-      expect(z.url).toBe("https://custom.example.com");
+    it("uses the configured current resolver URL", () => {
+      const z = new ZNS({ url: "https://resolver.example" });
+      expect(z.url).toBe("https://resolver.example");
     });
   });
 
@@ -45,26 +35,16 @@ describe("ZNS", () => {
   });
 
   describe("normalizeName", () => {
-    it("lowercases and strips .zcash/.zec suffix in any case", () => {
+    it("trims and lowercases lookup input", () => {
       expect(zns.normalizeName("alice")).toBe("alice");
-      expect(zns.normalizeName("Alice.zcash")).toBe("alice");
-      expect(zns.normalizeName("alice.zec")).toBe("alice");
-      expect(zns.normalizeName("aLice.Zec")).toBe("alice");
-      expect(zns.normalizeName("alice.ZCASH")).toBe("alice");
       expect(zns.normalizeName("ALICE")).toBe("alice");
-      expect(zns.normalizeName("  alice.Zec  ")).toBe("alice");
+      expect(zns.normalizeName("  Alice  ")).toBe("alice");
     });
 
-    it("does not strip non-suffix lookalikes", () => {
-      expect(zns.normalizeName("zec")).toBe("zec");
-      expect(zns.normalizeName("zcash")).toBe("zcash");
+    it("does not strip suffixes or alter punctuation", () => {
+      expect(zns.normalizeName("Alice.zcash")).toBe("alice.zcash");
       expect(zns.normalizeName("alice.eth")).toBe("alice.eth");
       expect(zns.normalizeName("alice.")).toBe("alice.");
-    });
-
-    it("strips only one suffix", () => {
-      expect(zns.normalizeName("alice.zec.zec")).toBe("alice.zec");
-      expect(zns.normalizeName(".zec")).toBe("");
     });
   });
 
@@ -88,8 +68,8 @@ describe("ZNS", () => {
                 address: VALID_TESTNET_UA,
                 txid: "ab".repeat(32),
                 height: 100,
-                nonce: 0,
-                last_action: "CLAIM",
+                last_action: "claim",
+                expires_at: "none",
               },
             }),
           };
@@ -100,9 +80,11 @@ describe("ZNS", () => {
 
     it("sends the normalized name as the query", async () => {
       const bodies = stubResolve();
-      for (const input of ["Alice.zcash", "alice.zec", "aLice.Zec", "alice.ZCASH"]) {
+      for (const input of ["Alice", "alice", "aLiCe", "  ALICE  "]) {
         const reg = await zns.resolveName(input);
-        expect(reg?.name).toBe("alice");
+      expect(reg?.name).toBe("alice");
+      expect(reg?.lastAction).toBe("claim");
+      expect(reg?.expiresAt).toBe("none");
       }
       expect(bodies.map((b) => (b.params as { query: string }).query)).toEqual([
         "alice",
@@ -116,8 +98,7 @@ describe("ZNS", () => {
       const fetchSpy = vi.fn();
       vi.stubGlobal("fetch", fetchSpy);
       expect(await zns.resolveName("alice.eth")).toBeNull();
-      expect(await zns.resolveName("alice.zec.zec")).toBeNull();
-      expect(await zns.resolveName(".zec")).toBeNull();
+      expect(await zns.resolveName("alice.zec")).toBeNull();
       expect(await zns.resolveName("")).toBeNull();
       expect(await zns.isAvailable("alice.eth")).toBe(false);
       expect(fetchSpy).not.toHaveBeenCalled();
@@ -125,8 +106,65 @@ describe("ZNS", () => {
 
     it("isAvailable checks the normalized name", async () => {
       const bodies = stubResolve();
-      expect(await zns.isAvailable("Alice.zec")).toBe(false);
+      expect(await zns.isAvailable("Alice")).toBe(false);
       expect((bodies[0].params as { query: string }).query).toBe("alice");
+    });
+  });
+
+  describe("status and events", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("returns the current resolver status shape", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ result: {
+          synced_height: 123,
+          synced: true,
+          viewing_key: "ufvk-test",
+          registered: 7,
+        } }),
+      })));
+
+      await expect(zns.status()).resolves.toEqual({
+        syncedHeight: 123,
+        synced: true,
+        viewingKey: "ufvk-test",
+        registered: 7,
+      });
+    });
+
+    it("sends lowercase event filters using resolver parameter names", async () => {
+      let request: Record<string, unknown> | undefined;
+      vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
+        request = JSON.parse(init.body);
+        return { ok: true, json: async () => ({ result: {
+          events: [{
+            id: 1,
+            name: "alice",
+            action: "update",
+            txid: "ab".repeat(32),
+            height: 123,
+            action_index: 2,
+            address: VALID_TESTNET_UA,
+            expires_at: "none",
+          }],
+          total: 1,
+          limit: 50,
+          offset: 0,
+        } }) };
+      }));
+
+      const result = await zns.events({ name: "alice", action: "update", sinceHeight: 100 });
+      expect(request?.params).toEqual({ name: "alice", action: "update", since_height: 100 });
+      expect(result.events[0]).toMatchObject({
+        action: "update",
+        actionIndex: 2,
+        address: VALID_TESTNET_UA,
+        expiresAt: "none",
+      });
+      expect(result).toMatchObject({ total: 1, limit: 50, offset: 0 });
     });
   });
 

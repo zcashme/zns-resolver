@@ -37,7 +37,7 @@ Options:
   --help                       Show this help
 
 Environment:
-  ZNS_URL                      Resolver URL
+  ZNS_URL                      Resolver URL (required unless --url is set)
 
 Examples:
   zns resolve alice
@@ -49,6 +49,7 @@ Examples:
 async function main() {
   const { flags, positional } = parseArgs(args);
   const url = flags.url || process.env.ZNS_URL;
+  if (!url) throw new Error("Set ZNS_URL or pass --url <resolver-url>");
   const zns = new ZNS({ url });
 
   switch (command) {
@@ -82,17 +83,18 @@ async function main() {
     }
     case "status": {
       const status = await zns.status();
-      console.log(`Synced:     ${status.syncedHeight}`);
-      console.log(`UIVK:       ${status.uivk.slice(0, 30)}...`);
-      console.log(`Registry:   ${status.address}`);
+      console.log(`Height:     ${status.syncedHeight}`);
+      console.log(`Synced:     ${status.synced}`);
+      console.log(`Viewing key: ${status.viewingKey.slice(0, 30)}...`);
       console.log(`Registered: ${status.registered}`);
       break;
     }
     case "events": {
       const result = await zns.events(positional[0] ? { name: positional[0] } : {});
       for (const event of result.events) {
-        const parts = [event.action, event.name];
-        parts.push(`h=${event.height}`);
+        const parts = [event.action, event.name, event.address];
+        parts.push(`h=${event.height}`, `action=${event.actionIndex}`);
+        parts.push(`expires=${event.expiresAt}`);
         console.log(parts.join("  "));
       }
       console.log(`(${result.total} total)`);

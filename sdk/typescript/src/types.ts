@@ -1,8 +1,6 @@
 /** Read-only data types returned by the ZNS resolver. */
 
-export type Network = "testnet" | "mainnet";
-
-export const ZNS_ACTIONS = ["CLAIM", "UPDATE", "RELEASE"] as const;
+export const ZNS_ACTIONS = ["claim", "update", "release"] as const;
 export type ZnsAction = (typeof ZNS_ACTIONS)[number];
 export type LastAction = ZnsAction;
 export type EventAction = ZnsAction;
@@ -12,14 +10,14 @@ export interface Registration {
   address: string;
   txid: string;
   height: number;
-  nonce: number;
   lastAction: LastAction;
+  expiresAt: string;
 }
 
 export interface Status {
   syncedHeight: number;
-  uivk: string;
-  address: string;
+  synced: boolean;
+  viewingKey: string;
   registered: number;
 }
 
@@ -29,8 +27,9 @@ export interface Event {
   action: EventAction;
   txid: string;
   height: number;
-  ua: string | null;
-  nonce: number | null;
+  actionIndex: number;
+  address: string;
+  expiresAt: string;
 }
 
 export interface EventsFilter {
@@ -44,4 +43,6 @@ export interface EventsFilter {
 export interface EventsResult {
   events: Event[];
   total: number;
+  limit: number;
+  offset: number;
 }

@@ -2,7 +2,7 @@
 
 Read-only TypeScript client for querying the ZNS resolver.
 
-This package does not accept, load, derive, or sign with private keys. It does not build signed action memos. It currently retains the legacy resolver API while migration to the Name Note resolver API is tracked in [zns-resolver issue #39](https://github.com/zcashme/zns-resolver/issues/39).
+This package is a read-only client for the current Name Note resolver JSON-RPC API. It does not accept, load, derive, or sign with private keys, and it does not build Name Note transactions.
 
 ## Install
 
@@ -15,7 +15,7 @@ npm install zcashname-sdk
 ```ts
 import { ZNS } from "zcashname-sdk";
 
-const zns = new ZNS();
+const zns = new ZNS({ url: "https://your-resolver.example" });
 const name = await zns.resolveName("alice");
 if (name) console.log(name.address);
 
@@ -38,12 +38,12 @@ const status = await zns.status();
 ## Configuration
 
 ```ts
-const zns = new ZNS({ network: "testnet" });
-const custom = new ZNS({ url: "https://your-indexer.example/zns" });
-await custom.verify(); // checks that the reported UIVK matches the selected network
+const zns = new ZNS({ url: "https://your-resolver.example" });
+const status = await zns.status();
+console.log(status.synced, status.syncedHeight);
 ```
 
-The optional `verify()` check identifies a configured resolver by its UIVK. It does not verify a name binding against chain data.
+Pass the current resolver's JSON-RPC URL explicitly. The client reports the resolver's viewing key and sync state; it does not independently authenticate the server or verify name bindings against chain data.
 
 ## CLI example
 

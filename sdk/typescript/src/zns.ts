@@ -1,28 +1,11 @@
 import { bech32m } from "bech32";
 import type {
-  Network,
   Registration,
   Status,
   Event,
   EventsFilter,
   EventsResult,
 } from "./types.js";
-
-/** Network-specific configuration for ZNS. */
-export const NETWORKS = {
-  testnet: {
-    url: "https://light.zcash.me/zns-testnet",
-    registryAddress:
-      "utest1f32kn6c4zvn54xr8wfsnxmj9hzpu2mwgtxzpzwcw34906tdccdvzs0z2dx38lly7tpan77x6udt8pjczqm22ymsdhlz9j0tk5yq664nl",
-    uivk: "uivktest1hzw7wyadutvzfgpna80yftsk5l7jeyu2p5me5quvp28tytxueta00cx4068wnlzcv7tx9n3t3gfhsy83pe4y6jrhxtzaq0hj6xtg5zrk2dn7zen3vns2a5pgs4fxdjlletmqrhfa42",
-  },
-  mainnet: {
-    url: "https://light.zcash.me/zns-mainnet",
-    registryAddress:
-      "u1k0evt0ahj5qdt6y9ftsxndl8lrkm4ff6rp00u04cjpmqj6hxl9t8hfsxftmn3ht34e03lljh89czn2h8qn67rwrs8x0hm3lsxsucp9q9",
-    uivk: "uivk1gl26qy0xjja7lqhyg3pf0x4j4j66kqwewrjkdcg28eqq4wgtzjmujpee7x9cs2ec9xhnlgrm8ptlw8z80j2aryw8nqtssser2ys778a0s00uvgkdjnfr58sndhfvc3f4zqjs6ywva6",
-  },
-} as const;
 
 /** Valid ZNS name pattern: 1-62 lowercase alphanumeric chars. */
 const NAME_RE = /^[a-z0-9]{1,62}$/;
@@ -33,15 +16,10 @@ function isValidName(name: string): boolean {
 }
 
 /**
- * Normalizes a ZNS name for lookups: trims whitespace, lowercases, and
- * strips one trailing `.zcash` or `.zec` suffix (case-insensitive), so
- * `Alice.zcash`, `aLice.Zec`, and `alice` all normalize to `alice`.
+ * Canonicalizes lookup input by trimming whitespace and lowercasing.
  */
 function normalizeName(name: string): string {
-  return name
-    .trim()
-    .toLowerCase()
-    .replace(/\.(zcash|zec)$/, "");
+  return name.trim().toLowerCase();
 }
 
 /**
@@ -61,6 +39,14 @@ function normalizeApiResponse<T>(obj: unknown): T {
   return obj as T;
 }
 
+function toRpcParams(obj: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(obj)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => [key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`), value]),
+  );
+}
+
 /** Validates a Zcash unified (u-) address. */
 function isValidUnifiedAddress(address: string): boolean {
   if (!address) return false;
@@ -76,43 +62,14 @@ function isValidUnifiedAddress(address: string): boolean {
 
 export class ZNS {
   private url: string;
-  private network: Network;
   private rpcId = 0;
-  private _verified = false;
 
   /**
    * Creates a new ZNS client.
-   * @param options - Configuration options
-   * @param options.network - Network to connect to ("testnet" | "mainnet"), defaults to "testnet"
-   * @param options.url - Custom indexer URL (optional)
+   * @param options.url - Current resolver JSON-RPC endpoint
    */
-  constructor(options?: { network?: Network; url?: string }) {
-    this.network = options?.network ?? "testnet";
-    this.url = options?.url ?? NETWORKS[this.network].url;
-  }
-
-  /**
-   * Verifies that the connected server is a known ZNS instance.
-   * @throws Error if the server's UIVK is not recognized
-   */
-  async verify(): Promise<void> {
-    const status = await this.status();
-    if (status.uivk !== NETWORKS[this.network].uivk) {
-      throw new Error(
-        `UIVK mismatch: indexer returned "${status.uivk.slice(0, 20)}..." which is not a known ZNS instance`,
-      );
-    }
-    this._verified = true;
-  }
-
-  /** Returns true if {@link verify} has been called and passed. */
-  get verified(): boolean {
-    return this._verified;
-  }
-
-  /** Get the registry address for the current network. */
-  get registryAddress(): string {
-    return NETWORKS[this.network].registryAddress;
+  constructor(options: { url: string }) {
+    this.url = options.url;
   }
 
   /** Fetch current server status. */
@@ -123,9 +80,8 @@ export class ZNS {
 
   /** Resolve a ZNS name to its registration. Returns null if not registered.
    *
-   *  The name is normalized before querying: trimmed, lowercased, and one
-   *  trailing `.zcash`/`.zec` suffix stripped (case-insensitive), so
-   *  `Alice.zcash`, `aLice.Zec`, and `alice` all resolve the same name.
+   *  The name is trimmed and lowercased before querying, so `Alice` and
+   *  `alice` resolve the same name.
    *  Returns null without hitting the server if the name is invalid after
    *  normalization. Note the returned registration's `name` field is the
    *  normalized form, not the raw input. */
@@ -169,7 +125,7 @@ export class ZNS {
 
   /** Check if a name is available for registration.
    *  The name is normalized like {@link resolveName} first, so
-   *  `isAvailable("Alice.zec")` checks "alice". Returns false immediately
+   *  `isAvailable("Alice")` checks "alice". Returns false immediately
    *  for names that are invalid after normalization, without hitting the
    *  server. */
   async isAvailable(name: string): Promise<boolean> {
@@ -195,7 +151,7 @@ export class ZNS {
   async events(filter?: EventsFilter): Promise<EventsResult> {
     const raw = await this.rpc<Record<string, unknown>>(
       "events",
-      normalizeApiResponse(filter ?? {}) as Record<string, unknown>,
+      toRpcParams((filter ?? {}) as Record<string, unknown>),
     );
     return normalizeApiResponse<EventsResult>(raw);
   }
