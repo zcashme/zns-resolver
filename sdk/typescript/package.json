@@ -1,0 +1,41 @@
+{
+  "name": "zcashname-sdk",
+  "version": "0.12.0",
+  "type": "module",
+  "description": "TypeScript SDK for the Zcash Name System (ZNS).",
+  "main": "dist/zns.cjs",
+  "module": "dist/zns.js",
+  "types": "dist/zns.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/zns.d.ts",
+      "import": "./dist/zns.js",
+      "require": "./dist/zns.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup src/zns.ts --format cjs,esm --dts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zcashme/ZNS.git",
+    "directory": "sdk/typescript"
+  },
+  "dependencies": {
+    "@noble/ed25519": "^2.0.0",
+    "@noble/hashes": "^2.2.0",
+    "bech32": "^2.0.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^2.0.0"
+  }
+}
