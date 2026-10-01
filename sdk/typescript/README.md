@@ -29,7 +29,6 @@ console.log(available);
 const name = await zns.resolveName("alice");
 const names = await zns.resolveAddress("u1...");
 const allNames = await zns.listAllRegistrations(50, 0);
-const listings = await zns.listings(50, 0);
 const history = await zns.events({ name: "alice", limit: 20 });
 const status = await zns.status();
 ```
@@ -48,7 +47,7 @@ The optional `verify()` check identifies a configured resolver by its UIVK. It d
 
 ## CLI example
 
-The example CLI supports read-only queries such as `resolve`, `available`, `listings`, `status`, `events`, and `cost`. It has no signing commands and accepts no private-key input.
+The example CLI supports read-only queries: `resolve`, `available`, `status`, and `events`. It has no signing commands and accepts no private-key input.
 
 ## License
 

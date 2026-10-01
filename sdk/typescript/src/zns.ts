@@ -1,15 +1,12 @@
 import { blake2b } from "@noble/hashes/blake2.js";
 import { bech32m } from "bech32";
 import type {
-  Zats,
   Network,
   Registration,
-  Listing,
   Status,
   Event,
   EventsFilter,
   EventsResult,
-  Pricing,
   MerkleProof,
   RegistrationWithProof,
 } from "./types.js";
@@ -159,7 +156,7 @@ export class ZNS {
     return NETWORKS[this.network].registryAddress;
   }
 
-  /** Fetch current server status including pricing and configuration. */
+  /** Fetch current server status. */
   async status(): Promise<Status> {
     const raw = await this.rpc<Record<string, unknown>>("status");
     return normalizeApiResponse<Status>(raw);
@@ -270,23 +267,6 @@ export class ZNS {
   normalizeName = normalizeName;
   isValidUnifiedAddress = isValidUnifiedAddress;
 
-  async listings(
-    limit?: number,
-    offset?: number,
-  ): Promise<{ listings: Listing[]; total: number }> {
-    const raw = await this.rpc<{
-      listings: Record<string, unknown>[];
-      total: number;
-    }>("listings", {
-      limit,
-      offset,
-    });
-    return {
-      listings: raw.listings.map((l) => normalizeApiResponse<Listing>(l)),
-      total: raw.total,
-    };
-  }
-
   async events(filter?: EventsFilter): Promise<EventsResult> {
     const raw = await this.rpc<Record<string, unknown>>(
       "events",
@@ -321,28 +301,6 @@ export class ZNS {
     }
     const claimed = hexToBytes(reg.proof.root);
     return bytesEqual(h, claimed);
-  }
-
-  /**
-   * Get the claim cost in zatoshis for a name of given length.
-   * @param nameLength The length of the name (1-62)
-   * @param pricing The pricing configuration - obtain from {@link status}
-   * @returns The cost in zatoshis, or null if pricing is unavailable
-   */
-  claimCost(nameLength: number, pricing: Pricing): Zats | null {
-    if (pricing.tiers.length === 0) return null;
-    const idx = Math.min(Math.max(nameLength - 1, 0), pricing.tiers.length - 1);
-    return pricing.tiers[idx];
-  }
-
-  /**
-   * Get the listing commission in zatoshis (10% of the minimum pricing tier).
-   * @param pricing The pricing configuration - obtain from {@link status}
-   * @returns The commission in zatoshis, or null if pricing is unavailable
-   */
-  listCommission(pricing: Pricing): Zats | null {
-    if (pricing.tiers.length === 0) return null;
-    return Math.min(...pricing.tiers) * 0.1;
   }
 
   /** Parse a ZIP-321 URI into its components. */

@@ -154,37 +154,6 @@ describe("ZNS", () => {
     });
   });
 
-  describe("claimCost", () => {
-    it("returns correct tier for name length", () => {
-      const pricing = { tiers: [100, 200, 300, 500, 1000] };
-      expect(zns.claimCost(1, pricing)).toBe(100);
-      expect(zns.claimCost(2, pricing)).toBe(200);
-      expect(zns.claimCost(3, pricing)).toBe(300);
-      expect(zns.claimCost(4, pricing)).toBe(500);
-      expect(zns.claimCost(62, pricing)).toBe(1000);
-    });
-
-    it("clamps to max tier for long names", () => {
-      const pricing = { tiers: [100, 200, 300] };
-      expect(zns.claimCost(100, pricing)).toBe(300);
-    });
-
-    it("returns null for empty tiers", () => {
-      expect(zns.claimCost(5, { tiers: [] })).toBeNull();
-    });
-  });
-
-  describe("listCommission", () => {
-    it("returns 10% of minimum tier", () => {
-      const pricing = { tiers: [100, 200, 300] };
-      expect(zns.listCommission(pricing)).toBe(10);
-    });
-
-    it("returns null for empty tiers", () => {
-      expect(zns.listCommission({ tiers: [] })).toBeNull();
-    });
-  });
-
   describe("parseZip321Uri", () => {
     it("parses address and amount", () => {
       const result = zns.parseZip321Uri("zcash:u1abc?amount=1.5&memo=abc123");
@@ -305,7 +274,6 @@ describe("ZNS", () => {
         ...leaves[target],
         txid: "tx",
         height: 100,
-        listing: null,
         proof,
       } as RegistrationWithProof;
     };
@@ -313,7 +281,7 @@ describe("ZNS", () => {
     const sampleLeaves: Leaf[] = [
       { name: "alice",   address: "u1alice",   nonce: 1, lastAction: "CLAIM"  },
       { name: "bob",     address: "u1bob",     nonce: 3, lastAction: "UPDATE" },
-      { name: "carol",   address: "u1carol",   nonce: 0, lastAction: "BUY"    },
+      { name: "carol",   address: "u1carol",   nonce: 0, lastAction: "CLAIM"  },
       { name: "dave",    address: "u1dave",    nonce: 7, lastAction: "CLAIM"  },
       { name: "eve",     address: "u1eve",     nonce: 2, lastAction: "UPDATE" },
     ];
