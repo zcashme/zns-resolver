@@ -1,15 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { blake2b } from "@noble/hashes/blake2.js";
 import { ZNS } from "../src/zns.js";
-import type {
-  RegistrationWithProof,
-  MerkleProof,
-  LastAction,
-} from "../src/types.js";
 
 const VALID_TESTNET_UA = "utest100qlkeru5c3m5kfrwe2hsmcfzmusreaza2prdyelg2kd2tr2842nceq952vay3gpmgky09fgft4z57h4z2zqzz5rcwgd4q90u54ek5yyca4s6e6y2jja9sww27kzedzznjcupcu0svq2exvq995c0lhl5zm53g4ksnm2xuwt3snv4dgh";
 const VALID_MAINNET_UA = "u1q8g0h9cn2x4eq8jd7k0d5y3zf6vhb5w4xj9tz3m5p6r2s1t0u7v8w9x0y1z";
-const VALID_TESTNET_TADDR = "tmqY61Gp3B7Pz3ev12NRFzWxJz1yB28Gfkfi";
 
 describe("ZNS", () => {
   let zns: ZNS;
@@ -126,7 +119,6 @@ describe("ZNS", () => {
       expect(await zns.resolveName("alice.zec.zec")).toBeNull();
       expect(await zns.resolveName(".zec")).toBeNull();
       expect(await zns.resolveName("")).toBeNull();
-      expect(await zns.resolveNameWithProof("alice.eth")).toBeNull();
       expect(await zns.isAvailable("alice.eth")).toBe(false);
       expect(fetchSpy).not.toHaveBeenCalled();
     });
@@ -179,150 +171,4 @@ describe("ZNS", () => {
     });
   });
 
-  describe("verifyProof", () => {
-    // Independent reimplementation of the leaf/internal hash to build proofs
-    // for testing. Must match src/zns.ts byte-for-byte; if these diverge the
-    // round-trip test fails immediately, surfacing the drift.
-    const LEAF = new TextEncoder().encode("ZNSv1:LEAF\0");
-    const NODE = new TextEncoder().encode("ZNSv1:NODE\0");
-    const NUL = new Uint8Array([0]);
-    const enc = new TextEncoder();
-    const u64be = (n: number) => {
-      const b = new Uint8Array(8);
-      new DataView(b.buffer).setBigUint64(0, BigInt(n), false);
-      return b;
-    };
-    const cat = (...xs: Uint8Array[]) => {
-      const out = new Uint8Array(xs.reduce((s, x) => s + x.length, 0));
-      let off = 0;
-      for (const x of xs) {
-        out.set(x, off);
-        off += x.length;
-      }
-      return out;
-    };
-    const toHex = (b: Uint8Array) =>
-      Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
-
-    type Leaf = {
-      name: string;
-      address: string;
-      nonce: number;
-      lastAction: LastAction;
-    };
-    const hashLeaf = (l: Leaf) =>
-      blake2b(
-        cat(
-          LEAF,
-          enc.encode(l.name),
-          NUL,
-          enc.encode(l.address),
-          NUL,
-          u64be(l.nonce),
-          enc.encode(l.lastAction),
-          NUL,
-        ),
-        { dkLen: 32 },
-      );
-    const hashNode = (a: Uint8Array, b: Uint8Array) =>
-      blake2b(cat(NODE, a, b), { dkLen: 32 });
-
-    const merkleRoot = (leaves: Uint8Array[]): Uint8Array => {
-      if (leaves.length === 0) return new Uint8Array(32);
-      let level = leaves.slice();
-      while (level.length > 1) {
-        if (level.length % 2 === 1) level.push(level[level.length - 1]);
-        const next: Uint8Array[] = [];
-        for (let i = 0; i < level.length; i += 2)
-          next.push(hashNode(level[i], level[i + 1]));
-        level = next;
-      }
-      return level[0];
-    };
-
-    const merklePath = (leaves: Uint8Array[], index: number): Uint8Array[] => {
-      let level = leaves.slice();
-      let idx = index;
-      const path: Uint8Array[] = [];
-      while (level.length > 1) {
-        if (level.length % 2 === 1) level.push(level[level.length - 1]);
-        path.push(idx % 2 === 0 ? level[idx + 1] : level[idx - 1]);
-        idx = Math.floor(idx / 2);
-        const next: Uint8Array[] = [];
-        for (let i = 0; i < level.length; i += 2)
-          next.push(hashNode(level[i], level[i + 1]));
-        level = next;
-      }
-      return path;
-    };
-
-    const buildRegWithProof = (
-      leaves: Leaf[],
-      target: number,
-    ): RegistrationWithProof => {
-      const hashes = leaves.map(hashLeaf);
-      const root = merkleRoot(hashes);
-      const path = merklePath(hashes, target);
-      const proof: MerkleProof = {
-        index: target,
-        path: path.map(toHex),
-        root: toHex(root),
-        height: 1000,
-        leafCount: leaves.length,
-      };
-      return {
-        ...leaves[target],
-        txid: "tx",
-        height: 100,
-        proof,
-      } as RegistrationWithProof;
-    };
-
-    const sampleLeaves: Leaf[] = [
-      { name: "alice",   address: "u1alice",   nonce: 1, lastAction: "CLAIM"  },
-      { name: "bob",     address: "u1bob",     nonce: 3, lastAction: "UPDATE" },
-      { name: "carol",   address: "u1carol",   nonce: 0, lastAction: "CLAIM"  },
-      { name: "dave",    address: "u1dave",    nonce: 7, lastAction: "CLAIM"  },
-      { name: "eve",     address: "u1eve",     nonce: 2, lastAction: "UPDATE" },
-    ];
-
-    it("verifies a valid proof for each leaf in a 5-leaf tree", () => {
-      for (let i = 0; i < sampleLeaves.length; i++) {
-        const reg = buildRegWithProof(sampleLeaves, i);
-        expect(zns.verifyProof(reg), `index ${i}`).toBe(true);
-      }
-    });
-
-    it("verifies a single-leaf tree (empty path)", () => {
-      const reg = buildRegWithProof([sampleLeaves[0]], 0);
-      expect(reg.proof.path).toEqual([]);
-      expect(zns.verifyProof(reg)).toBe(true);
-    });
-
-    it("rejects a proof when the address has been tampered with", () => {
-      const reg = buildRegWithProof(sampleLeaves, 1);
-      reg.address = "u1evil";
-      expect(zns.verifyProof(reg)).toBe(false);
-    });
-
-    it("rejects a proof when the nonce has been tampered with", () => {
-      const reg = buildRegWithProof(sampleLeaves, 2);
-      reg.nonce = 999;
-      expect(zns.verifyProof(reg)).toBe(false);
-    });
-
-    it("rejects a proof when a sibling hash has been swapped", () => {
-      const reg = buildRegWithProof(sampleLeaves, 3);
-      const tampered = reg.proof.path.slice();
-      tampered[0] = "00".repeat(32);
-      reg.proof = { ...reg.proof, path: tampered };
-      expect(zns.verifyProof(reg)).toBe(false);
-    });
-
-    it("rejects a proof against a wrong root", () => {
-      const reg = buildRegWithProof(sampleLeaves, 0);
-      reg.proof = { ...reg.proof, root: "00".repeat(32) };
-      expect(zns.verifyProof(reg)).toBe(false);
-    });
-  });
 });

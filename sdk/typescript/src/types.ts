@@ -16,18 +16,6 @@ export interface Registration {
   lastAction: LastAction;
 }
 
-export interface MerkleProof {
-  index: number;
-  path: string[];
-  root: string;
-  height: number;
-  leafCount: number;
-}
-
-export interface RegistrationWithProof extends Registration {
-  proof: MerkleProof;
-}
-
 export interface Status {
   syncedHeight: number;
   uivk: string;

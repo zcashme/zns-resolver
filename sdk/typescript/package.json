@@ -29,7 +29,6 @@
     "directory": "sdk/typescript"
   },
   "dependencies": {
-    "@noble/hashes": "^2.2.0",
     "bech32": "^2.0.0"
   },
   "devDependencies": {

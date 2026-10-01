@@ -1,4 +1,3 @@
-import { blake2b } from "@noble/hashes/blake2.js";
 import { bech32m } from "bech32";
 import type {
   Network,
@@ -7,8 +6,6 @@ import type {
   Event,
   EventsFilter,
   EventsResult,
-  MerkleProof,
-  RegistrationWithProof,
 } from "./types.js";
 
 /** Network-specific configuration for ZNS. */
@@ -29,44 +26,6 @@ export const NETWORKS = {
 
 /** Valid ZNS name pattern: 1-62 lowercase alphanumeric chars. */
 const NAME_RE = /^[a-z0-9]{1,62}$/;
-
-/** Domain tags for the Merkle commitment — must match the Rust indexer. */
-const LEAF_TAG = new TextEncoder().encode("ZNSv1:LEAF\0");
-const NODE_TAG = new TextEncoder().encode("ZNSv1:NODE\0");
-const NULL_BYTE = new Uint8Array([0]);
-
-function hexToBytes(hex: string): Uint8Array {
-  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
-  if (clean.length % 2 !== 0) throw new Error(`Invalid hex length: ${hex}`);
-  const out = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-  }
-  return out;
-}
-
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-
-function u64BE(n: number): Uint8Array {
-  const buf = new Uint8Array(8);
-  new DataView(buf.buffer).setBigUint64(0, BigInt(n), false);
-  return buf;
-}
-
-function concatBytes(...parts: Uint8Array[]): Uint8Array {
-  const total = parts.reduce((s, p) => s + p.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    out.set(p, off);
-    off += p.length;
-  }
-  return out;
-}
 
 /** Validates a ZNS name format (lowercase alphanumeric, 1-62 chars). */
 function isValidName(name: string): boolean {
@@ -179,39 +138,6 @@ export class ZNS {
     return raw ? normalizeApiResponse<Registration>(raw) : null;
   }
 
-  /**
-   * Resolve a ZNS name with an accompanying Merkle inclusion proof against
-   * the indexer's state root. Returns null if the name isn't registered.
-   * Throws if the name is registered but the indexer didn't return a proof
-   * (e.g. the indexer hasn't yet computed a root, or doesn't support proofs).
-   *
-   * The name is normalized the same way as {@link resolveName} (trim,
-   * lowercase, strip one `.zcash`/`.zec` suffix); invalid names return null
-   * without a server round trip.
-   *
-   * Call {@link verifyProof} on the result to confirm the binding offline.
-   * For full trustlessness, also cross-check `proof.root` against an
-   * independent indexer at the same `proof.height`.
-   */
-  async resolveNameWithProof(
-    name: string,
-  ): Promise<RegistrationWithProof | null> {
-    const normalized = normalizeName(name);
-    if (!isValidName(normalized)) return null;
-    const raw = await this.rpc<Record<string, unknown> | null>("resolve", {
-      query: normalized,
-      with_proof: true,
-    });
-    if (!raw) return null;
-    const reg = normalizeApiResponse<RegistrationWithProof>(raw);
-    if (!reg.proof) {
-      throw new Error(
-        `Indexer returned no Merkle proof for "${name}" — it may not yet have committed a state root or may not support proofs.`,
-      );
-    }
-    return reg;
-  }
-
   /** Resolve a Zcash Unified Address to all names pointing to it. Returns empty array if none.
    *  Supports pagination with limit (default 50, max 500) and offset (default 0). */
   async resolveAddress(
@@ -261,8 +187,7 @@ export class ZNS {
    *  @todo(F4Jumble) Upgrade to full ZIP-316 decoding with F4Jumble to:
    *    - Parse actual typecodes from address items
    *    - Validate F4Jumble checksum (not just bech32m)
-   *    - Optionally enforce: address must contain at least one Orchard receiver (typecode 0x03)
-   *    Requires @noble/hashes (blake2b) implementation of F4Jumble inverse. */
+   *    - Optionally enforce: address must contain at least one Orchard receiver (typecode 0x03) */
   isValidName = isValidName;
   normalizeName = normalizeName;
   isValidUnifiedAddress = isValidUnifiedAddress;
@@ -273,34 +198,6 @@ export class ZNS {
       normalizeApiResponse(filter ?? {}) as Record<string, unknown>,
     );
     return normalizeApiResponse<EventsResult>(raw);
-  }
-
-  /**
-   * Verify a Merkle inclusion proof returned by {@link resolveNameWithProof}.
-   *
-   * Recomputes the leaf hash from the registration fields, folds the sibling
-   * path bottom-up, and compares the result against `proof.root`. Returns
-   * `true` iff the binding is consistent with the root the indexer committed
-   * to at `proof.height`.
-   *
-   * This proves the indexer's response is internally consistent — it cannot
-   * have lied about this specific name without also committing to a globally
-   * forged root. It does NOT prove the root reflects on-chain truth; for that,
-   * cross-check `proof.root` against an independent indexer at the same
-   * height, or re-derive the state from the chain using the public UIVK.
-   */
-  verifyProof(reg: RegistrationWithProof): boolean {
-    let h = this.hashLeaf(reg);
-    let idx = reg.proof.index;
-    for (const siblingHex of reg.proof.path) {
-      const sibling = hexToBytes(siblingHex);
-      h = idx % 2 === 0
-        ? this.hashInternal(h, sibling)
-        : this.hashInternal(sibling, h);
-      idx = Math.floor(idx / 2);
-    }
-    const claimed = hexToBytes(reg.proof.root);
-    return bytesEqual(h, claimed);
   }
 
   /** Parse a ZIP-321 URI into its components. */
@@ -321,30 +218,6 @@ export class ZNS {
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
-
-  /** Hash one registration into a 32-byte Merkle leaf. Mirrors the Rust
-   *  indexer's `hash_leaf` byte-for-byte. */
-  private hashLeaf(reg: RegistrationWithProof): Uint8Array {
-    const enc = new TextEncoder();
-    return blake2b(
-      concatBytes(
-        LEAF_TAG,
-        enc.encode(reg.name),
-        NULL_BYTE,
-        enc.encode(reg.address),
-        NULL_BYTE,
-        u64BE(reg.nonce),
-        enc.encode(reg.lastAction),
-        NULL_BYTE,
-      ),
-      { dkLen: 32 },
-    );
-  }
-
-  /** Hash two child hashes into a parent. */
-  private hashInternal(left: Uint8Array, right: Uint8Array): Uint8Array {
-    return blake2b(concatBytes(NODE_TAG, left, right), { dkLen: 32 });
-  }
 
   private decodeBase64Url(value: string): string {
     try {
