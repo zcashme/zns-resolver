@@ -23,7 +23,8 @@ type ChainTip = watch::Receiver<Option<u32>>;
 ///
 /// One query verb: `resolve` dispatches on the query — an exact name
 /// resolves to its record (or `null`), the empty query lists all
-/// registrations, an address lists the names bound to it. `events`/// exposes the append-only log; `status` the sync state. Params are
+/// registrations, an address lists the names bound to it. `events`
+/// exposes the append-only log; `status` the sync state. Params are
 /// accepted as named fields (jsonrpsee also accepts positional arrays).
 #[rpc(server)]
 pub trait ZnsApi {
