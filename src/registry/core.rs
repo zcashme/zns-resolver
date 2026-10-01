@@ -481,12 +481,12 @@ fn apply_candidates(
 
         match note.action() {
             Action::Claim => {
-                // Gate: claim law — the mint's accept_claim: exactly one
-                // live anchor spent by this transaction, by the claim's own
-                // action; no live name note spent; a zero-value successor
-                // created.
-                let law_ok = snapshot.contains(&AnchorNf::from_bytes(&candidate.action_nullifier))
-                    && snapshot.live_retirements(tx_facts) == 1
+                // Gate: the mint's accept_claim. The anchor spend and the
+                // name note are separate actions — fee inputs sit between
+                // them — so the name note's own nullifier is not the anchor.
+                // The transaction must spend exactly one live anchor, spend
+                // no live name, and create one zero-value successor.
+                let law_ok = snapshot.live_retirements(tx_facts) == 1
                     && !spent_a_live_name
                     && tx_facts.adoptions.len() == 1;
                 if !law_ok {
@@ -1632,6 +1632,47 @@ mod admission {
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+    }
+
+    /// The mint's builder spends the anchor in one action and puts the name
+    /// note in another, with fee inputs between them. `accept_claim` still
+    /// binds the name: exactly one live anchor retired, one successor.
+    #[test]
+    fn claim_binds_when_the_anchor_spend_is_a_different_action() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        let memos = vec![memo_for("claim", "julian", &[0u8; 32])];
+        let candidates = vec![candidate(
+            &memos,
+            0,
+            0,
+            0,
+            [2; 32],
+            "claim",
+            "julian",
+            *nf(9).as_bytes(), // the name note's action is a fee spend
+            [0u8; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![tx_law_for(
+            [2; 32],
+            seeded.clone(),
+            vec![Adoption { nf: nf(200) }],
+            vec![Retirement { nf: nf(1) }, Retirement { nf: nf(9) }],
+            true,
+        )];
+        let mut live_names = HashSet::new();
+
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
+        assert_eq!(
+            tx.query_row("SELECT name FROM names", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "julian"
+        );
     }
 
     #[test]
