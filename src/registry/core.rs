@@ -828,8 +828,10 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
 
 pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
-    // seer-sync downloads again from the block before `fork_height`.
-    let drop_from = i64::from(fork_height.saturating_sub(1));
+    // seer-sync re-fetches the block before `fork_height`. That block stays;
+    // record_admission ignores the replay. Rows at `fork_height` and above
+    // are the discarded chain.
+    let fork = i64::from(fork_height);
 
     let mut stmt = tx.prepare(
         "SELECT name FROM name_events WHERE height >= ?1
@@ -837,27 +839,21 @@ pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
          SELECT name FROM implicit_releases WHERE height >= ?1",
     )?;
     let affected: Vec<String> = stmt
-        .query_map(params![drop_from], |r| r.get(0))?
+        .query_map(params![fork], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
 
-    tx.execute(
-        "DELETE FROM name_events WHERE height >= ?1",
-        params![drop_from],
-    )?;
+    tx.execute("DELETE FROM name_events WHERE height >= ?1", params![fork])?;
     tx.execute(
         "DELETE FROM implicit_releases WHERE height >= ?1",
-        params![drop_from],
+        params![fork],
     )?;
-    tx.execute(
-        "DELETE FROM anchor_facts WHERE height >= ?1",
-        params![drop_from],
-    )?;
+    tx.execute("DELETE FROM anchor_facts WHERE height >= ?1", params![fork])?;
     tx.execute(
         "UPDATE anchor_facts
          SET spent_height = NULL, spent_tx_index = NULL, spent_action_index = NULL
          WHERE spent_height >= ?1",
-        params![drop_from],
+        params![fork],
     )?;
 
     for name in &affected {
@@ -1552,10 +1548,10 @@ mod tests {
         assert_eq!(watched, 0);
     }
 
-    /// seer-sync re-fetches the fork block and the one before it. Those rows
-    /// are dropped, and inserting a surviving event again leaves the tip put.
+    /// The block before the fork stays, including a spend in it. Replaying
+    /// that event leaves the tip where it stands. The fork itself is dropped.
     #[test]
-    fn rewind_drops_the_refetched_blocks_and_replay_keeps_the_tip() {
+    fn rewind_keeps_the_seam_block_and_replay_leaves_the_tip() {
         let conn = database();
         conn.execute(
             "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
@@ -1604,13 +1600,13 @@ mod tests {
                 .collect::<rusqlite::Result<_>>()
                 .unwrap()
         };
-        assert_eq!(heights, vec![39]);
+        assert_eq!(heights, vec![39, 40]);
         let tip_height: i64 = conn
             .query_row("SELECT height FROM names WHERE name = 'z'", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(tip_height, 39);
+        assert_eq!(tip_height, 40);
         let spent: Option<i64> = conn
             .query_row(
                 "SELECT spent_height FROM anchor_facts WHERE nullifier = ?1",
@@ -1618,22 +1614,22 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(spent, None);
-        let overlap_facts: i64 = conn
+        assert_eq!(spent, Some(40));
+        let seam_facts: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM anchor_facts WHERE nullifier = ?1",
                 params![vec![8_u8; 32]],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(overlap_facts, 0);
+        assert_eq!(seam_facts, 1);
 
         let tx = conn.unchecked_transaction().unwrap();
         let replayed = record_admission(
             &tx,
             &AdmissionRow {
                 name: "z",
-                height: 39,
+                height: 40,
                 action: "claim",
                 ua: "u",
                 expires_at: "none",
@@ -1642,7 +1638,7 @@ mod tests {
                 psi: &[3],
                 cmx: &[4],
                 nullifier: &[0x5a],
-                txid: &[1; 32],
+                txid: &[2; 32],
                 tx_index: 0,
                 action_index: 0,
                 memo,
@@ -1657,11 +1653,11 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(tip_after, 39);
+        assert_eq!(tip_after, 40);
         let events: i64 = conn
             .query_row("SELECT COUNT(*) FROM name_events", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(events, 1);
+        assert_eq!(events, 2);
     }
 
     /// The live-name set claimed a nullifier the names table does not have.
