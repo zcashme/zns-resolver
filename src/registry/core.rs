@@ -27,9 +27,6 @@ use super::{Event, Registration};
 /// boundary is constructible in tests.
 struct Candidate<'a> {
     action_index: usize,
-    /// The candidate action's revealed nullifier — raw until the lifecycle
-    /// PR types the tip family.
-    action_nullifier: [u8; 32],
     txid: [u8; 32],
     memo: &'a [u8],
     note: NameNote<'a>,
@@ -96,7 +93,6 @@ pub(crate) fn install_registry_config(
 /// except the parse, which borrows the per-block memo arena.
 struct Source<'a> {
     action_index: usize,
-    action_nullifier: [u8; 32],
     cand_note: Note,
     cand_cmx: [u8; 32],
     memo: &'a [u8],
@@ -144,7 +140,7 @@ pub(crate) fn apply_batch(
         for tx in block {
             let txid = *tx.txid.as_ref();
             for output in &tx.relaxed_ironwood_outputs {
-                let (action_index, cand_note, action_nullifier, memo, _) = output;
+                let (action_index, cand_note, _action_nullifier, memo, _) = output;
 
                 let Some(memo) = memo else {
                     continue;
@@ -183,7 +179,6 @@ pub(crate) fn apply_batch(
                 memos.push(zns_memo);
                 sources.push(Source {
                     action_index: *action_index,
-                    action_nullifier: action_nullifier.to_bytes(),
                     cand_note: *cand_note.note(),
                     cand_cmx: cand_note.cmx().to_bytes(),
                     memo: memo.as_slice(),
@@ -198,7 +193,6 @@ pub(crate) fn apply_batch(
             .zip(&sources)
             .map(|(memo, src)| Candidate {
                 action_index: src.action_index,
-                action_nullifier: src.action_nullifier,
                 txid: src.txid,
                 memo: src.memo,
                 note: NameNote::parse(memo).expect("arena memo parsed at triage"),
@@ -471,9 +465,12 @@ fn apply_candidates(
 
         let binding = read_tip_offline(db_tx, candidate.name())?;
         let note = &candidate.note;
-        let tip_consumed = binding
-            .as_ref()
-            .is_some_and(|b| b.1 == candidate.action_nullifier);
+        // The predecessor spend and the name-note output are different
+        // actions. The mint's `predecessor_spent` looks at every nullifier
+        // in the transaction, not at the output's own action.
+        let tip_nf = binding.as_ref().map(|b| b.1);
+        let tip_consumed =
+            tip_nf.is_some_and(|nf| tx_facts.retirements.iter().any(|r| r.nf.as_bytes() == &nf));
         let spent_a_live_name = tx_facts
             .retirements
             .iter()
@@ -545,8 +542,8 @@ fn apply_candidates(
                 // else is follow_spends: every spent live name ends its
                 // binding.
                 let spent_other_live = tx_facts.retirements.iter().any(|r| {
-                    live_names.contains(r.nf.as_bytes())
-                        && r.nf.as_bytes() != &candidate.action_nullifier
+                    let nf = r.nf.as_bytes();
+                    live_names.contains(nf) && tip_nf != Some(*nf)
                 });
                 if !tip_consumed || spent_other_live || snapshot.touches_live_anchor(tx_facts) {
                     mark_released_spent(
@@ -567,16 +564,18 @@ fn apply_candidates(
                 let Some(expected_prev) =
                     notes::check_chain_rule(binding.as_ref().map(|b| &b.0), note)
                 else {
-                    end_binding_implicitly(
-                        db_tx,
-                        live_names,
-                        candidate.name(),
-                        height,
-                        &candidate.txid,
-                        law.tx_index,
-                        candidate.action_index,
-                        &candidate.action_nullifier,
-                    )?;
+                    if let Some(consumed) = tip_nf {
+                        end_binding_implicitly(
+                            db_tx,
+                            live_names,
+                            candidate.name(),
+                            height,
+                            &candidate.txid,
+                            law.tx_index,
+                            candidate.action_index,
+                            &consumed,
+                        )?;
+                    }
                     continue;
                 };
 
@@ -1530,7 +1529,6 @@ mod admission {
         txid: [u8; 32],
         action: &str,
         name: &str,
-        action_nullifier: [u8; 32],
         prev: [u8; 32],
     ) -> Candidate<'a> {
         let ua = test_ua();
@@ -1553,7 +1551,6 @@ mod admission {
 
         Candidate {
             action_index,
-            action_nullifier,
             txid,
             memo: memo_bytes,
             note,
@@ -1601,15 +1598,7 @@ mod admission {
 
         let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
         let candidates = vec![candidate(
-            &memos,
-            0,
-            0,
-            0,
-            [1; 32],
-            "claim",
-            "alice",
-            *nf(1).as_bytes(),
-            [0u8; 32],
+            &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
         )];
         let snapshot = Lineage::new();
         let seeded = seeded_lineage(&[1]);
@@ -1645,15 +1634,7 @@ mod admission {
 
         let memos = vec![memo_for("claim", "julian", &[0u8; 32])];
         let candidates = vec![candidate(
-            &memos,
-            0,
-            0,
-            0,
-            [2; 32],
-            "claim",
-            "julian",
-            *nf(9).as_bytes(), // the name note's action is a fee spend
-            [0u8; 32],
+            &memos, 0, 0, 0, [2; 32], "claim", "julian", [0u8; 32],
         )];
         let seeded = seeded_lineage(&[1]);
         let tx_law = vec![tx_law_for(
@@ -1683,8 +1664,7 @@ mod admission {
 
         let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
         let candidates = vec![candidate(
-            &memos, 0, 0, 0, [1; 32], "claim", "alice", [9; 32], // not a live anchor
-            [0u8; 32],
+            &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
         )];
         let seeded = seeded_lineage(&[1]);
         let tx_law = vec![tx_law_for(
@@ -1724,11 +1704,7 @@ mod admission {
         .unwrap();
 
         let memos = vec![memo_for("claim", "a", &[0u8; 32])];
-        let candidates = vec![candidate(
-            &memos, 0, 0, 0, [1; 32], "claim", "a",
-            [0x5a; 32], // the claim action spends z's tip
-            [0u8; 32],
-        )];
+        let candidates = vec![candidate(&memos, 0, 0, 0, [1; 32], "claim", "a", [0u8; 32])];
         let seeded = seeded_lineage(&[1]);
         let tx_law = vec![tx_law_for(
             [1; 32],
@@ -1781,12 +1757,8 @@ mod admission {
             memo_for("update", "z", &[0x02; 32]),
             memo_for("release", "z", &[0x02; 32]),
         ];
-        let update = candidate(
-            &memos, 0, 0, 0, [1; 32], "update", "z", [0x5a; 32], [0x02; 32],
-        );
-        let release = candidate(
-            &memos, 1, 0, 0, [2; 32], "release", "z", [9; 32], [0x02; 32],
-        );
+        let update = candidate(&memos, 0, 0, 0, [1; 32], "update", "z", [0x02; 32]);
+        let release = candidate(&memos, 1, 0, 0, [2; 32], "release", "z", [0x02; 32]);
         let nullifier_u = admit_nullifier(&update, &fvk).expect("update nullifier");
 
         let seeded = seeded_lineage(&[1]);
@@ -1832,6 +1804,63 @@ mod admission {
         assert_eq!(rel_nf, nullifier_u);
     }
 
+    /// The mint spends the live tip in one action and writes the release
+    /// note in another. `accept_release` still ends the binding: the tip
+    /// nullifier is among the transaction's spends, and the predecessor matches.
+    #[test]
+    fn release_binds_when_the_tip_spend_is_a_different_action() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('jesuschrist', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        let memos = vec![memo_for("release", "jesuschrist", &[0x02; 32])];
+        let candidates = vec![candidate(
+            &memos,
+            0,
+            0,
+            0,
+            [3; 32],
+            "release",
+            "jesuschrist",
+            [0x02; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![tx_law_for(
+            [3; 32],
+            seeded,
+            vec![],
+            vec![
+                Retirement {
+                    nf: AnchorNf::from_bytes(&[0x5a; 32]),
+                },
+                Retirement { nf: nf(9) },
+            ],
+            true,
+        )];
+        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+        assert_eq!(
+            tx.query_row(
+                "SELECT action FROM name_events WHERE name = 'jesuschrist' ORDER BY height DESC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            "release"
+        );
+    }
+
     /// A transaction with two candidates takes follow_spends: nothing is
     /// admitted, and spent live names end their bindings.
     #[test]
@@ -1852,12 +1881,8 @@ mod admission {
             memo_for("claim", "b", &[0u8; 32]),
         ];
         let candidates = vec![
-            candidate(
-                &memos, 0, 0, 0, [1; 32], "claim", "a", [0x5a; 32], [0u8; 32],
-            ),
-            candidate(
-                &memos, 1, 0, 1, [1; 32], "claim", "b", [0x5a; 32], [0u8; 32],
-            ),
+            candidate(&memos, 0, 0, 0, [1; 32], "claim", "a", [0u8; 32]),
+            candidate(&memos, 1, 0, 1, [1; 32], "claim", "b", [0u8; 32]),
         ];
         let seeded = seeded_lineage(&[1]);
         let tx_law = vec![tx_law_for(
