@@ -41,10 +41,37 @@ pub struct NameEvent {
     pub expires_at: String,
 }
 
-/// Paginated result envelope used by list-style methods.
+/// The `resolve` result. One verb, three query forms:
+/// an exact name yields the record or `null`; the empty query and address
+/// queries yield bare arrays of records.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ResolveResult {
+    /// Exact-name lookup: the record, or `null` when unregistered.
+    Exact(Option<NameRecord>),
+    /// List forms: all registrations (empty query), or the names bound to
+    /// an address.
+    Many(Vec<NameRecord>),
+}
+
+/// Paginated result envelope used by the typed list-style methods
+/// (`list_names`, `reverse_lookup`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Paginated<T> {
     pub items: Vec<T>,
+    pub total: u64,
+    /// The limit that was applied (after server caps).
+    pub limit: u64,
+    /// The offset that was applied.
+    pub offset: u64,
+}
+
+/// Paginated event history envelope.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventsPage {
+    /// The events on this page, in canonical order.
+    pub events: Vec<NameEvent>,
+    /// Total matching events across all pages.
     pub total: u64,
     /// The limit that was applied (after server caps).
     pub limit: u64,

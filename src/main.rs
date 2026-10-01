@@ -45,11 +45,15 @@ const DB_PATH: &str = "zns.sqlite";
 #[cfg(feature = "testnet")]
 const DB_PATH: &str = "zns-testnet.sqlite";
 
-/// Skip all blocks before this height on first sync (performance).
+/// The mint's ceremony height — the registry's first notes are the
+/// ceremony anchors, so scanning starts there and never before. Keep in
+/// step with `MINT_BIRTHDAY` in zns-mint `src/boot.rs`. A stored
+/// registry_account row keeps its own birthday; this constant only seeds
+/// a first sync.
 #[cfg(feature = "mainnet")]
-const SCAN_BIRTHDAY: u32 = 3000000;
+const MINT_BIRTHDAY: u32 = 3_400_000;
 #[cfg(feature = "testnet")]
-const SCAN_BIRTHDAY: u32 = 4_000_000;
+const MINT_BIRTHDAY: u32 = 4_338_933;
 
 const RPC_ADDR: &str = "127.0.0.1:8080"; // where clients send JSON-RPC name queries
 
@@ -92,7 +96,7 @@ async fn main() {
     tokio::spawn(live_tip(tip_tx));
 
     // --- Persistent layer bootstrap. Without it there is nothing to serve. ---
-    let db = match Db::open(UFVK, SCAN_BIRTHDAY, DB_PATH) {
+    let db = match Db::open(UFVK, MINT_BIRTHDAY, DB_PATH) {
         Ok(db) => db,
         Err(error) => {
             tracing::error!(error = %error, "fatal: resolver is unconfigured — registry database failed to open");
@@ -112,5 +116,5 @@ async fn main() {
     };
 
     // --- The indexer: everything passed — run forever ---
-    run_indexer(db, UFVK, fvk, SCAN_BIRTHDAY).await;
+    run_indexer(db, UFVK, fvk, MINT_BIRTHDAY).await;
 }

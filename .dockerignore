@@ -1,0 +1,8 @@
+target/
+.git/
+.pi/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+TODO.md
+docs/
