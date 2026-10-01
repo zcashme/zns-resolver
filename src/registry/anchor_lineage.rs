@@ -122,7 +122,9 @@ impl Lineage {
         }
     }
 
-    /// Whether `nf` is a live claim anchor right now.
+    /// Whether `nf` is a live claim anchor right now. The claim law counts
+    /// live retirements directly; this query is for the lineage tests.
+    #[cfg(test)]
     pub(crate) fn contains(&self, nf: &AnchorNf) -> bool {
         self.live.contains(nf)
     }
