@@ -58,12 +58,15 @@ Consequences:
 The mint's `accept_claim` (`zns-mint` `src/mint/registry.rs`), evaluated
 at the candidate's transaction position:
 
-1. the claim's own action spends a live anchor;
-2. exactly one anchor is spent by the transaction;
-3. no live name note is spent by the transaction;
-4. the transaction creates exactly one zero-value successor;
-5. the name is free (the chain rule: `prev_rcm_for(non-release tip, Claim)
+1. exactly one anchor is spent by the transaction;
+2. no live name note is spent by the transaction;
+3. the transaction creates exactly one zero-value successor;
+4. the name is free (the chain rule: `prev_rcm_for(non-release tip, Claim)
    → None`).
+
+The anchor spend and the name note are not the same action. The mint's
+builder places fee inputs between them, so requiring the name note's own
+nullifier to be the anchor rejects claims the mint has already broadcast.
 
 Updates and releases take the same accept path with the mint's
 `predecessor_spent` guard: a transition whose transaction also spends an
