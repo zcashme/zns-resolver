@@ -6,8 +6,7 @@
     "dev": "tsx src/index.ts"
   },
   "dependencies": {
-    "zcashname-sdk": "file:../..",
-    "@noble/ed25519": "^2.0.0"
+    "zcashname-sdk": "file:../.."
   },
   "devDependencies": {
     "tsx": "^4.0.0",
