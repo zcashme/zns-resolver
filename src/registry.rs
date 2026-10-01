@@ -36,6 +36,7 @@ impl Db {
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|poisoned| {
             tracing::error!("registry database lock was poisoned; recovering the connection");
+            self.0.clear_poison();
             poisoned.into_inner()
         })
     }
@@ -83,10 +84,14 @@ mod tests {
         }));
         assert!(panicked.is_err());
 
-        let conn = db.lock();
-        let names: i64 = conn
-            .query_row("SELECT COUNT(*) FROM names", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(names, 0);
+        {
+            let conn = db.lock();
+            let names: i64 = conn
+                .query_row("SELECT COUNT(*) FROM names", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(names, 0);
+        }
+        assert!(!db.0.is_poisoned());
+        let _again = db.lock();
     }
 }
