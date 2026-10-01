@@ -549,7 +549,7 @@ fn apply_candidates(
                     );
                     continue;
                 };
-                record_admission(
+                if record_admission(
                     db_tx,
                     &AdmissionRow {
                         name: candidate.name(),
@@ -570,8 +570,9 @@ fn apply_candidates(
                         action_index: candidate.action_index as i64,
                         memo: candidate.memo,
                     },
-                )?;
-                live_names.insert(nullifier);
+                )? {
+                    live_names.insert(nullifier);
+                }
             }
             Action::Update | Action::Release => {
                 // Gate: predecessor — the transaction must consume this
@@ -641,7 +642,7 @@ fn apply_candidates(
                     }
                     continue;
                 };
-                record_admission(
+                if record_admission(
                     db_tx,
                     &AdmissionRow {
                         name: candidate.name(),
@@ -662,12 +663,13 @@ fn apply_candidates(
                         action_index: candidate.action_index as i64,
                         memo: candidate.memo,
                     },
-                )?;
-                if let Some(b) = binding {
-                    live_names.remove(&b.1);
-                }
-                if note.action() == Action::Update {
-                    live_names.insert(nullifier);
+                )? {
+                    if let Some(b) = binding {
+                        live_names.remove(&b.1);
+                    }
+                    if note.action() == Action::Update {
+                        live_names.insert(nullifier);
+                    }
                 }
             }
         }
@@ -776,7 +778,10 @@ struct AdmissionRow<'a> {
     memo: &'a [u8],
 }
 
-fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite::Result<()> {
+/// Writes the event, then the per-name tip. Returns whether this call
+/// inserted the event. A replay of the same primary key leaves the tip
+/// where it stands.
+fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite::Result<bool> {
     let sql_params = params![
         row.name,
         row.height,
@@ -793,11 +798,14 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
         row.action_index,
         row.memo,
     ];
-    db_tx.execute(
-        "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+    let inserted = db_tx.execute(
+        "INSERT OR IGNORE INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         sql_params,
     )?;
+    if inserted == 0 {
+        return Ok(false);
+    }
     if row.action == "release" {
         db_tx.execute("DELETE FROM names WHERE name = ?1", params![row.name])?;
     } else {
@@ -815,39 +823,41 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
             sql_params,
         )?;
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
+    // seer-sync downloads again from the block before `fork_height`.
+    let drop_from = i64::from(fork_height.saturating_sub(1));
 
     let mut stmt = tx.prepare(
-        "SELECT name FROM name_events WHERE height > ?1
+        "SELECT name FROM name_events WHERE height >= ?1
          UNION
-         SELECT name FROM implicit_releases WHERE height > ?1",
+         SELECT name FROM implicit_releases WHERE height >= ?1",
     )?;
     let affected: Vec<String> = stmt
-        .query_map(params![fork_height as i64], |r| r.get(0))?
+        .query_map(params![drop_from], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
 
     tx.execute(
-        "DELETE FROM name_events WHERE height > ?1",
-        params![fork_height as i64],
+        "DELETE FROM name_events WHERE height >= ?1",
+        params![drop_from],
     )?;
     tx.execute(
-        "DELETE FROM implicit_releases WHERE height > ?1",
-        params![fork_height as i64],
+        "DELETE FROM implicit_releases WHERE height >= ?1",
+        params![drop_from],
     )?;
     tx.execute(
-        "DELETE FROM anchor_facts WHERE height > ?1",
-        params![fork_height as i64],
+        "DELETE FROM anchor_facts WHERE height >= ?1",
+        params![drop_from],
     )?;
     tx.execute(
         "UPDATE anchor_facts
          SET spent_height = NULL, spent_tx_index = NULL, spent_action_index = NULL
-         WHERE spent_height > ?1",
-        params![fork_height as i64],
+         WHERE spent_height >= ?1",
+        params![drop_from],
     )?;
 
     for name in &affected {
@@ -1535,12 +1545,123 @@ mod tests {
         rewind(&conn, 41).unwrap();
 
         let position = checkpoint(&conn).unwrap();
-        assert!(position.is_none()); // NULL hash: the next apply fixes it; a
-                                     // restart meanwhile rescans from the birthday.
+        assert!(position.is_none()); // NULL hash: a restart replays from the birthday.
         let watched: u64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(watched, 0);
+    }
+
+    /// seer-sync re-fetches the fork block and the one before it. Those rows
+    /// are dropped, and inserting a surviving event again leaves the tip put.
+    #[test]
+    fn rewind_drops_the_refetched_blocks_and_replay_keeps_the_tip() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
+        insert_checkpoint(&conn, 50, 7);
+
+        let memo =
+            b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
+        for (height, txid) in [(39_i64, 1_u8), (40, 2), (41, 3)] {
+            conn.execute(
+                "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+                 VALUES ('z', ?1, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', ?2, 0, 0, ?3)",
+                params![height, vec![txid; 32], &memo[..]],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 41, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', ?1, 0, 0, ?2)",
+            params![vec![3_u8; 32], &memo[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height, spent_tx_index, spent_action_index)
+             VALUES (?1, 0, 30, 0, 0, 0, 40, 0, 0)",
+            params![vec![9_u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 0, 40, 0, 0, 0, NULL)",
+            params![vec![8_u8; 32]],
+        )
+        .unwrap();
+
+        rewind(&conn, 41).unwrap();
+
+        let heights: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT height FROM name_events ORDER BY height")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(heights, vec![39]);
+        let tip_height: i64 = conn
+            .query_row("SELECT height FROM names WHERE name = 'z'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(tip_height, 39);
+        let spent: Option<i64> = conn
+            .query_row(
+                "SELECT spent_height FROM anchor_facts WHERE nullifier = ?1",
+                params![vec![9_u8; 32]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(spent, None);
+        let overlap_facts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM anchor_facts WHERE nullifier = ?1",
+                params![vec![8_u8; 32]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(overlap_facts, 0);
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let replayed = record_admission(
+            &tx,
+            &AdmissionRow {
+                name: "z",
+                height: 39,
+                action: "claim",
+                ua: "u",
+                expires_at: "none",
+                prev_rcm: &[0],
+                rcm: &[2],
+                psi: &[3],
+                cmx: &[4],
+                nullifier: &[0x5a],
+                txid: &[1; 32],
+                tx_index: 0,
+                action_index: 0,
+                memo,
+            },
+        )
+        .unwrap();
+        assert!(!replayed);
+        tx.commit().unwrap();
+
+        let tip_after: i64 = conn
+            .query_row("SELECT height FROM names WHERE name = 'z'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(tip_after, 39);
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM name_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, 1);
     }
 
     /// The live-name set claimed a nullifier the names table does not have.
@@ -1743,6 +1864,43 @@ mod admission {
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+    }
+
+    /// A released name's claim event is still in the log. Replaying that
+    /// claim (a birthday rescan, the name free again) must not abort and
+    /// must not put the name back.
+    #[test]
+    fn replaying_a_recorded_claim_leaves_a_free_name_free() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        tx.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('alice', 100, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'05', ?1, 0, 0, x'07')",
+            params![vec![1_u8; 32]],
+        )
+        .unwrap();
+
+        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let candidates = vec![candidate(
+            &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![tx_law_for(
+            [1; 32],
+            seeded,
+            vec![Adoption { nf: nf(200) }],
+            vec![Retirement { nf: nf(1) }],
+            true,
+        )];
+        let mut live_names = HashSet::new();
+
+        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert!(live_names.is_empty());
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
     }
 
     /// The mint's builder spends the anchor in one action and puts the name
