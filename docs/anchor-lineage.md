@@ -69,8 +69,9 @@ builder places fee inputs between them, so requiring the name note's own
 nullifier to be the anchor rejects claims the mint has already broadcast.
 
 Updates and releases take the same accept path with the mint's
-`predecessor_spent` guard: a transition whose transaction also spends an
-anchor is malformed.
+`predecessor_spent` guard: the transaction's nullifiers must spend this
+name's live tip and no anchor. The predecessor spend is not the name
+note's own action; fee inputs sit between them, same as a claim.
 
 ## The canon contract
 
