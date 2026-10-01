@@ -32,8 +32,12 @@ impl Db {
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
 
+    /// Recovers the connection when a previous holder panicked.
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.0.lock().unwrap()
+        self.0.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("registry database lock was poisoned; recovering the connection");
+            poisoned.into_inner()
+        })
     }
 }
 
@@ -63,4 +67,26 @@ pub(crate) struct Event {
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
     pub(crate) action_index: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_recovers_after_the_mutex_is_poisoned() {
+        let db = Db::open("ufvk", 1, ":memory:").unwrap();
+        let other = db.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = other.lock();
+            panic!("poison the registry lock");
+        }));
+        assert!(panicked.is_err());
+
+        let conn = db.lock();
+        let names: i64 = conn
+            .query_row("SELECT COUNT(*) FROM names", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(names, 0);
+    }
 }
