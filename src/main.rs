@@ -36,7 +36,7 @@ pub(crate) const NETWORK: Network = Network::TestNetwork;
 #[cfg(feature = "mainnet")]
 const UFVK: &str = "ufvk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"; // TODO: replace with real mainnet registry UFVK before building for mainnet
 #[cfg(feature = "testnet")]
-const UFVK: &str = "uviewtest1m6ttk6khq8gy0s5v5e5c9snavnwzyv9hl9d5g7kc9lczlv36mjj4tpkmqqd5jep4cg0ea79ahqjpz3huv28kp2frtr3vc9wgerseynuntyu92ky6nwd746w8waz7jv34ax32h4uffcj7ky8qphxesmqqzvt7ykdle5lg2vv69we9nz2q89m8pudjzngxk82mh2s3p3uqedjucnca95tzdqqsg7pn5htvulp8hcyhqa8t4qhlxnpqw7elupkeyvzwky4lta26yy4tvgqz5pjx6ew9e3hm4wmu5t4jt7ku450atn83fezs6r5mc6jkxjc4xcptzss3c3e8ldrnj0uru9tnjteelxzzx7mzrwetu965t2z8luz24h9cj37g9q5nclyczp4gnx2g5z4twlkl9mtvdxwdwxza7chztzcgw6e4eye36auh6p5ltzclppxykhmalghf0fk8087jhknjyzxfzkukj4fmt3umm0k27mh44lfxmc8m0kvh";
+const UFVK: &str = "uviewtest1akm8qc7xya8227z4crzpqx5jj23esvf9l2kc5ddt7zupzg2s785gu70rlv42ge228wwu323el8h8qm4kucus4fl6py0eq7etx8dkhe8wedjz390gvxthrylxrhp22zvzq65vcs2mg3s8krpssevaqzwed4murqtghp4x9jj84kkp5txtcrvcauvx36kae9pmrwjuvs7k29f8glqkf53yzhspralwrej7g0t0nrn86ryqs9rcc3k797vpk7jj33suxefjl4sk2va2furxkh3sude0v7ve2htrqgf03lw0yyrh5lnt4vx97787rj9l0gnprg5r2fqlthnx3f6kcv6p96taz3wce8krzl8uw3aeukhleuvzwvhp7v3y6mvyw23g9ych5qhda6gupc8r06c5c8hf4mplrt40m5mvywmdy0xvs49katqhj7amr26pdzfrj0up69t5ksjuxv6wf2tgw6lxevpprtuqj9en4w3sx2w3jv5j2vrjsuf9";
 
 /// Persisted name index filename. Distinct per network so mainnet and testnet
 /// builds do not share on-disk state.
@@ -45,11 +45,15 @@ const DB_PATH: &str = "zns.sqlite";
 #[cfg(feature = "testnet")]
 const DB_PATH: &str = "zns-testnet.sqlite";
 
-/// Skip all blocks before this height on first sync (performance).
+/// The mint's ceremony height — the registry's first notes are the
+/// ceremony anchors, so scanning starts there and never before. Keep in
+/// step with `MINT_BIRTHDAY` in zns-mint `src/boot.rs`. A stored
+/// registry_account row keeps its own birthday; this constant only seeds
+/// a first sync.
 #[cfg(feature = "mainnet")]
-const SCAN_BIRTHDAY: u32 = 3000000;
+const MINT_BIRTHDAY: u32 = 3_400_000;
 #[cfg(feature = "testnet")]
-const SCAN_BIRTHDAY: u32 = 4_000_000;
+const MINT_BIRTHDAY: u32 = 4_338_933;
 
 const RPC_ADDR: &str = "127.0.0.1:8080"; // where clients send JSON-RPC name queries
 
@@ -92,7 +96,7 @@ async fn main() {
     tokio::spawn(live_tip(tip_tx));
 
     // --- Persistent layer bootstrap. Without it there is nothing to serve. ---
-    let db = match Db::open(UFVK, SCAN_BIRTHDAY, DB_PATH) {
+    let db = match Db::open(UFVK, MINT_BIRTHDAY, DB_PATH) {
         Ok(db) => db,
         Err(error) => {
             tracing::error!(error = %error, "fatal: resolver is unconfigured — registry database failed to open");
@@ -112,5 +116,5 @@ async fn main() {
     };
 
     // --- The indexer: everything passed — run forever ---
-    run_indexer(db, UFVK, fvk, SCAN_BIRTHDAY).await;
+    run_indexer(db, UFVK, fvk, MINT_BIRTHDAY).await;
 }

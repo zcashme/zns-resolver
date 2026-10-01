@@ -11,21 +11,38 @@ use zns_verify::Action;
 use crate::registry::core;
 use crate::registry::Db;
 
-use super::records::{NameEvent, NameRecord, Paginated, Status};
+use zcash_address::ZcashAddress;
+
+use super::records::{EventsPage, NameEvent, NameRecord, Paginated, ResolveResult, Status};
 
 /// The network head as published live by the tip publisher: `None` until the
 /// first poll lands.
 type ChainTip = watch::Receiver<Option<u32>>;
 
 /// Public JSON-RPC API for the ZNS resolver.
+///
+/// One query verb: `resolve` dispatches on the query — an exact name
+/// resolves to its record (or `null`), the empty query lists all
+/// registrations, an address lists the names bound to it. `events`
+/// exposes the append-only log; `status` the sync state. Params are
+/// accepted as named fields (jsonrpsee also accepts positional arrays).
 #[rpc(server)]
 pub trait ZnsApi {
-    /// Resolve a name to its current binding. Returns `null` if the name is
-    /// not registered (or has been released).
+    /// Resolve a query to its current binding state.
+    ///
+    /// - exact name → the record, or `null` if unregistered/released;
+    /// - empty query → all currently registered names, paginated;
+    /// - an address → the names currently bound to it, paginated.
     #[method(name = "resolve")]
-    async fn resolve(&self, name: String) -> RpcResult<Option<NameRecord>>;
+    async fn resolve(
+        &self,
+        query: String,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> RpcResult<ResolveResult>;
 
-    /// List all currently registered names, paginated.
+    /// List all currently registered names, paginated. Typed alternative to
+    /// `resolve` with the empty query.
     #[method(name = "list_names")]
     async fn list_names(
         &self,
@@ -33,7 +50,8 @@ pub trait ZnsApi {
         offset: Option<u64>,
     ) -> RpcResult<Paginated<NameRecord>>;
 
-    /// Reverse lookup: find all names currently bound to a unified address.
+    /// Reverse lookup: all names currently bound to a unified address.
+    /// Typed alternative to `resolve` with an address query.
     #[method(name = "reverse_lookup")]
     async fn reverse_lookup(
         &self,
@@ -55,7 +73,7 @@ pub trait ZnsApi {
         since_height: Option<u64>,
         limit: Option<u64>,
         offset: Option<u64>,
-    ) -> RpcResult<Paginated<NameEvent>>;
+    ) -> RpcResult<EventsPage>;
 }
 
 pub struct JsonRpcApi {
@@ -105,12 +123,40 @@ fn clamp_pagination(limit: Option<u64>, offset: Option<u64>) -> (u32, u32) {
 
 #[async_trait]
 impl ZnsApiServer for JsonRpcApi {
-    async fn resolve(&self, name: String) -> RpcResult<Option<NameRecord>> {
+    async fn resolve(
+        &self,
+        query: String,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> RpcResult<ResolveResult> {
+        let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
         let conn = self.db.lock();
-        let reg = core::resolve_by_name(&conn, &name).map_err(RpcError::from)?;
-        Ok(reg.map(NameRecord::from))
+
+        // The empty query lists all registrations — the page-through form
+        // explorers and sitemaps build on.
+        if query.is_empty() {
+            let (regs, _) =
+                core::list_registrations(&conn, limit_u32, offset_u32).map_err(RpcError::from)?;
+            return Ok(ResolveResult::Many(
+                regs.into_iter().map(NameRecord::from).collect(),
+            ));
+        }
+
+        // An address queries the names currently bound to it.
+        if query.parse::<ZcashAddress>().is_ok() {
+            let (regs, _) = core::registrations_by_ua(&conn, &query, limit_u32, offset_u32)
+                .map_err(RpcError::from)?;
+            return Ok(ResolveResult::Many(
+                regs.into_iter().map(NameRecord::from).collect(),
+            ));
+        }
+
+        // Otherwise the query is a name: exact lookup, record or `null`.
+        let reg = core::resolve_by_name(&conn, &query).map_err(RpcError::from)?;
+        Ok(ResolveResult::Exact(reg.map(NameRecord::from)))
     }
 
+    /// List all currently registered names, paginated.
     async fn list_names(
         &self,
         limit: Option<u64>,
@@ -129,6 +175,7 @@ impl ZnsApiServer for JsonRpcApi {
         })
     }
 
+    /// Reverse lookup: all names currently bound to a unified address.
     async fn reverse_lookup(
         &self,
         address: String,
@@ -180,7 +227,7 @@ impl ZnsApiServer for JsonRpcApi {
         since_height: Option<u64>,
         limit: Option<u64>,
         offset: Option<u64>,
-    ) -> RpcResult<Paginated<NameEvent>> {
+    ) -> RpcResult<EventsPage> {
         let action = match action {
             Some(s) => Some(Action::from_bytes(s.as_bytes()).ok_or_else(|| {
                 RpcError::InvalidParams(format!(
@@ -198,10 +245,10 @@ impl ZnsApiServer for JsonRpcApi {
             core::events(&conn, name.as_deref(), action, since, limit_u32, offset_u32)
                 .map_err(RpcError::from)?;
 
-        let items = events.into_iter().map(NameEvent::from).collect();
+        let events = events.into_iter().map(NameEvent::from).collect();
 
-        Ok(Paginated {
-            items,
+        Ok(EventsPage {
+            events,
             total,
             limit: limit_u32 as u64,
             offset: offset_u32 as u64,
