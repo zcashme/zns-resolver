@@ -70,8 +70,8 @@ nullifier to be the anchor rejects claims the mint has already broadcast.
 
 Updates and releases take the same accept path with the mint's
 `predecessor_spent` guard: the transaction's nullifiers must spend this
-name's live tip and no anchor. The predecessor spend is not the name
-note's own action; fee inputs sit between them, same as a claim.
+name's live tip, no other live name, and no anchor. The predecessor spend
+is not the name note's own action; fee inputs sit between them, same as a claim.
 
 ## The canon contract
 
