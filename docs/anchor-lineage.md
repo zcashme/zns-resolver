@@ -35,11 +35,13 @@ authority — is a pure function of position-ordered chain facts:
 2. a revealed nullifier **retires** whatever the rest of its transaction
    turned out to be — including a candidate-free Registry spend;
 3. a **successor** joins one-for-one — including while the pool is
-   short — only for a claim whose registry outputs are exactly one
-   zero-value note, and only when exactly one live anchor retired.
-   A note cannot create a new claim permission on its own. It only
-   replaces the one anchor this transaction spent (zns-mint #233). An update, a release, or a second registry output leaves the
-   successor unset. A zero-value note in any other transaction stays out.
+   short — only when the claim is admitted. The claim spends exactly
+   one live anchor, spends no name note, and the name is free. A
+   duplicate on a live name, or a claim that also spends a name note,
+   retires the anchor and leaves the successor out. A note cannot
+   create a new claim permission on its own. It only replaces the one
+   anchor this transaction spent (zns-mint #233). An update, a release,
+   or a second registry output leaves the successor unset.
 
 `Lineage::step_tx` (`src/registry/anchor_lineage.rs`) folds one
 transaction's facts in exactly that order. It is never persisted: each
@@ -101,8 +103,3 @@ records notes. Two implementations, one executable contract.
   `confirmed_mtp + LIVENESS_INTERVAL`. A release stays legal after
   either clock. The first ten scanned blocks have no MTP, so an update
   there follows the chain rule alone.
-- The mint's `retire_spent` adopts a rejected claim's successor into its
-  pool (facts first). The fold reproduces this only for accepted-shape
-  transactions; the poisoned entries are inert (attacker notes can never
-  be spent) but grow the mint's pool unboundedly — mint-side hardening,
-  separate ticket.

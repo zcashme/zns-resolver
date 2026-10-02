@@ -77,10 +77,11 @@ pub(crate) struct TxAnchorFacts {
     pub(crate) has_single_name_note: bool,
     /// Name notes in this transaction. The keygen ceremony has none.
     pub(crate) name_notes: usize,
-    /// The mint's successor: the one candidate is a claim, and the
-    /// transaction's registry outputs are exactly one zero-value note.
-    /// An update, a release, or a second registry output leaves this false,
-    /// so the note cannot take a seat after ceremony close.
+    /// The mint admits this claim's successor. The output shape is one
+    /// zero-value note, exactly one live anchor retired, the transaction
+    /// spent no name note, and the name was free. A duplicate on a live
+    /// name, or a claim that also spends a name note, leaves this false:
+    /// the anchor still retires, and the successor stays out.
     pub(crate) claim_successor: bool,
 }
 
@@ -143,12 +144,11 @@ impl Lineage {
             }
         }
 
-        // One-for-one, mirroring the mint's retire_spent: a successor
-        // takes a seat only for a claim with exactly one zero-value
-        // registry output, and only when exactly one live anchor retired.
-        // Authority cannot be minted, only succeeded. This insert is
-        // independent of ceremony close: a backed successor still
-        // enters while the pool is short.
+        // One-for-one, mirroring the mint's accept_claim: the successor
+        // joins only when the claim is admitted. The anchor it spent has
+        // already retired, whatever the verdict. Authority cannot be
+        // minted, only succeeded. This insert is independent of ceremony
+        // close: an admitted successor still enters while the pool is short.
         if retired == 1 && facts.claim_successor && facts.adoptions.len() == 1 {
             self.live.insert(facts.adoptions[0].nf);
         }
@@ -566,6 +566,7 @@ mod canon {
             height: u32,
             spent_anchor: String,
             successor_anchor: String,
+            expect: String,
         },
         UnbackedClaim {
             height: u32,
@@ -699,6 +700,7 @@ mod canon {
                         height,
                         spent_anchor,
                         successor_anchor,
+                        expect,
                     } => (
                         *height,
                         TxAnchorFacts {
@@ -710,7 +712,10 @@ mod canon {
                             }],
                             has_single_name_note: true,
                             name_notes: 1,
-                            claim_successor: true,
+                            // A rejected claim retires its anchor and leaves
+                            // the successor out. The fixture records that
+                            // verdict; the scan computes the same one.
+                            claim_successor: expect == "accepted",
                         },
                         false,
                     ),

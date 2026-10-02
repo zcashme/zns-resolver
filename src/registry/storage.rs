@@ -5,7 +5,7 @@ use rusqlite::Connection;
 /// The SQL to create the name index tables (and supporting state).
 /// Run once by the writer connection at startup.
 pub(crate) const SCHEMA_SQL: &str = r#"
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;
@@ -104,9 +104,14 @@ CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 /// claim with a second registry output would seat an anchor the mint
 /// rejects. A version 3 database stored every zero-value note, so the
 /// pool can contain anchors the keygen transaction did not create, and a
-/// name may have been bound to one of them. Those scans cannot be
-/// replayed into the mint's pool. In each case the chain tables and the
-/// checkpoint are dropped and the next open replays from the birthday.
+/// name may have been bound to one of them. A version 4 database stored
+/// a successor for every claim-shaped note, including a claim that was
+/// not admitted. A later claim may already have spent that successor and
+/// been recorded. A replay from the birthday would not admit that later
+/// claim, because the successor it spent would never have entered the
+/// pool. Those scans cannot be replayed into the mint's pool. In each
+/// case the chain tables and the checkpoint are dropped and the next
+/// open replays from the birthday.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
@@ -119,7 +124,7 @@ pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
              DROP TABLE IF EXISTS implicit_releases;
              DROP TABLE IF EXISTS block_times;",
         )?;
-    } else if version < 4 {
+    } else if version < 5 {
         if version == 1 {
             tracing::warn!(
                 "schema version 1 has no confirmation times; dropping the scan so it replays from the birthday"
@@ -128,9 +133,13 @@ pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
             tracing::warn!(
                 "schema version 2 cannot tell a claim successor from any other zero-value note; dropping the scan so it replays from the birthday"
             );
-        } else {
+        } else if version == 3 {
             tracing::warn!(
                 "schema version 3 stored every zero-value note; the ceremony is only the keygen transaction, so the scan replays from the birthday"
+            );
+        } else {
+            tracing::warn!(
+                "schema version 4 kept a successor for a claim that was not admitted; a later claim may have spent it, so the scan replays from the birthday"
             );
         }
         conn.execute_batch(
