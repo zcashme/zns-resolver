@@ -13,7 +13,7 @@ must never be compared — each is typed at the scan boundary
 |---|---|---|
 | notes | ordinary (rseed self-consistent) | relaxed (ZNS commitment from memo) |
 | nullifier | standard derivation | `zns_nullifier` (fork derivation) |
-| type | `AnchorNf` | raw (PR #2: `TipNf`) |
+| type | `AnchorNf` | `TipNf` |
 | state | derived (`Lineage`) | the `names` row |
 
 The scan surfaces both: ordinary notes in `ironwood_outputs`, relaxed
