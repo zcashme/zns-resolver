@@ -22,6 +22,8 @@ use super::{Event, Registration};
 /// The liveness interval, §4.5: a name whose tip is not renewed within
 /// this many seconds of its confirmation is release-due. Mirrors
 /// zns-mint's `LIVENESS_INTERVAL` (one Julian year).
+///
+/// TODO: move to zns-verify so the mint and the resolver share one definition.
 pub(crate) const LIVENESS_INTERVAL: i64 = 31_557_600;
 
 /// One authenticated candidate: a relaxed registry output whose memo
