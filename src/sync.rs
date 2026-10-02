@@ -76,8 +76,16 @@ impl Account for Registry {
         at: SeerCursor,
         transactions: &[WalletTx],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // Fold the snapshot without the connection so a name query is not
+        // stuck behind the replay. The indexer is the only writer, so the
+        // snapshot still matches the batch.
+        let facts = {
+            let conn = self.db.lock();
+            core::lineage_facts(&conn)?
+        };
+        let lineage = core::fold_lineage(facts);
         let conn = self.db.lock();
-        core::apply_batch(&conn, at, transactions, &self.fvk)?;
+        core::apply_batch(&conn, at, transactions, &self.fvk, lineage)?;
         Ok(())
     }
 }
