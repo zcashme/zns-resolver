@@ -365,11 +365,14 @@ pub(crate) fn apply_batch(
         let mut txs: Vec<&WalletTx> = block.iter().collect();
         txs.sort_by_key(|tx| tx.tx_index);
         let mut tx_law: Vec<TxLaw> = Vec::new();
+        // Names admitted earlier in this batch are not in the table yet.
+        // A later claim in the same block must see them as taken.
+        let mut bound_names: HashSet<String> = HashSet::new();
         for tx in txs {
             let txid = *tx.txid.as_ref();
             let tx_index = tx.tx_index;
             let name_notes = candidate_counts.get(&txid).copied().unwrap_or(0);
-            let claim_successor = claim_successor_output(tx, &candidates);
+            let shape = claim_successor_output(tx, &candidates);
             let adoptions: Vec<Adoption> = tx
                 .ironwood_outputs
                 .iter()
@@ -377,8 +380,8 @@ pub(crate) fn apply_batch(
                 .filter_map(|o| o.nf.map(AnchorNf::from_scan))
                 .map(|nf| Adoption { nf })
                 .collect();
-            let facts = TxAnchorFacts {
-                adoptions: if keeps_anchor_note(adoptions.len(), name_notes, claim_successor) {
+            let mut facts = TxAnchorFacts {
+                adoptions: if keeps_anchor_note(adoptions.len(), name_notes, shape) {
                     adoptions
                 } else {
                     Vec::new()
@@ -392,9 +395,37 @@ pub(crate) fn apply_batch(
                     .collect(),
                 has_single_name_note: name_notes == 1,
                 name_notes,
-                claim_successor,
+                claim_successor: false,
             };
             let snapshot = lineage.clone();
+            let spent_a_live_name = facts
+                .retirements
+                .iter()
+                .any(|r| live_names.contains(&TipNf::from_revealed(&r.nf)));
+            let one_live_anchor = snapshot.live_retirements(&facts) == 1;
+            let admitted = if shape && one_live_anchor && !spent_a_live_name {
+                admitted_claim_successor(&db_tx, &candidates, txid, &bound_names, fvk)?
+            } else {
+                None
+            };
+            if shape && admitted.is_none() {
+                // The note was stored from its output shape. A rejected
+                // claim does not keep it: the fold would seat it later.
+                if let Some(adoption) = facts.adoptions.first() {
+                    db_tx.execute(
+                        "DELETE FROM anchor_facts WHERE nullifier = ?1",
+                        params![adoption.nf.as_bytes().as_slice()],
+                    )?;
+                }
+                facts.adoptions.clear();
+            }
+            facts.claim_successor = admitted.is_some();
+            if let Some(nullifier) = admitted {
+                if let Some(candidate) = candidates.iter().find(|c| c.txid == txid) {
+                    bound_names.insert(candidate.name().to_string());
+                }
+                live_names.insert(nullifier);
+            }
             lineage.step_tx(height, &facts);
             tx_law.push(TxLaw {
                 txid,
@@ -493,6 +524,31 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
 /// received, and the transaction's one name note is a claim. A sent note
 /// is not stored as an adoption, so it cannot be the successor the fold
 /// seats.
+/// The mint seats a successor only for a claim it admits: the name is
+/// free, including names already admitted earlier in this batch, and the
+/// note's nullifier derives. `None` leaves the successor out.
+fn admitted_claim_successor(
+    db: &Connection,
+    candidates: &[Candidate<'_>],
+    txid: [u8; 32],
+    bound_names: &HashSet<String>,
+    fvk: &FullViewingKey,
+) -> rusqlite::Result<Option<TipNf>> {
+    let Some(candidate) = candidates.iter().find(|candidate| candidate.txid == txid) else {
+        return Ok(None);
+    };
+    if bound_names.contains(candidate.name()) {
+        return Ok(None);
+    }
+    if read_tip_offline(db, candidate.name())?.is_some() {
+        return Ok(None);
+    }
+    if notes::check_chain_rule(None, &candidate.note).is_none() {
+        return Ok(None);
+    }
+    Ok(admit_nullifier(candidate, fvk))
+}
+
 fn claim_successor_output(tx: &WalletTx, candidates: &[Candidate<'_>]) -> bool {
     let [output] = tx.ironwood_outputs.as_slice() else {
         return false;
@@ -1709,7 +1765,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1740,7 +1796,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1822,7 +1878,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -1884,7 +1940,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -1968,7 +2024,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -1979,6 +2035,106 @@ mod tests {
         assert_eq!(birthday, 90);
         assert!(checkpoint(&conn).unwrap().is_none());
         for table in ["names", "anchor_facts"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+    }
+
+    /// A version 4 database stored a successor for a claim that was not
+    /// admitted. A later claim may have spent that successor. Opening it
+    /// drops the scan and keeps the account, so the next run replays from
+    /// the birthday.
+    #[test]
+    fn version_4_database_rescans_from_the_birthday() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 4;
+             CREATE TABLE registry_account (
+                id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+                ufvk TEXT NOT NULL,
+                network TEXT NOT NULL,
+                birthday INTEGER NOT NULL,
+                sync_height INTEGER,
+                sync_hash BLOB
+             );
+             CREATE TABLE name_events (
+                name TEXT NOT NULL,
+                height INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                ua TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                prev_rcm BLOB NOT NULL,
+                rcm BLOB NOT NULL,
+                psi BLOB NOT NULL,
+                cmx BLOB NOT NULL,
+                nullifier BLOB NOT NULL,
+                txid BLOB NOT NULL,
+                tx_index INTEGER NOT NULL,
+                action_index INTEGER NOT NULL,
+                memo BLOB NOT NULL,
+                PRIMARY KEY (name, height, txid, action_index)
+             );
+             CREATE TABLE anchor_facts (
+                nullifier BLOB NOT NULL PRIMARY KEY,
+                value INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                tx_index INTEGER NOT NULL,
+                action_index INTEGER NOT NULL,
+                name_note_candidates INTEGER NOT NULL,
+                claim_successor INTEGER NOT NULL DEFAULT 0,
+                spent_height INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday, sync_height, sync_hash)
+             VALUES (0, 'ufvk', 'test', 90, 100, ?1)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('alice', 10, 'claim', 'u', 'none', x'00', x'00', x'00', x'00', x'11', x'22', 0, 0, x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('bob', 20, 'claim', 'u', 'none', x'00', x'00', x'00', x'00', x'33', x'44', 0, 0, x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor, spent_height)
+             VALUES (x'11', 0, 10, 0, 1, 1, 1, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor, spent_height)
+             VALUES (x'22', 0, 12, 0, 1, 1, 1, 20)",
+            [],
+        )
+        .unwrap();
+
+        crate::registry::storage::install_schema(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+        let birthday: i64 = conn
+            .query_row(
+                "SELECT birthday FROM registry_account WHERE id = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(birthday, 90);
+        assert!(checkpoint(&conn).unwrap().is_none());
+        for table in ["name_events", "anchor_facts"] {
             let rows: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap();
@@ -2644,13 +2800,19 @@ mod admission {
             "alice",
             [0u8; 32],
         )];
-        let second_law = tx_law_for(
+        let mut second_law = tx_law_for(
             [2; 32],
-            lineage,
+            lineage.clone(),
             vec![Adoption { nf: nf(201) }],
             vec![Retirement { nf: nf(200) }],
             true,
         );
+        // The name is already live, so the successor stays out. The anchor
+        // it spent still retires.
+        second_law.facts.claim_successor = false;
+        lineage.step_tx(101, &second_law.facts);
+        assert!(!lineage.contains(&nf(201)));
+        assert!(!lineage.contains(&nf(200)));
         apply_candidates(
             &tx,
             101,
