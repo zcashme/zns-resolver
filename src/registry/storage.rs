@@ -95,8 +95,10 @@ CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 /// before the anchor-fact tables cannot be upgraded in place: the old
 /// watch table lacks value and canonical-position data, and its names
 /// rows lack tx_index. The version gate drops everything and reinstalls,
-/// so the next open rescans from the configured birthday. Version 1 gains
-/// the clock columns in place; its rows stay.
+/// so the next open rescans from the configured birthday. A version 1
+/// database has tips and no confirmation times. Keeping those rows would
+/// admit a clock-due update as a renewal, so the chain tables and the
+/// checkpoint are dropped and the next open replays from the birthday.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
@@ -110,27 +112,18 @@ pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
              DROP TABLE IF EXISTS block_times;",
         )?;
     } else if version == 1 {
-        add_column(conn, "names", "confirmed_mtp")?;
-        add_column(conn, "name_events", "confirmed_mtp")?;
-    }
-    conn.execute_batch(SCHEMA_SQL)?;
-    Ok(())
-}
-
-fn add_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<()> {
-    let present: bool = conn.query_row(
-        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
-        rusqlite::params![column],
-        |row| {
-            let count: i64 = row.get(0)?;
-            Ok(count != 0)
-        },
-    )?;
-    if !present {
-        conn.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER"),
-            [],
+        tracing::warn!(
+            "schema version 1 has no confirmation times; dropping the scan so it replays from the birthday"
+        );
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS name_events;
+             DROP TABLE IF EXISTS names;
+             DROP TABLE IF EXISTS anchor_facts;
+             DROP TABLE IF EXISTS implicit_releases;
+             DROP TABLE IF EXISTS block_times;
+             UPDATE registry_account SET sync_height = NULL, sync_hash = NULL WHERE id = 0;",
         )?;
     }
+    conn.execute_batch(SCHEMA_SQL)?;
     Ok(())
 }

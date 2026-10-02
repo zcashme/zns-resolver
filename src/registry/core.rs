@@ -1684,12 +1684,22 @@ mod tests {
         );
     }
 
-    /// A version 1 database gains the clock columns without losing rows.
+    /// A version 1 database has tips and no confirmation times. Opening it
+    /// drops the scan, keeps the account, and leaves an empty index so the
+    /// next run replays from the birthday.
     #[test]
-    fn version_1_database_gains_clock_columns() {
+    fn version_1_database_rescans_from_the_birthday() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "PRAGMA user_version = 1;
+             CREATE TABLE registry_account (
+                id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+                ufvk TEXT NOT NULL,
+                network TEXT NOT NULL,
+                birthday INTEGER NOT NULL,
+                sync_height INTEGER,
+                sync_hash BLOB
+             );
              CREATE TABLE names (
                 name TEXT NOT NULL PRIMARY KEY,
                 height INTEGER NOT NULL,
@@ -1706,27 +1716,31 @@ mod tests {
                 action_index INTEGER NOT NULL,
                 memo BLOB NOT NULL
              );
-             CREATE TABLE name_events (
-                name TEXT NOT NULL,
+             CREATE TABLE anchor_facts (
+                nullifier BLOB NOT NULL PRIMARY KEY,
+                value INTEGER NOT NULL,
                 height INTEGER NOT NULL,
-                action TEXT NOT NULL,
-                ua TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                prev_rcm BLOB NOT NULL,
-                rcm BLOB NOT NULL,
-                psi BLOB NOT NULL,
-                cmx BLOB NOT NULL,
-                nullifier BLOB NOT NULL,
-                txid BLOB NOT NULL,
                 tx_index INTEGER NOT NULL,
                 action_index INTEGER NOT NULL,
-                memo BLOB NOT NULL
+                name_note_candidates INTEGER NOT NULL
              );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday, sync_height, sync_hash)
+             VALUES (0, 'ufvk', 'test', 90, 100, ?1)",
+            params![vec![1u8; 32]],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
              VALUES ('z', 1, 'claim', 'u', 'none', x'00', x'00', x'00', x'00', x'00', x'00', 0, 0, x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates)
+             VALUES (x'01', 0, 90, 0, 0, 0)",
             [],
         )
         .unwrap();
@@ -1737,18 +1751,21 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 2);
-        let confirmed: Option<i64> = conn
+        let birthday: i64 = conn
             .query_row(
-                "SELECT confirmed_mtp FROM names WHERE name = 'z'",
+                "SELECT birthday FROM registry_account WHERE id = 0",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(confirmed, None);
-        let times: i64 = conn
-            .query_row("SELECT COUNT(*) FROM block_times", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(times, 0);
+        assert_eq!(birthday, 90);
+        assert!(checkpoint(&conn).unwrap().is_none());
+        for table in ["names", "anchor_facts", "block_times", "name_events"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
     }
 
     #[test]
