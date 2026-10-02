@@ -2307,6 +2307,48 @@ mod tests {
         assert!(!lineage.adoption_closed());
     }
 
+    /// A stored adoption, the spend that retires it, and the successor note
+    /// fold to the pool the batch would keep. The pool is already full, so
+    /// the successor enters only because the stored row says it is a claim
+    /// successor.
+    #[test]
+    fn lineage_facts_replay_a_spent_anchor_and_its_successor() {
+        let conn = database();
+        let mut spent = [0u8; 32];
+        spent[0] = 1;
+        for seed in 1..=40 {
+            let mut nullifier = [0u8; 32];
+            nullifier[0] = seed;
+            conn.execute(
+                "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor, spent_height)
+                 VALUES (?1, 0, 10, 0, ?2, 0, 0, NULL)",
+                params![nullifier.as_slice(), i64::from(seed) - 1],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE anchor_facts SET spent_height = 12, spent_tx_index = 0, spent_action_index = 0
+             WHERE nullifier = ?1",
+            params![spent.as_slice()],
+        )
+        .unwrap();
+        let mut successor = [0u8; 32];
+        successor[0] = 200;
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor, spent_height)
+             VALUES (?1, 0, 12, 0, 1, 1, 1, NULL)",
+            params![successor.as_slice()],
+        )
+        .unwrap();
+
+        let lineage = fold_lineage(lineage_facts(&conn).unwrap());
+
+        assert!(lineage.adoption_closed());
+        assert_eq!(lineage.len(), 40);
+        assert!(lineage.contains(&AnchorNf::from_bytes(&successor)));
+        assert!(!lineage.contains(&AnchorNf::from_bytes(&spent)));
+    }
+
     #[test]
     fn a_fact_height_that_does_not_fit_fails_the_snapshot() {
         let conn = database();
@@ -2564,6 +2606,148 @@ mod admission {
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+    }
+
+    /// A second claim for a name that already has a live record does not
+    /// replace that record.
+    #[test]
+    fn a_second_claim_leaves_the_first_name_in_place() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let first = vec![candidate(
+            &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let first_law = tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![Adoption { nf: nf(200) }],
+            vec![Retirement { nf: nf(1) }],
+            true,
+        );
+        let mut live_names: HashSet<TipNf> = HashSet::new();
+        let mut lineage = seeded;
+        lineage.step_tx(100, &first_law.facts);
+        apply_candidates(&tx, 100, None, &first, &mut live_names, &[first_law], &fvk).unwrap();
+
+        let second_memo = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let second = vec![candidate(
+            &second_memo,
+            0,
+            0,
+            0,
+            [2; 32],
+            "claim",
+            "alice",
+            [0u8; 32],
+        )];
+        let second_law = tx_law_for(
+            [2; 32],
+            lineage,
+            vec![Adoption { nf: nf(201) }],
+            vec![Retirement { nf: nf(200) }],
+            true,
+        );
+        apply_candidates(
+            &tx,
+            101,
+            None,
+            &second,
+            &mut live_names,
+            &[second_law],
+            &fvk,
+        )
+        .unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
+        let height: i64 = tx
+            .query_row("SELECT height FROM names WHERE name = 'alice'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(height, 100);
+    }
+
+    /// An update that also spends a live anchor does not renew the name.
+    /// The spent tip ends the binding.
+    #[test]
+    fn an_update_that_spends_an_anchor_ends_the_binding() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let claim = vec![candidate(
+            &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let claim_law = tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![Adoption { nf: nf(200) }],
+            vec![Retirement { nf: nf(1) }],
+            true,
+        );
+        let mut live_names: HashSet<TipNf> = HashSet::new();
+        let mut lineage = seeded;
+        lineage.step_tx(100, &claim_law.facts);
+        apply_candidates(&tx, 100, None, &claim, &mut live_names, &[claim_law], &fvk).unwrap();
+
+        let tip: Vec<u8> = tx
+            .query_row(
+                "SELECT nullifier FROM names WHERE name = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let tip: [u8; 32] = tip.try_into().unwrap();
+        let update_memo = vec![memo_for("update", "alice", &[0x02; 32])];
+        let update = vec![candidate(
+            &update_memo,
+            0,
+            0,
+            0,
+            [3; 32],
+            "update",
+            "alice",
+            [0x02; 32],
+        )];
+        let update_law = tx_law_for(
+            [3; 32],
+            lineage,
+            vec![],
+            vec![
+                Retirement {
+                    nf: AnchorNf::from_bytes(&tip),
+                },
+                Retirement { nf: nf(200) },
+            ],
+            true,
+        );
+        apply_candidates(
+            &tx,
+            101,
+            None,
+            &update,
+            &mut live_names,
+            &[update_law],
+            &fvk,
+        )
+        .unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(
+            count(
+                &tx,
+                "SELECT COUNT(*) FROM name_events WHERE action = 'update'"
+            ),
+            0
+        );
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
     }
 
     /// A second registry output means the mint's successor is absent, so
@@ -3173,6 +3357,121 @@ mod admission {
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+    }
+
+    /// A batch with one received zero-value note is not the keygen
+    /// transaction, so that note is not stored. A payment and a note this
+    /// account sent are not stored either. The block time is still recorded.
+    #[test]
+    fn a_batch_skips_a_note_outside_the_keygen_transaction_and_a_payment() {
+        use orchard::keys::Scope;
+        use orchard::note::{Nullifier, RandomSeed, Rho};
+        use orchard::value::NoteValue;
+        use orchard::Address;
+        use seer_sync::sync::scan::WalletTx;
+        use seer_sync::Cursor;
+        use zcash_primitives::block::BlockHash;
+        use zcash_primitives::transaction::TxId;
+        use zcash_protocol::consensus::BlockHeight;
+
+        let conn = db();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
+            [],
+        )
+        .unwrap();
+
+        let rho = Rho::from_bytes(&[9u8; 32]).into_option().expect("rho");
+        let rseed = RandomSeed::from_bytes([4u8; 32], &rho)
+            .into_option()
+            .expect("rseed");
+        let recipient = Address::from_raw_address_bytes(&RAW_ADDR)
+            .into_option()
+            .expect("address");
+        let payment = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(1),
+            rho,
+            rseed,
+            orchard::note::NoteVersion::V3,
+        )
+        .into_option()
+        .expect("payment note");
+        let zero = test_note();
+        let nf_bytes = [9u8; 32];
+        let nullifier = Option::from(Nullifier::from_bytes(&nf_bytes)).expect("nullifier");
+
+        let tx = WalletTx {
+            txid: TxId::from_bytes([1; 32]),
+            height: BlockHeight::from_u32(10),
+            tx_index: 0,
+            sapling_outputs: vec![],
+            sapling_spends: vec![],
+            orchard_outputs: vec![],
+            orchard_spends: vec![],
+            ironwood_outputs: vec![
+                seer_sync::sync::scan::OrchardOutput {
+                    index: 0,
+                    note: zero,
+                    recipient,
+                    nf: Some(nullifier),
+                    position: 0,
+                    scope: Scope::External,
+                    memo: None,
+                    is_sent: false,
+                    is_change: false,
+                },
+                seer_sync::sync::scan::OrchardOutput {
+                    index: 1,
+                    note: payment,
+                    recipient,
+                    nf: Some(nullifier),
+                    position: 1,
+                    scope: Scope::External,
+                    memo: None,
+                    is_sent: false,
+                    is_change: false,
+                },
+                seer_sync::sync::scan::OrchardOutput {
+                    index: 2,
+                    note: zero,
+                    recipient,
+                    nf: Some(nullifier),
+                    position: 2,
+                    scope: Scope::External,
+                    memo: None,
+                    is_sent: true,
+                    is_change: false,
+                },
+            ],
+            ironwood_spends: vec![],
+            relaxed_ironwood_outputs: vec![],
+            transparent_outputs: vec![],
+            transparent_spends: vec![],
+        };
+        apply_batch(
+            &conn,
+            Cursor {
+                height: BlockHeight::from_u32(10),
+                hash: BlockHash([2; 32]),
+            },
+            &[tx],
+            &[(10, 1_000)],
+            &fvk(),
+            Lineage::new(),
+        )
+        .unwrap();
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM anchor_facts"), 0);
+        let time: i64 = conn
+            .query_row(
+                "SELECT time FROM block_times WHERE height = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(time, 1_000);
     }
 
     fn seeded_lineage(anchors: &[u8]) -> Lineage {
