@@ -14,7 +14,9 @@ use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::{BlockHeight, Parameters as _};
 use zns_verify::{pallas, Action, Memo, NameNote, PrimeField, Tip};
 
-use super::anchor_lineage::{Adoption, Lineage, Position, Retirement, TxAnchorFacts};
+use super::anchor_lineage::{
+    keeps_anchor_note, Adoption, Lineage, Position, Retirement, TxAnchorFacts,
+};
 use super::nf::{AnchorNf, TipNf};
 use super::notes;
 use super::{Event, Registration};
@@ -297,10 +299,22 @@ pub(crate) fn apply_batch(
             let tx_index = tx_data.tx_index;
             let candidate_count = candidate_counts.get(&txid).copied().unwrap_or(0);
             let claim_successor = claim_successor_output(tx_data, &candidates);
+            let zero_value_notes = tx_data
+                .ironwood_outputs
+                .iter()
+                .filter(|output| {
+                    !output.is_sent && output.note.value().inner() == 0 && output.nf.is_some()
+                })
+                .count();
+            // The keygen transaction, or a claim's one successor. A
+            // zero-value note in any other transaction does not join.
+            // Spends are still recorded: a later transaction can retire
+            // an anchor this one did not create.
+            let keep_notes = keeps_anchor_note(zero_value_notes, candidate_count, claim_successor);
             for output in &tx_data.ironwood_outputs {
                 // A payment is not an anchor fact. Storing it would grow the
                 // table the lineage rereads on every batch.
-                if output.is_sent || output.note.value().inner() != 0 {
+                if !keep_notes || output.is_sent || output.note.value().inner() != 0 {
                     continue;
                 }
                 let Some(nf) = output.nf else {
@@ -354,14 +368,21 @@ pub(crate) fn apply_batch(
         for tx in txs {
             let txid = *tx.txid.as_ref();
             let tx_index = tx.tx_index;
+            let name_notes = candidate_counts.get(&txid).copied().unwrap_or(0);
+            let claim_successor = claim_successor_output(tx, &candidates);
+            let adoptions: Vec<Adoption> = tx
+                .ironwood_outputs
+                .iter()
+                .filter(|o| !o.is_sent && o.note.value().inner() == 0)
+                .filter_map(|o| o.nf.map(AnchorNf::from_scan))
+                .map(|nf| Adoption { nf })
+                .collect();
             let facts = TxAnchorFacts {
-                adoptions: tx
-                    .ironwood_outputs
-                    .iter()
-                    .filter(|o| !o.is_sent && o.note.value().inner() == 0)
-                    .filter_map(|o| o.nf.map(AnchorNf::from_scan))
-                    .map(|nf| Adoption { nf })
-                    .collect(),
+                adoptions: if keeps_anchor_note(adoptions.len(), name_notes, claim_successor) {
+                    adoptions
+                } else {
+                    Vec::new()
+                },
                 retirements: tx
                     .ironwood_spends
                     .iter()
@@ -369,8 +390,9 @@ pub(crate) fn apply_batch(
                         nf: AnchorNf::from_scan(s.nf),
                     })
                     .collect(),
-                has_single_name_note: candidate_counts.get(&txid).copied().unwrap_or(0) == 1,
-                claim_successor: claim_successor_output(tx, &candidates),
+                has_single_name_note: name_notes == 1,
+                name_notes,
+                claim_successor,
             };
             let snapshot = lineage.clone();
             lineage.step_tx(height, &facts);
@@ -510,6 +532,7 @@ pub(crate) fn fold_lineage(mut events: Vec<(Position, FactEvent)>) -> Lineage {
                     claim_successor,
                 } => {
                     facts.has_single_name_note = name_note_candidates == 1;
+                    facts.name_notes = usize::try_from(name_note_candidates).unwrap_or(usize::MAX);
                     facts.claim_successor = claim_successor;
                     facts.adoptions.push(Adoption { nf });
                 }
@@ -1686,7 +1709,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1717,7 +1740,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1799,7 +1822,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -1861,7 +1884,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -1875,6 +1898,92 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(facts, 0);
+    }
+
+    /// A version 3 database stored every zero-value note. Opening it drops
+    /// the scan and keeps the account, so the next run replays the keygen
+    /// transaction from the birthday.
+    #[test]
+    fn version_3_database_rescans_for_the_keygen_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 3;
+             CREATE TABLE registry_account (
+                id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+                ufvk TEXT NOT NULL,
+                network TEXT NOT NULL,
+                birthday INTEGER NOT NULL,
+                sync_height INTEGER,
+                sync_hash BLOB
+             );
+             CREATE TABLE names (
+                name TEXT NOT NULL PRIMARY KEY,
+                height INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                ua TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                prev_rcm BLOB NOT NULL,
+                rcm BLOB NOT NULL,
+                psi BLOB NOT NULL,
+                cmx BLOB NOT NULL,
+                nullifier BLOB NOT NULL,
+                txid BLOB NOT NULL,
+                tx_index INTEGER NOT NULL,
+                action_index INTEGER NOT NULL,
+                memo BLOB NOT NULL
+             );
+             CREATE TABLE anchor_facts (
+                nullifier BLOB NOT NULL PRIMARY KEY,
+                value INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                tx_index INTEGER NOT NULL,
+                action_index INTEGER NOT NULL,
+                name_note_candidates INTEGER NOT NULL,
+                claim_successor INTEGER NOT NULL DEFAULT 0,
+                spent_height INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday, sync_height, sync_hash)
+             VALUES (0, 'ufvk', 'test', 90, 100, ?1)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 1, 'claim', 'u', 'none', x'00', x'00', x'00', x'00', x'00', x'00', 0, 0, x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor, spent_height)
+             VALUES (x'01', 0, 90, 0, 0, 0, 0, NULL)",
+            [],
+        )
+        .unwrap();
+
+        crate::registry::storage::install_schema(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let birthday: i64 = conn
+            .query_row(
+                "SELECT birthday FROM registry_account WHERE id = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(birthday, 90);
+        assert!(checkpoint(&conn).unwrap().is_none());
+        for table in ["names", "anchor_facts"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
     }
 
     #[test]
@@ -2067,6 +2176,7 @@ mod tests {
                 nf: AnchorNf::from_bytes(&nf),
             }],
             has_single_name_note: false,
+            name_notes: 0,
             claim_successor: false,
         };
 
@@ -2152,12 +2262,16 @@ mod tests {
     #[test]
     fn lineage_ignores_payment_notes() {
         let conn = database();
-        conn.execute(
-            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
-             VALUES (?1, 0, 10, 0, 0, 0, NULL)",
-            params![vec![1u8; 32]],
-        )
-        .unwrap();
+        for action in 0..40 {
+            let mut nf = [0u8; 32];
+            nf[0] = action as u8 + 1;
+            conn.execute(
+                "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+                 VALUES (?1, 0, 10, 0, ?2, 0, NULL)",
+                params![nf.to_vec(), action],
+            )
+            .unwrap();
+        }
         conn.execute(
             "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
              VALUES (?1, 5, 11, 0, 0, 0, NULL)",
@@ -2166,13 +2280,31 @@ mod tests {
         .unwrap();
 
         let lineage = fold_lineage(lineage_facts(&conn).unwrap());
-        assert_eq!(lineage.len(), 1);
-        assert_eq!(ironwood_nullifiers(&conn).unwrap().len(), 1);
+        assert_eq!(lineage.len(), 40);
+        assert!(lineage.adoption_closed());
+        assert_eq!(ironwood_nullifiers(&conn).unwrap().len(), 40);
         assert_eq!(drop_payment_notes(&conn).unwrap(), 1);
         let left: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(left, 1);
+        assert_eq!(left, 40);
+    }
+
+    /// One stored zero-value note is not the keygen transaction, so the
+    /// fold does not adopt it.
+    #[test]
+    fn a_stored_note_outside_the_keygen_transaction_does_not_join() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 0, 10, 0, 0, 0, NULL)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+
+        let lineage = fold_lineage(lineage_facts(&conn).unwrap());
+        assert!(lineage.is_empty());
+        assert!(!lineage.adoption_closed());
     }
 
     #[test]
@@ -2385,6 +2517,7 @@ mod admission {
                 adoptions,
                 retirements,
                 has_single_name_note,
+                name_notes: usize::from(has_single_name_note),
                 claim_successor,
             },
         }
@@ -2454,6 +2587,7 @@ mod admission {
                 adoptions: vec![Adoption { nf: nf(200) }],
                 retirements: vec![Retirement { nf: nf(1) }],
                 has_single_name_note: true,
+                name_notes: 1,
                 claim_successor: false,
             },
         }];
@@ -3044,15 +3178,7 @@ mod admission {
     fn seeded_lineage(anchors: &[u8]) -> Lineage {
         let mut lineage = Lineage::new();
         for seed in anchors {
-            lineage.step_tx(
-                0,
-                &TxAnchorFacts {
-                    adoptions: vec![Adoption { nf: nf(*seed) }],
-                    retirements: vec![],
-                    has_single_name_note: false,
-                    claim_successor: false,
-                },
-            );
+            lineage.adopt(0, nf(*seed));
         }
         lineage
     }

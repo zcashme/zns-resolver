@@ -25,11 +25,13 @@ grouped per transaction.
 The live anchor set — the nullifiers that currently confer claim
 authority — is a pure function of position-ordered chain facts:
 
-1. zero-value registry outputs **adopt** in canonical order
-   (height, tx_index, action_index) until the pool first reaches
-   standing size (`ANCHOR_POOL_SIZE = 40`, mirrors keygen's
-   `NUM_ANCHORS`). The fold records that completion block; a later
-   shrink does not reopen filling;
+1. The keygen transaction is the ceremony. It holds all 40 zero-value
+   registry notes and no name note (`ANCHOR_POOL_SIZE = 40`, the same
+   number keygen uses). Those notes fill the pool, in canonical order
+   (height, tx_index, action_index). The fold records that block.
+   Spending an anchor later leaves one fewer in the pool, and a new
+   note does not replace it. A zero-value note in any other transaction
+   does not join the pool.
 2. a revealed nullifier **retires** whatever the rest of its transaction
    turned out to be — including a candidate-free Registry spend;
 3. a **successor** joins one-for-one — including while the pool is
@@ -37,7 +39,7 @@ authority — is a pure function of position-ordered chain facts:
    zero-value note, and only when exactly one live anchor retired.
    A note cannot create a new claim permission on its own. It only
    replaces the one anchor this transaction spent (zns-mint #233). An update, a release, or a second registry output leaves the
-   successor unset. Ordinary zero-value outputs after close stay out.
+   successor unset. A zero-value note in any other transaction stays out.
 
 `Lineage::step_tx` (`src/registry/anchor_lineage.rs`) folds one
 transaction's facts in exactly that order. It is never persisted: each
@@ -81,8 +83,9 @@ is not the name note's own action; fee inputs sit between them, same as a claim.
 `tests/fixtures/canon-vectors-v1.json` is vendored from zns-mint
 (provenance in `tests/fixtures/README.md`). All eight scenarios replay
 into the fold; the live set and `adoption_closed` must equal the mint's
-recorded snapshot after every event. Two implementations, one executable
-contract.
+recorded snapshot after every event. Each `adopt_anchor` event is the
+mint's `adopt()` call. The scan applies the keygen check before it
+records notes. Two implementations, one executable contract.
 
 ## Known residue
 
