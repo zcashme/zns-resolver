@@ -5,7 +5,7 @@ use rusqlite::Connection;
 /// The SQL to create the name index tables (and supporting state).
 /// Run once by the writer connection at startup.
 pub(crate) const SCHEMA_SQL: &str = r#"
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS name_events (
     txid         BLOB    NOT NULL,
     tx_index     INTEGER NOT NULL,
     action_index INTEGER NOT NULL,
-    confirmed_mtp INTEGER NOT NULL,
+    confirmed_mtp INTEGER,
     memo         BLOB    NOT NULL,
     PRIMARY KEY (name, height, txid, action_index)
 );
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS names (
     txid         BLOB    NOT NULL,
     tx_index     INTEGER NOT NULL,
     action_index INTEGER NOT NULL,
-    confirmed_mtp INTEGER NOT NULL,
+    confirmed_mtp INTEGER,
     memo         BLOB    NOT NULL
 );
 
@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
     spent_tx_index     INTEGER,
     spent_action_index INTEGER
 );
+CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 
 "#;
 
@@ -94,21 +95,42 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
 /// before the anchor-fact tables cannot be upgraded in place: the old
 /// watch table lacks value and canonical-position data, and its names
 /// rows lack tx_index. The version gate drops everything and reinstalls,
-/// so the next open rescans from the configured birthday. There is no
-/// version 1 in the wild — the first versioned schema is 1, and every
-/// database that exists reads 0 (never versioned) until this runs.
+/// so the next open rescans from the configured birthday. Version 1 gains
+/// the clock columns in place; its rows stay.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
-    use rusqlite::params;
-    let version: i64 = conn.query_row("PRAGMA user_version", params![], |r| r.get(0))?;
-    if version < 2 {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 1 {
         conn.execute_batch(
             "DROP TABLE IF EXISTS registry_account;
              DROP TABLE IF EXISTS name_events;
              DROP TABLE IF EXISTS names;
              DROP TABLE IF EXISTS watched_ironwood_notes;
              DROP TABLE IF EXISTS anchor_facts;
-             DROP TABLE IF EXISTS implicit_releases;",
+             DROP TABLE IF EXISTS implicit_releases;
+             DROP TABLE IF EXISTS block_times;",
+        )?;
+    } else if version == 1 {
+        add_column(conn, "names", "confirmed_mtp")?;
+        add_column(conn, "name_events", "confirmed_mtp")?;
+    }
+    conn.execute_batch(SCHEMA_SQL)?;
+    Ok(())
+}
+
+fn add_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<()> {
+    let present: bool = conn.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+        rusqlite::params![column],
+        |row| {
+            let count: i64 = row.get(0)?;
+            Ok(count != 0)
+        },
+    )?;
+    if !present {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER"),
+            [],
         )?;
     }
-    conn.execute_batch(SCHEMA_SQL)
+    Ok(())
 }
