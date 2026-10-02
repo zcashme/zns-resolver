@@ -13,7 +13,7 @@ mod sync; // Sync Loop
 
 use orchard::keys::FullViewingKey;
 use seer_sync::UnifiedFullViewingKey;
-use sync::{live_tip, run_indexer};
+use sync::{live_tip, run_indexer, Pending};
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
@@ -62,6 +62,7 @@ const RPC_ADDR: &str = "127.0.0.1:8080"; // where clients send JSON-RPC name que
 pub(crate) struct Registry {
     pub(crate) db: Db,
     pub(crate) fvk: FullViewingKey,
+    pub(crate) pending: Pending,
 }
 
 /// The mainnet placeholder is an all-`q` bech32 body. A real viewing key is not.
