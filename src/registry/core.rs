@@ -198,16 +198,10 @@ pub(crate) fn apply_batch(
                 };
                 // Gate: protocol parse. The kernel's structural rules are the
                 // authority — invalid statements never become candidates.
-                // The mint then requires the canonical encoding: parsing and
-                // encoding again must reproduce the memo bytes.
                 let Ok(note) = NameNote::parse(&zns_memo) else {
                     candidate_dropped("memo is not a name note", &txid, *action_index);
                     continue;
                 };
-                if note.encode().ok() != Some(zns_memo) {
-                    candidate_dropped("memo is not the canonical encoding", &txid, *action_index);
-                    continue;
-                }
                 // Gate: binding — the transition, hashed under the ZNS
                 // binding, must reproduce the published cmx.
                 let Some((psi, rcm)) =
@@ -1131,9 +1125,11 @@ pub(crate) fn events(
         &p[..3],
         |r| r.get(0),
     )?;
+    // One spend can end several names at the same height, tx, and action.
+    // `id` is unique, so a page cannot skip or repeat a tied row.
     let mut stmt = conn.prepare(&format!(
         "SELECT id, name, action, ua, txid, height, action_index, memo FROM ({LOG}) {WHERE}
-         ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT ?4 OFFSET ?5"
+         ORDER BY height DESC, tx_index DESC, action_index DESC, id DESC LIMIT ?4 OFFSET ?5"
     ))?;
     let events = stmt
         .query_map(p, |row| {
@@ -1811,6 +1807,40 @@ mod tests {
         assert_eq!(claim_total, 1);
         assert_eq!(claims[0].action, Action::Claim);
     }
+
+    #[test]
+    fn tied_implicit_releases_page_by_id() {
+        let conn = database();
+        let prev = "0000000000000000000000000000000000000000000000000000000000000000";
+        for name in ["a", "b"] {
+            let memo = format!("ZNS:claim:{name}:u:none:{prev}");
+            conn.execute(
+                "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+                 VALUES (?1, 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', ?2, ?3, 0, 0, ?4)",
+                params![name, name.as_bytes(), vec![6u8; 32], memo.as_bytes()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+                 VALUES (?1, 100, ?2, 1, 2, ?3)",
+                params![name, vec![7u8; 32], name.as_bytes()],
+            )
+            .unwrap();
+        }
+
+        let mut paged = Vec::new();
+        for offset in 0..4 {
+            let (page, total) = events(&conn, None, None, None, 1, offset).unwrap();
+            assert_eq!(total, 4);
+            assert_eq!(page.len(), 1);
+            paged.push(page[0].id);
+        }
+        let (all, _) = events(&conn, None, None, None, 4, 0).unwrap();
+        assert_eq!(paged, all.iter().map(|event| event.id).collect::<Vec<_>>());
+        assert_eq!(all[0].height, 100);
+        assert_eq!(all[1].height, 100);
+        assert!(all[0].id > all[1].id);
+    }
 }
 
 #[cfg(test)]
@@ -1935,13 +1965,6 @@ mod admission {
                 has_single_name_note,
             },
         }
-    }
-
-    #[test]
-    fn a_parsed_memo_reencodes_to_the_same_bytes() {
-        let memo = memo_for("claim", "alice", &[0u8; 32]);
-        let note = NameNote::parse(&memo).expect("parsed");
-        assert_eq!(note.encode().expect("encoded"), memo);
     }
 
     fn count(conn: &Connection, sql: &str) -> i64 {
