@@ -7,10 +7,10 @@ import type {
   EventsResult,
 } from "./types.js";
 
-/** Valid ZNS name pattern: 1-62 lowercase alphanumeric chars. */
-const NAME_RE = /^[a-z0-9]{1,62}$/;
+/** Valid ZNS name pattern: 1-63 lowercase alphanumeric chars. */
+const NAME_RE = /^[a-z0-9]{1,63}$/;
 
-/** Validates a ZNS name format (lowercase alphanumeric, 1-62 chars). */
+/** Validates a ZNS name format (lowercase alphanumeric, 1-63 chars). */
 function isValidName(name: string): boolean {
   return NAME_RE.test(name);
 }

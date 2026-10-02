@@ -23,14 +23,14 @@ describe("ZNS", () => {
       expect(zns.isValidName("alice")).toBe(true);
       expect(zns.isValidName("bob123")).toBe(true);
       expect(zns.isValidName("a")).toBe(true);
-      expect(zns.isValidName("a".repeat(62))).toBe(true);
+      expect(zns.isValidName("a".repeat(63))).toBe(true);
     });
 
     it("rejects invalid names", () => {
       expect(zns.isValidName("")).toBe(false);
       expect(zns.isValidName("Alice")).toBe(false);
       expect(zns.isValidName("my-name")).toBe(false);
-      expect(zns.isValidName("a".repeat(63))).toBe(false);
+      expect(zns.isValidName("a".repeat(64))).toBe(false);
     });
   });
 
