@@ -13,7 +13,7 @@ mod sync; // Sync Loop
 
 use orchard::keys::FullViewingKey;
 use seer_sync::UnifiedFullViewingKey;
-use sync::{live_tip, run_indexer};
+use sync::{live_tip, run_indexer, Pending};
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
@@ -62,6 +62,15 @@ const RPC_ADDR: &str = "127.0.0.1:8080"; // where clients send JSON-RPC name que
 pub(crate) struct Registry {
     pub(crate) db: Db,
     pub(crate) fvk: FullViewingKey,
+    pub(crate) pending: Pending,
+}
+
+/// The mainnet placeholder is an all-`q` bech32 body. A real viewing key is not.
+fn ufvk_is_placeholder(ufvk: &str) -> bool {
+    match ufvk.strip_prefix("ufvk1") {
+        Some(body) => !body.is_empty() && body.chars().all(|c| c == 'q'),
+        None => false,
+    }
 }
 
 #[tokio::main]
@@ -72,7 +81,11 @@ async fn main() {
         .init();
 
     // --- The registry key: decoded before anything persists it — a bad key
-    // --- parks here and never poisons the registry_account row. ---
+    // --- stops here and never poisons the registry_account row. ---
+    if ufvk_is_placeholder(UFVK) {
+        tracing::error!("fatal: registry UFVK is still the placeholder");
+        std::process::exit(1);
+    }
     let fvk = match UnifiedFullViewingKey::decode(&NETWORK, UFVK) {
         Ok(decoded) => match decoded.orchard() {
             Some(fvk) => fvk.clone(),
@@ -80,14 +93,12 @@ async fn main() {
                 tracing::error!(
                     "fatal: resolver is unconfigured — registry UFVK has no orchard component"
                 );
-                std::future::pending::<()>().await;
-                unreachable!()
+                std::process::exit(1);
             }
         },
         Err(error) => {
             tracing::error!(error = %error, "fatal: resolver is unconfigured — registry UFVK failed to decode");
-            std::future::pending::<()>().await;
-            unreachable!()
+            std::process::exit(1);
         }
     };
 
@@ -99,9 +110,8 @@ async fn main() {
     let db = match Db::open(UFVK, MINT_BIRTHDAY, DB_PATH) {
         Ok(db) => db,
         Err(error) => {
-            tracing::error!(error = %error, "fatal: resolver is unconfigured — registry database failed to open");
-            std::future::pending::<()>().await;
-            unreachable!()
+            tracing::error!(error = %error, "fatal: registry database failed to open");
+            std::process::exit(1);
         }
     };
 
@@ -109,12 +119,23 @@ async fn main() {
     let _rpc_handle = match serve_rpc(RPC_ADDR, db.clone(), tip_rx).await {
         Ok(handle) => handle,
         Err(error) => {
-            tracing::error!(error = %error, "fatal: resolver is unconfigured — rpc server failed to start");
-            std::future::pending::<()>().await;
-            unreachable!()
+            tracing::error!(error = %error, "fatal: rpc server failed to start");
+            std::process::exit(1);
         }
     };
 
     // --- The indexer: everything passed — run forever ---
     run_indexer(db, UFVK, fvk, MINT_BIRTHDAY).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ufvk_is_placeholder;
+
+    #[test]
+    fn an_all_q_ufvk_is_a_placeholder() {
+        assert!(ufvk_is_placeholder("ufvk1qqqq"));
+        assert!(!ufvk_is_placeholder("ufvk1qqqp"));
+        assert!(!ufvk_is_placeholder("uviewtest1qqqq"));
+    }
 }

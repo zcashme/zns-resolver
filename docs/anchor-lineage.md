@@ -13,7 +13,7 @@ must never be compared — each is typed at the scan boundary
 |---|---|---|
 | notes | ordinary (rseed self-consistent) | relaxed (ZNS commitment from memo) |
 | nullifier | standard derivation | `zns_nullifier` (fork derivation) |
-| type | `AnchorNf` | raw (PR #2: `TipNf`) |
+| type | `AnchorNf` | `TipNf` |
 | state | derived (`Lineage`) | the `names` row |
 
 The scan surfaces both: ordinary notes in `ironwood_outputs`, relaxed
@@ -89,9 +89,12 @@ contract.
   Surfacing them through the API is PR #2's remainder.
 - The claim law lives in two repos by copy-paste (pinned by the fixture).
   The endgame is one law as a `zns-verify` kernel consumed by both.
-- Clock checks (term expiry, liveness) are mint-side only — a clock-stale
-  transition is admitted here when the mint would free the name. That is
-  the M8 divergence, tracked separately.
+- A clock-due update ends the binding. Compact-block times are stored,
+  and each block is judged at the median of its trailing eleven (the
+  mint's MTP). The clocks are the predecessor's term and
+  `confirmed_mtp + LIVENESS_INTERVAL`. A release stays legal after
+  either clock. The first ten scanned blocks have no MTP, so an update
+  there follows the chain rule alone.
 - The mint's `retire_spent` adopts a rejected claim's successor into its
   pool (facts first). The fold reproduces this only for accepted-shape
   transactions; the poisoned entries are inert (attacker notes can never
