@@ -1074,6 +1074,27 @@ pub(crate) fn events(
     limit: u32,
     offset: u32,
 ) -> rusqlite::Result<(Vec<Event>, u64)> {
+    // An implicit release has no memo of its own. It is served as a release
+    // of the binding it ended, and its id is the negation of its rowid so it
+    // cannot collide with a name_events rowid.
+    const LOG: &str = "
+        SELECT id, name, action, ua, txid, height, action_index, memo, tx_index
+        FROM (
+            SELECT rowid AS id, name, action, ua, txid, height, action_index, memo, tx_index
+            FROM name_events
+            UNION ALL
+            SELECT -ir.rowid, ir.name, 'release', pred.ua, ir.txid, ir.height,
+                   ir.action_index, pred.memo, ir.tx_index
+            FROM implicit_releases AS ir
+            JOIN name_events AS pred ON pred.rowid = (
+                SELECT rowid FROM name_events
+                WHERE name = ir.name
+                  AND (height, tx_index, action_index)
+                      < (ir.height, ir.tx_index, ir.action_index)
+                ORDER BY height DESC, tx_index DESC, action_index DESC
+                LIMIT 1
+            )
+        )";
     const WHERE: &str = "WHERE (?1 IS NULL OR name = ?1)
                          AND (?2 IS NULL OR action = ?2)
                          AND (?3 IS NULL OR height > ?3)";
@@ -1085,14 +1106,30 @@ pub(crate) fn events(
         offset
     ];
 
+    let unmatched: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM implicit_releases AS ir
+         WHERE NOT EXISTS (
+             SELECT 1 FROM name_events
+             WHERE name = ir.name
+               AND (height, tx_index, action_index) < (ir.height, ir.tx_index, ir.action_index)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if unmatched != 0 {
+        return Err(corrupt_record());
+    }
+
     let total: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM name_events {WHERE}"),
+        &format!("SELECT COUNT(*) FROM ({LOG}) {WHERE}"),
         &p[..3],
         |r| r.get(0),
     )?;
+    // One spend can end several names at the same height, tx, and action.
+    // `id` is unique, so a page cannot skip or repeat a tied row.
     let mut stmt = conn.prepare(&format!(
-        "SELECT rowid, name, action, ua, txid, height, action_index, memo FROM name_events {WHERE}
-         ORDER BY height DESC, rowid DESC LIMIT ?4 OFFSET ?5"
+        "SELECT id, name, action, ua, txid, height, action_index, memo FROM ({LOG}) {WHERE}
+         ORDER BY height DESC, tx_index DESC, action_index DESC, id DESC LIMIT ?4 OFFSET ?5"
     ))?;
     let events = stmt
         .query_map(p, |row| {
@@ -1732,6 +1769,77 @@ mod tests {
             error.to_string().contains("registry record is corrupt"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn events_include_an_implicit_release() {
+        let conn = database();
+        let memo =
+            b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', ?1, 0, 0, ?2)",
+            params![vec![6u8; 32], &memo[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+             VALUES ('z', 100, ?1, 1, 2, x'5a')",
+            params![vec![7u8; 32]],
+        )
+        .unwrap();
+
+        let (log, total) = events(&conn, None, None, None, 10, 0).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(log[0].action, Action::Release);
+        assert_eq!(log[0].height, 100);
+        assert_eq!(log[0].action_index, 2);
+        assert_eq!(log[0].name, "z");
+        assert_eq!(log[0].ua, "u");
+        assert_eq!(log[0].expires_at, "none");
+        assert!(log[0].id < 0);
+        assert_eq!(log[0].txid, [7u8; 32]);
+        assert_eq!(log[1].action, Action::Claim);
+        assert_eq!(log[1].height, 90);
+
+        let (claims, claim_total) =
+            events(&conn, Some("z"), Some(Action::Claim), None, 10, 0).unwrap();
+        assert_eq!(claim_total, 1);
+        assert_eq!(claims[0].action, Action::Claim);
+    }
+
+    #[test]
+    fn tied_implicit_releases_page_by_id() {
+        let conn = database();
+        let prev = "0000000000000000000000000000000000000000000000000000000000000000";
+        for name in ["a", "b"] {
+            let memo = format!("ZNS:claim:{name}:u:none:{prev}");
+            conn.execute(
+                "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+                 VALUES (?1, 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', ?2, ?3, 0, 0, ?4)",
+                params![name, name.as_bytes(), vec![6u8; 32], memo.as_bytes()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+                 VALUES (?1, 100, ?2, 1, 2, ?3)",
+                params![name, vec![7u8; 32], name.as_bytes()],
+            )
+            .unwrap();
+        }
+
+        let mut paged = Vec::new();
+        for offset in 0..4 {
+            let (page, total) = events(&conn, None, None, None, 1, offset).unwrap();
+            assert_eq!(total, 4);
+            assert_eq!(page.len(), 1);
+            paged.push(page[0].id);
+        }
+        let (all, _) = events(&conn, None, None, None, 4, 0).unwrap();
+        assert_eq!(paged, all.iter().map(|event| event.id).collect::<Vec<_>>());
+        assert_eq!(all[0].height, 100);
+        assert_eq!(all[1].height, 100);
+        assert!(all[0].id > all[1].id);
     }
 }
 

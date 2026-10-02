@@ -32,9 +32,9 @@ pub fn normalize_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
-/// Checks the canonical ZNS name grammar: 1–62 lowercase ASCII letters or digits.
+/// Checks the canonical ZNS name grammar: 1–63 lowercase ASCII letters or digits.
 pub fn is_valid_name(name: &str) -> bool {
-    (1..=62).contains(&name.len())
+    (1..=63).contains(&name.len())
         && name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
@@ -343,6 +343,7 @@ mod tests {
         assert!(is_valid_name("alice42"));
         assert!(!is_valid_name("Alice"));
         assert!(!is_valid_name("a-name"));
-        assert!(!is_valid_name(&"a".repeat(63)));
+        assert!(is_valid_name(&"a".repeat(63)));
+        assert!(!is_valid_name(&"a".repeat(64)));
     }
 }

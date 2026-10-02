@@ -26,7 +26,8 @@ pub struct NameRecord {
 /// One entry in the immutable event log for names.
 #[derive(Debug, Clone, Serialize)]
 pub struct NameEvent {
-    /// Monotonic identifier for this event (stable for this name's history).
+    /// `name_events.rowid`, or the negation of `implicit_releases.rowid`
+    /// when the release has no memo of its own.
     pub id: i64,
     pub name: String,
     pub action: String,
