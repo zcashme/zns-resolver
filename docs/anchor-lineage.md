@@ -25,11 +25,13 @@ grouped per transaction.
 The live anchor set — the nullifiers that currently confer claim
 authority — is a pure function of position-ordered chain facts:
 
-1. zero-value registry outputs **adopt** in canonical order
-   (height, tx_index, action_index) until the pool first reaches
-   standing size (`ANCHOR_POOL_SIZE = 40`, mirrors keygen's
-   `NUM_ANCHORS`). The fold records that completion block; a later
-   shrink does not reopen filling;
+1. The ceremony is one transaction that brings all 40 zero-value notes
+   at once, and no name note. Those notes fill the pool. The fold records
+   that block. Spending an anchor later leaves one fewer in the pool, and
+   a new note does not replace it. A note sent
+   on its own does not count, so the first 40 gifts cannot close
+   adoption. The mint still counts every zero-value note. This resolver
+   does not.
 2. a revealed nullifier **retires** whatever the rest of its transaction
    turned out to be — including a candidate-free Registry spend;
 3. a **successor** joins one-for-one — including while the pool is

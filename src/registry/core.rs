@@ -14,7 +14,9 @@ use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::{BlockHeight, Parameters as _};
 use zns_verify::{pallas, Action, Memo, NameNote, PrimeField, Tip};
 
-use super::anchor_lineage::{Adoption, Lineage, Position, Retirement, TxAnchorFacts};
+use super::anchor_lineage::{
+    keeps_zero_value_note, Adoption, Lineage, Position, Retirement, TxAnchorFacts,
+};
 use super::nf::{AnchorNf, TipNf};
 use super::notes;
 use super::{Event, Registration};
@@ -297,10 +299,17 @@ pub(crate) fn apply_batch(
             let tx_index = tx_data.tx_index;
             let candidate_count = candidate_counts.get(&txid).copied().unwrap_or(0);
             let claim_successor = claim_successor_output(tx_data, &candidates);
+            let keep_notes = keeps_zero_value_note(
+                received_zero_value_count(tx_data),
+                candidate_count,
+                claim_successor,
+            );
             for output in &tx_data.ironwood_outputs {
-                // A payment is not an anchor fact. Storing it would grow the
-                // table the lineage rereads on every batch.
-                if output.is_sent || output.note.value().inner() != 0 {
+                // A payment is not an anchor fact. A lone zero-value note is
+                // not the ceremony. Storing either would grow the table the
+                // lineage rereads on every batch, and lone notes would close
+                // adoption.
+                if !keep_notes || output.is_sent || output.note.value().inner() != 0 {
                     continue;
                 }
                 let Some(nf) = output.nf else {
@@ -354,14 +363,21 @@ pub(crate) fn apply_batch(
         for tx in txs {
             let txid = *tx.txid.as_ref();
             let tx_index = tx.tx_index;
+            let claim_successor = claim_successor_output(tx, &candidates);
+            let name_notes = candidate_counts.get(&txid).copied().unwrap_or(0);
+            let keep_notes =
+                keeps_zero_value_note(received_zero_value_count(tx), name_notes, claim_successor);
             let facts = TxAnchorFacts {
-                adoptions: tx
-                    .ironwood_outputs
-                    .iter()
-                    .filter(|o| !o.is_sent && o.note.value().inner() == 0)
-                    .filter_map(|o| o.nf.map(AnchorNf::from_scan))
-                    .map(|nf| Adoption { nf })
-                    .collect(),
+                adoptions: if keep_notes {
+                    tx.ironwood_outputs
+                        .iter()
+                        .filter(|o| !o.is_sent && o.note.value().inner() == 0)
+                        .filter_map(|o| o.nf.map(AnchorNf::from_scan))
+                        .map(|nf| Adoption { nf })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 retirements: tx
                     .ironwood_spends
                     .iter()
@@ -369,8 +385,8 @@ pub(crate) fn apply_batch(
                         nf: AnchorNf::from_scan(s.nf),
                     })
                     .collect(),
-                has_single_name_note: candidate_counts.get(&txid).copied().unwrap_or(0) == 1,
-                claim_successor: claim_successor_output(tx, &candidates),
+                has_single_name_note: name_notes == 1,
+                claim_successor,
             };
             let snapshot = lineage.clone();
             lineage.step_tx(height, &facts);
@@ -471,6 +487,13 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
 /// received, and the transaction's one name note is a claim. A sent note
 /// is not stored as an adoption, so it cannot be the successor the fold
 /// seats.
+fn received_zero_value_count(tx: &WalletTx) -> usize {
+    tx.ironwood_outputs
+        .iter()
+        .filter(|output| !output.is_sent && output.note.value().inner() == 0 && output.nf.is_some())
+        .count()
+}
+
 fn claim_successor_output(tx: &WalletTx, candidates: &[Candidate<'_>]) -> bool {
     let [output] = tx.ironwood_outputs.as_slice() else {
         return false;
@@ -1513,6 +1536,7 @@ fn registration_from_row(r: &Row<'_>) -> rusqlite::Result<Registration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::anchor_lineage::ANCHOR_POOL_SIZE;
     use crate::registry::storage::SCHEMA_SQL;
 
     fn database() -> Connection {
@@ -1686,7 +1710,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1717,7 +1741,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1799,7 +1823,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -1861,7 +1885,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -1875,6 +1899,83 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(facts, 0);
+    }
+
+    /// A version 3 database stored every zero-value note. Opening it drops
+    /// gifts, keeps the ceremony and claim successors, and keeps the checkpoint.
+    #[test]
+    fn version_3_database_drops_gifts_and_keeps_the_ceremony() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 3;
+             CREATE TABLE registry_account (
+                id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+                ufvk TEXT NOT NULL,
+                network TEXT NOT NULL,
+                birthday INTEGER NOT NULL,
+                sync_height INTEGER,
+                sync_hash BLOB
+             );
+             CREATE TABLE anchor_facts (
+                nullifier BLOB NOT NULL PRIMARY KEY,
+                value INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                tx_index INTEGER NOT NULL,
+                action_index INTEGER NOT NULL,
+                name_note_candidates INTEGER NOT NULL,
+                claim_successor INTEGER NOT NULL DEFAULT 0,
+                spent_height INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday, sync_height, sync_hash)
+             VALUES (0, 'ufvk', 'test', 90, 100, ?1)",
+            params![vec![9u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor)
+             VALUES (x'ff', 0, 1, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        for action in 0..ANCHOR_POOL_SIZE {
+            let mut nullifier = [0u8; 32];
+            nullifier[0] = u8::try_from(action).unwrap();
+            conn.execute(
+                "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor)
+                 VALUES (?1, 0, 2, 0, ?2, 0, 0)",
+                params![nullifier.as_slice(), action as i64],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor)
+             VALUES (x'ee', 0, 3, 0, 0, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        crate::registry::storage::install_schema(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        assert!(checkpoint(&conn).unwrap().is_some());
+        let facts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(facts, i64::try_from(ANCHOR_POOL_SIZE).unwrap() + 1);
+        let gift: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM anchor_facts WHERE nullifier = x'ff'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gift, 0);
     }
 
     #[test]

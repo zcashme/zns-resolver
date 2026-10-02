@@ -1,10 +1,12 @@
 //! The anchor lineage, derived: a pure fold over position-ordered facts.
 //!
 //! The lineage is never maintained — it is recomputed from chain facts.
-//! The rules mirror the mint's claim-anchor semantics exactly
-//! (`zns-mint` `AnchorPool` / `apply_block`): zero-value registry outputs
-//! adopt in canonical order until the pool first reaches standing size;
-//! a later shrink does not reopen ceremony filling. A revealed nullifier
+//! The rules mirror the mint's claim-anchor semantics
+//! (`zns-mint` `AnchorPool` / `apply_block`), except ceremony filling.
+//! The scan keeps a ceremony only when one transaction brings all 40
+//! zero-value notes and no name note. A note sent on its own is not
+//! recorded, so it cannot close adoption. The fold adopts the facts it
+//! is given. A revealed nullifier
 //! retires whatever the rest of its transaction turned out to be; a
 //! successor joins one-for-one — including while the pool is short —
 //! only for a claim whose registry outputs are exactly one zero-value
@@ -21,6 +23,18 @@ use super::nf::AnchorNf;
 /// Standing size of the anchor lineage pool; mirrors keygen's `NUM_ANCHORS`
 /// and the mint's `ANCHOR_POOL_SIZE`.
 pub(crate) const ANCHOR_POOL_SIZE: usize = 40;
+
+/// Whether a zero-value registry note is worth storing. The ceremony is
+/// one transaction that brings the whole pool and no name note. A claim's
+/// single successor is stored too. Anything else is a gift, and gifts
+/// must not fill the pool or close adoption.
+pub(crate) fn keeps_zero_value_note(
+    zero_value_notes: usize,
+    name_notes: usize,
+    claim_successor: bool,
+) -> bool {
+    claim_successor || (zero_value_notes == ANCHOR_POOL_SIZE && name_notes == 0)
+}
 
 /// Canonical chain position of a fact: block height, transaction index
 /// within the block, action index within the transaction.
@@ -183,6 +197,15 @@ mod tests {
         for i in 0..ANCHOR_POOL_SIZE {
             lineage.step_tx(height, &ceremony_adopt(i as u8 + 1));
         }
+    }
+
+    #[test]
+    fn lone_notes_do_not_count_as_the_ceremony() {
+        assert!(!keeps_zero_value_note(1, 0, false));
+        assert!(!keeps_zero_value_note(ANCHOR_POOL_SIZE - 1, 0, false));
+        assert!(!keeps_zero_value_note(ANCHOR_POOL_SIZE, 1, false));
+        assert!(keeps_zero_value_note(ANCHOR_POOL_SIZE, 0, false));
+        assert!(keeps_zero_value_note(1, 1, true));
     }
 
     /// Ceremony filling stops at standing size; extras never enter — and a

@@ -2,10 +2,12 @@
 
 use rusqlite::Connection;
 
+use super::anchor_lineage::ANCHOR_POOL_SIZE;
+
 /// The SQL to create the name index tables (and supporting state).
 /// Run once by the writer connection at startup.
 pub(crate) const SCHEMA_SQL: &str = r#"
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;
@@ -104,7 +106,10 @@ CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 /// claim with a second registry output would seat an anchor the mint
 /// rejects. Those rows cannot be told apart. In both cases the chain
 /// tables and the checkpoint are dropped and the next open replays from
-/// the birthday.
+/// the birthday. A version 3 database stored every zero-value note, so
+/// gifts could fill the pool and close adoption. Notes that are not the
+/// full ceremony, and not a claim successor, are deleted in place. The
+/// checkpoint stays.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
@@ -135,6 +140,21 @@ pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
              DROP TABLE IF EXISTS block_times;
              UPDATE registry_account SET sync_height = NULL, sync_hash = NULL WHERE id = 0;",
         )?;
+    } else if version == 3 {
+        tracing::warn!(
+            "schema version 3 stored every zero-value note; dropping gifts so they cannot close ceremony adoption"
+        );
+        conn.execute_batch(&format!(
+            "DELETE FROM anchor_facts
+             WHERE rowid IN (
+                 SELECT a.rowid FROM anchor_facts AS a
+                 WHERE a.claim_successor = 0
+                   AND (
+                       SELECT COUNT(*) FROM anchor_facts AS b
+                       WHERE b.height = a.height AND b.tx_index = a.tx_index
+                   ) != {ANCHOR_POOL_SIZE}
+             );",
+        ))?;
     }
     conn.execute_batch(SCHEMA_SQL)?;
     Ok(())
