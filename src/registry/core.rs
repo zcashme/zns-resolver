@@ -296,6 +296,7 @@ pub(crate) fn apply_batch(
             let block_height = u32::from(tx_data.height);
             let tx_index = tx_data.tx_index;
             let candidate_count = candidate_counts.get(&txid).copied().unwrap_or(0);
+            let claim_successor = claim_successor_output(tx_data, &candidates);
             for output in &tx_data.ironwood_outputs {
                 // A payment is not an anchor fact. Storing it would grow the
                 // table the lineage rereads on every batch.
@@ -307,14 +308,15 @@ pub(crate) fn apply_batch(
                 };
                 let nf = AnchorNf::from_scan(nf);
                 db_tx.execute(
-                    "INSERT OR IGNORE INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
-                     VALUES (?1, 0, ?2, ?3, ?4, ?5, NULL)",
+                    "INSERT OR IGNORE INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor, spent_height)
+                     VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, NULL)",
                     params![
                         nf.as_bytes().as_slice(),
                         block_height as i64,
                         tx_index as i64,
                         output.index as i64,
                         candidate_count as i64,
+                        claim_successor as i64,
                     ],
                 )?;
             }
@@ -368,6 +370,7 @@ pub(crate) fn apply_batch(
                     })
                     .collect(),
                 has_single_name_note: candidate_counts.get(&txid).copied().unwrap_or(0) == 1,
+                claim_successor: claim_successor_output(tx, &candidates),
             };
             let snapshot = lineage.clone();
             lineage.step_tx(height, &facts);
@@ -404,7 +407,7 @@ pub(crate) fn apply_batch(
 /// folds them with [`fold_lineage`] after releasing the database lock.
 pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position, FactEvent)>> {
     let mut stmt = conn.prepare(
-        "SELECT nullifier, height, tx_index, action_index, name_note_candidates,
+        "SELECT nullifier, height, tx_index, action_index, name_note_candidates, claim_successor,
                 spent_height, spent_tx_index, spent_action_index
          FROM anchor_facts
          WHERE value = 0",
@@ -416,14 +419,25 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
             row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
-            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, i64>(5)?,
             row.get::<_, Option<i64>>(6)?,
             row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
         ))
     })?;
     let mut events = Vec::new();
     for row in rows {
-        let (nf, height, tx_index, action_index, cands, spent_h, spent_tx, spent_a) = row?;
+        let (
+            nf,
+            height,
+            tx_index,
+            action_index,
+            cands,
+            claim_successor,
+            spent_h,
+            spent_tx,
+            spent_a,
+        ) = row?;
         let nf_bytes: [u8; 32] = nf.try_into().map_err(|_| corrupt_record())?;
         let nf = AnchorNf::from_bytes(&nf_bytes);
         let adopt_at = Position {
@@ -436,6 +450,7 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
             FactEvent::Adoption {
                 nf,
                 name_note_candidates: cands,
+                claim_successor: claim_successor != 0,
             },
         ));
         if let (Some(sh), Some(stx), Some(sa)) = (spent_h, spent_tx, spent_a) {
@@ -452,14 +467,33 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
     Ok(events)
 }
 
+/// The mint's successor output: one registry output, zero-value and
+/// received, and the transaction's one name note is a claim. A sent note
+/// is not stored as an adoption, so it cannot be the successor the fold
+/// seats.
+fn claim_successor_output(tx: &WalletTx, candidates: &[Candidate<'_>]) -> bool {
+    let [output] = tx.ironwood_outputs.as_slice() else {
+        return false;
+    };
+    if output.is_sent || output.note.value().inner() != 0 || output.nf.is_none() {
+        return false;
+    }
+    let txid = *tx.txid.as_ref();
+    let mut notes = candidates.iter().filter(|candidate| candidate.txid == txid);
+    let Some(candidate) = notes.next() else {
+        return false;
+    };
+    notes.next().is_none() && candidate.note.action() == Action::Claim
+}
+
 fn row_u32(value: i64) -> rusqlite::Result<u32> {
     u32::try_from(value).map_err(|_| corrupt_record())
 }
 
 /// Folds anchor facts into the lineage. Each zero-value received note is an
 /// adoption at its own position, each spent zero-value note a retirement at
-/// its spending position, and a transaction's candidate count carries the
-/// accept-path marker.
+/// its spending position. The candidate count marks the accept path, and
+/// `claim_successor` marks a claim whose only registry output is that note.
 pub(crate) fn fold_lineage(mut events: Vec<(Position, FactEvent)>) -> Lineage {
     events.sort_by_key(|(pos, _)| *pos);
 
@@ -473,8 +507,10 @@ pub(crate) fn fold_lineage(mut events: Vec<(Position, FactEvent)>) -> Lineage {
                 FactEvent::Adoption {
                     nf,
                     name_note_candidates,
+                    claim_successor,
                 } => {
                     facts.has_single_name_note = name_note_candidates == 1;
+                    facts.claim_successor = claim_successor;
                     facts.adoptions.push(Adoption { nf });
                 }
                 FactEvent::Retirement(nf) => facts.retirements.push(Retirement { nf }),
@@ -501,6 +537,7 @@ pub(crate) enum FactEvent {
     Adoption {
         nf: AnchorNf,
         name_note_candidates: i64,
+        claim_successor: bool,
     },
     Retirement(AnchorNf),
 }
@@ -596,10 +633,11 @@ fn apply_candidates(
                 // name note are separate actions — fee inputs sit between
                 // them — so the name note's own nullifier is not the anchor.
                 // The transaction must spend exactly one live anchor, spend
-                // no live name, and create one zero-value successor.
+                // no live name, and its registry outputs must be the one
+                // zero-value successor of a claim.
                 let law_ok = snapshot.live_retirements(tx_facts) == 1
                     && !spent_a_live_name
-                    && tx_facts.adoptions.len() == 1;
+                    && tx_facts.claim_successor;
                 if !law_ok {
                     // The mint's mark_released: every live name this
                     // transaction spent ends its binding.
@@ -1648,7 +1686,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1679,7 +1717,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1761,7 +1799,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -1777,6 +1815,66 @@ mod tests {
                 .unwrap();
             assert_eq!(rows, 0, "{table}");
         }
+    }
+
+    /// A version 2 database cannot tell a claim successor from any other
+    /// zero-value note. Opening it drops the scan and keeps the account.
+    #[test]
+    fn version_2_database_rescans_for_the_successor_shape() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 2;
+             CREATE TABLE registry_account (
+                id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+                ufvk TEXT NOT NULL,
+                network TEXT NOT NULL,
+                birthday INTEGER NOT NULL,
+                sync_height INTEGER,
+                sync_hash BLOB
+             );
+             CREATE TABLE anchor_facts (
+                nullifier BLOB NOT NULL PRIMARY KEY,
+                value INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                tx_index INTEGER NOT NULL,
+                action_index INTEGER NOT NULL,
+                name_note_candidates INTEGER NOT NULL,
+                spent_height INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday, sync_height, sync_hash)
+             VALUES (0, 'ufvk', 'test', 90, 100, ?1)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (x'01', 0, 90, 0, 0, 1, NULL)",
+            [],
+        )
+        .unwrap();
+
+        crate::registry::storage::install_schema(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let birthday: i64 = conn
+            .query_row(
+                "SELECT birthday FROM registry_account WHERE id = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(birthday, 90);
+        assert!(checkpoint(&conn).unwrap().is_none());
+        let facts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(facts, 0);
     }
 
     #[test]
@@ -1969,6 +2067,7 @@ mod tests {
                 nf: AnchorNf::from_bytes(&nf),
             }],
             has_single_name_note: false,
+            claim_successor: false,
         };
 
         let error =
@@ -2277,6 +2376,7 @@ mod admission {
         retirements: Vec<Retirement>,
         has_single_name_note: bool,
     ) -> TxLaw {
+        let claim_successor = has_single_name_note && adoptions.len() == 1;
         TxLaw {
             txid,
             tx_index: 0,
@@ -2285,6 +2385,7 @@ mod admission {
                 adoptions,
                 retirements,
                 has_single_name_note,
+                claim_successor,
             },
         }
     }
@@ -2330,6 +2431,38 @@ mod admission {
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+    }
+
+    /// A second registry output means the mint's successor is absent, so
+    /// the claim does not bind even though one zero-value note is present.
+    #[test]
+    fn claim_with_an_extra_registry_output_does_not_bind() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+
+        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let candidates = vec![candidate(
+            &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let tx_law = vec![TxLaw {
+            txid: [1; 32],
+            tx_index: 0,
+            snapshot: seeded,
+            facts: TxAnchorFacts {
+                adoptions: vec![Adoption { nf: nf(200) }],
+                retirements: vec![Retirement { nf: nf(1) }],
+                has_single_name_note: true,
+                claim_successor: false,
+            },
+        }];
+        let mut live_names: HashSet<TipNf> = HashSet::new();
+
+        apply_candidates(&tx, 100, None, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
     }
 
     /// A released name's claim event is still in the log. Replaying that
@@ -2917,6 +3050,7 @@ mod admission {
                     adoptions: vec![Adoption { nf: nf(*seed) }],
                     retirements: vec![],
                     has_single_name_note: false,
+                    claim_successor: false,
                 },
             );
         }

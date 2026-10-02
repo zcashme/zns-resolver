@@ -5,7 +5,7 @@ use rusqlite::Connection;
 /// The SQL to create the name index tables (and supporting state).
 /// Run once by the writer connection at startup.
 pub(crate) const SCHEMA_SQL: &str = r#"
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;
@@ -83,6 +83,8 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
     tx_index           INTEGER NOT NULL,
     action_index       INTEGER NOT NULL,
     name_note_candidates INTEGER NOT NULL,
+    -- 1 when this note is a claim's only registry output and it is zero-value.
+    claim_successor    INTEGER NOT NULL DEFAULT 0,
     spent_height       INTEGER,
     spent_tx_index     INTEGER,
     spent_action_index INTEGER
@@ -97,8 +99,12 @@ CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 /// rows lack tx_index. The version gate drops everything and reinstalls,
 /// so the next open rescans from the configured birthday. A version 1
 /// database has tips and no confirmation times. Keeping those rows would
-/// admit a clock-due update as a renewal, so the chain tables and the
-/// checkpoint are dropped and the next open replays from the birthday.
+/// admit a clock-due update as a renewal. A version 2 database stored
+/// every one-candidate zero-value note as a successor, so an update or a
+/// claim with a second registry output would seat an anchor the mint
+/// rejects. Those rows cannot be told apart. In both cases the chain
+/// tables and the checkpoint are dropped and the next open replays from
+/// the birthday.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
@@ -111,10 +117,16 @@ pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
              DROP TABLE IF EXISTS implicit_releases;
              DROP TABLE IF EXISTS block_times;",
         )?;
-    } else if version == 1 {
-        tracing::warn!(
-            "schema version 1 has no confirmation times; dropping the scan so it replays from the birthday"
-        );
+    } else if version < 3 {
+        if version == 1 {
+            tracing::warn!(
+                "schema version 1 has no confirmation times; dropping the scan so it replays from the birthday"
+            );
+        } else {
+            tracing::warn!(
+                "schema version 2 cannot tell a claim successor from any other zero-value note; dropping the scan so it replays from the birthday"
+            );
+        }
         conn.execute_batch(
             "DROP TABLE IF EXISTS name_events;
              DROP TABLE IF EXISTS names;

@@ -7,7 +7,8 @@
 //! a later shrink does not reopen ceremony filling. A revealed nullifier
 //! retires whatever the rest of its transaction turned out to be; a
 //! successor joins one-for-one — including while the pool is short —
-//! only when exactly one live anchor retired.
+//! only for a claim whose registry outputs are exactly one zero-value
+//! note, and only when exactly one live anchor retired.
 //!
 //! Because the fold is a pure function of facts, reorg correctness is
 //! inherited from the fact tables' rewind semantics: folding the facts
@@ -51,18 +52,13 @@ pub(crate) struct TxAnchorFacts {
     pub(crate) adoptions: Vec<Adoption>,
     pub(crate) retirements: Vec<Retirement>,
     /// Whether the transaction presented exactly one name-note candidate —
-    /// the accept path. Transactions without it take `follow_spends`:
-    /// successor is `None`, so a stray zero-value output can never force
-    /// its way past standing size.
+    /// the accept path. Transactions without it take `follow_spends`.
     pub(crate) has_single_name_note: bool,
-}
-
-impl TxAnchorFacts {
-    /// Whether the transaction created exactly one zero-value registry
-    /// output — the successor shape.
-    fn has_successor(&self) -> bool {
-        self.adoptions.len() == 1
-    }
+    /// The mint's successor: the one candidate is a claim, and the
+    /// transaction's registry outputs are exactly one zero-value note.
+    /// An update, a release, or a second registry output leaves this false,
+    /// so the note cannot take a seat after ceremony close.
+    pub(crate) claim_successor: bool,
 }
 
 /// The set of nullifiers that currently confer claim authority, plus the
@@ -113,11 +109,12 @@ impl Lineage {
         }
 
         // One-for-one, mirroring the mint's retire_spent: a successor
-        // takes a seat only when exactly one live anchor retired —
-        // authority cannot be minted, only succeeded. This insert is
+        // takes a seat only for a claim with exactly one zero-value
+        // registry output, and only when exactly one live anchor retired.
+        // Authority cannot be minted, only succeeded. This insert is
         // independent of ceremony close: a backed successor still
         // enters while the pool is short.
-        if retired == 1 && facts.has_single_name_note && facts.has_successor() {
+        if retired == 1 && facts.claim_successor && facts.adoptions.len() == 1 {
             self.live.insert(facts.adoptions[0].nf);
         }
     }
@@ -178,6 +175,7 @@ mod tests {
             adoptions: vec![adopt(seed)],
             retirements: vec![],
             has_single_name_note: false,
+            claim_successor: false,
         }
     }
 
@@ -214,6 +212,7 @@ mod tests {
                 adoptions: vec![],
                 retirements: vec![retire(1)],
                 has_single_name_note: false,
+                claim_successor: false,
             },
         );
         assert!(lineage.is_empty());
@@ -233,11 +232,33 @@ mod tests {
                 adoptions: vec![adopt(200)],
                 retirements: vec![retire(1)],
                 has_single_name_note: true,
+                claim_successor: true,
             },
         );
         assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
         assert!(!lineage.contains(&nf(1)));
         assert!(lineage.contains(&nf(200)));
+    }
+
+    /// After ceremony close, a zero-value note seats only as a claim's
+    /// successor. An update or release that spends one anchor, and a claim
+    /// with a second registry output, are both stored with the flag clear.
+    #[test]
+    fn a_note_without_the_claim_shape_does_not_seat() {
+        let mut lineage = Lineage::new();
+        fill_to_standing_size(&mut lineage, 1);
+        lineage.step_tx(
+            2,
+            &TxAnchorFacts {
+                adoptions: vec![adopt(200)],
+                retirements: vec![retire(1)],
+                has_single_name_note: true,
+                claim_successor: false,
+            },
+        );
+        assert!(!lineage.contains(&nf(200)));
+        assert!(!lineage.contains(&nf(1)));
+        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE - 1);
     }
 
     /// A transaction with two or more zero-value outputs is not a backed
@@ -252,6 +273,7 @@ mod tests {
                 adoptions: vec![adopt(2), adopt(3)],
                 retirements: vec![retire(1)],
                 has_single_name_note: true,
+                claim_successor: false,
             },
         );
         // Both adoptions entered (ceremony still open), the retirement
@@ -278,6 +300,7 @@ mod tests {
                 adoptions: vec![adopt(200)],
                 retirements: vec![retire(7)],
                 has_single_name_note: true,
+                claim_successor: true,
             },
         );
 
@@ -302,6 +325,7 @@ mod tests {
                 adoptions: vec![adopt(50)],
                 retirements: vec![retire(99)], // 99 is not a live anchor
                 has_single_name_note: true,
+                claim_successor: true,
             },
         );
         assert!(!lineage.contains(&nf(50)));
@@ -326,6 +350,7 @@ mod tests {
                 adoptions: vec![],
                 retirements: vec![retire(1), retire(2)],
                 has_single_name_note: false,
+                claim_successor: false,
             },
         );
         lineage.step_tx(102, &ceremony_adopt(0xF0));
@@ -340,6 +365,7 @@ mod tests {
                 adoptions: vec![adopt(201)],
                 retirements: vec![retire(3)],
                 has_single_name_note: true,
+                claim_successor: true,
             },
         );
         assert!(lineage.contains(&nf(201)));
@@ -379,6 +405,7 @@ mod tests {
             adoptions: vec![adopt(2)],
             retirements: vec![retire(1)],
             has_single_name_note: true,
+            claim_successor: true,
         };
         lineage.step_tx(12, &facts);
         assert!(lineage.contains(&nf(2)));
@@ -535,6 +562,7 @@ mod canon {
                             }],
                             retirements: vec![],
                             has_single_name_note: false,
+                            claim_successor: false,
                         },
                     ),
                     CanonEvent::Retire { height, spent } => (
@@ -546,6 +574,7 @@ mod canon {
                                 .map(|s| Retirement { nf: hex32(s) })
                                 .collect(),
                             has_single_name_note: false,
+                            claim_successor: false,
                         },
                     ),
                     CanonEvent::Claim {
@@ -562,6 +591,7 @@ mod canon {
                                 nf: hex32(spent_anchor),
                             }],
                             has_single_name_note: true,
+                            claim_successor: true,
                         },
                     ),
                     CanonEvent::UnbackedClaim { height, spent } => (
@@ -573,6 +603,7 @@ mod canon {
                                 .map(|s| Retirement { nf: hex32(s) })
                                 .collect(),
                             has_single_name_note: true,
+                            claim_successor: false,
                         },
                     ),
                     CanonEvent::Update {
@@ -590,6 +621,7 @@ mod canon {
                                 nf: hex32(prev_nullifier),
                             }],
                             has_single_name_note: true,
+                            claim_successor: false,
                         },
                     ),
                     CanonEvent::Rewind { to_height } => {

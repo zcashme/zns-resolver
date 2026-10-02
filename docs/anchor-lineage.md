@@ -33,9 +33,11 @@ authority — is a pure function of position-ordered chain facts:
 2. a revealed nullifier **retires** whatever the rest of its transaction
    turned out to be — including a candidate-free Registry spend;
 3. a **successor** joins one-for-one — including while the pool is
-   short — only when exactly one live anchor retired. Authority cannot
-   be minted, only succeeded (mint lockstep: zns-mint #233). Ordinary
-   zero-value outputs after close stay out.
+   short — only for a claim whose registry outputs are exactly one
+   zero-value note, and only when exactly one live anchor retired.
+   A note cannot create a new claim permission on its own. It only
+   replaces the one anchor this transaction spent (zns-mint #233). An update, a release, or a second registry output leaves the
+   successor unset. Ordinary zero-value outputs after close stay out.
 
 `Lineage::step_tx` (`src/registry/anchor_lineage.rs`) folds one
 transaction's facts in exactly that order. It is never persisted: each
@@ -60,7 +62,8 @@ at the candidate's transaction position:
 
 1. exactly one anchor is spent by the transaction;
 2. no live name note is spent by the transaction;
-3. the transaction creates exactly one zero-value successor;
+3. the transaction's registry outputs are exactly one note, and that
+   note is zero-value;
 4. the name is free (the chain rule: `prev_rcm_for(non-release tip, Claim)
    → None`).
 
