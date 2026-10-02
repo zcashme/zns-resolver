@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
     spent_tx_index     INTEGER,
     spent_action_index INTEGER
 );
+CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 
 "#;
 

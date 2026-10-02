@@ -63,33 +63,76 @@ pub(crate) fn install_registry_config(
     network: &str,
     birthday: u32,
 ) -> rusqlite::Result<()> {
-    if let Some((stored_ufvk, stored_net, stored_birthday)) = registry_config(conn)? {
-        if stored_ufvk != ufvk {
-            tracing::warn!(
-                stored = %stored_ufvk,
-                "registry_account ufvk already set; not changing"
-            );
-        }
-        if stored_net != network {
-            tracing::warn!(
-                stored = %stored_net,
-                "registry_account network already set; not changing"
-            );
-        }
-        if stored_birthday != birthday as i64 {
-            tracing::warn!(
-                stored = stored_birthday,
-                "registry_account birthday already set; not changing"
-            );
-        }
+    let Some((stored_ufvk, stored_net, stored_birthday)) = registry_config(conn)? else {
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, ?1, ?2, ?3)",
+            params![ufvk, network, birthday as i64],
+        )?;
+        return Ok(());
+    };
+
+    if stored_ufvk == ufvk && stored_net == network && stored_birthday == birthday as i64 {
         return Ok(());
     }
 
-    conn.execute(
-        "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, ?1, ?2, ?3)",
-        params![ufvk, network, birthday as i64],
-    )?;
+    // Nothing has been scanned, so the row is only the first-open seed and
+    // can still take the configuration this process was built with.
+    if !scan_has_started(conn)? {
+        tracing::info!("registry has no scan yet; storing the current configuration");
+        conn.execute(
+            "UPDATE registry_account SET ufvk = ?1, network = ?2, birthday = ?3 WHERE id = 0",
+            params![ufvk, network, birthday as i64],
+        )?;
+        return Ok(());
+    }
+
+    if stored_ufvk != ufvk || stored_net != network {
+        return Err(config_refused(
+            "registry database belongs to a different ufvk or network",
+        ));
+    }
+
+    // The birthday only seeds the first sync. A database that has scanned
+    // keeps the height it started from.
+    tracing::warn!(
+        stored = stored_birthday,
+        configured = birthday,
+        "stored birthday differs from this binary; keeping the stored birthday"
+    );
     Ok(())
+}
+
+/// Whether any chain observation has been stored. A lone account row is not
+/// a scan.
+fn scan_has_started(conn: &Connection) -> rusqlite::Result<bool> {
+    let started: i64 = conn.query_row(
+        "SELECT (sync_height IS NOT NULL)
+            OR EXISTS(SELECT 1 FROM anchor_facts)
+            OR EXISTS(SELECT 1 FROM name_events)
+            OR EXISTS(SELECT 1 FROM names)
+            OR EXISTS(SELECT 1 FROM implicit_releases)
+         FROM registry_account WHERE id = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(started != 0)
+}
+
+fn config_refused(detail: &str) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+        Some(detail.to_string()),
+    )
+}
+
+/// Removes payment notes from the fact table. They are not part of the fold,
+/// and a database opened before that rule may still be holding them.
+pub(crate) fn drop_payment_notes(conn: &Connection) -> rusqlite::Result<usize> {
+    let removed = conn.execute("DELETE FROM anchor_facts WHERE value != 0", [])?;
+    if removed > 0 {
+        tracing::info!(removed, "dropped anchor rows that are not zero-value notes");
+    }
+    Ok(removed)
 }
 
 /// One triage survivor, pre-verification: everything `Candidate` needs
@@ -108,19 +151,19 @@ struct Source<'a> {
 /// admission in canonical transaction order. Admission applies the chain rule,
 /// commitment binding, consumption proof, and implicit-release behavior.
 /// All work runs in one transaction, so readers see pre-batch or post-batch
-/// state, never partial. The connection lock makes this the sole mutator;
-/// tip reads and writes share the transaction.
+/// state, never partial. `lineage` is the fold of the facts at the start of
+/// the batch. The connection lock makes this the sole mutator; tip reads and
+/// writes share the transaction.
 pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
     transactions: &[WalletTx],
     fvk: &FullViewingKey,
+    mut lineage: Lineage,
 ) -> rusqlite::Result<()> {
     let db_tx = conn.unchecked_transaction()?;
 
-    // The lineage as of the batch start, folded from the stored facts; the
-    // live name nullifiers feed the claim law's no-name-spend condition.
-    let mut lineage = load_lineage(&db_tx)?;
+    // The live name nullifiers feed the claim law's no-name-spend condition.
     let mut live_names: HashSet<[u8; 32]> = live_name_nullifiers(&db_tx)?;
 
     // Derivation: consider each block's candidates per name. A name note
@@ -236,23 +279,26 @@ pub(crate) fn apply_batch(
             let tx_index = tx_data.tx_index;
             let candidate_count = candidate_counts.get(&txid).copied().unwrap_or(0);
             for output in &tx_data.ironwood_outputs {
-                if !output.is_sent {
-                    if let Some(nf) = output.nf {
-                        let nf = AnchorNf::from_scan(nf);
-                        db_tx.execute(
-                            "INSERT OR IGNORE INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-                            params![
-                                nf.as_bytes().as_slice(),
-                                output.note.value().inner() as i64,
-                                block_height as i64,
-                                tx_index as i64,
-                                output.index as i64,
-                                candidate_count as i64,
-                            ],
-                        )?;
-                    }
+                // A payment is not an anchor fact. Storing it would grow the
+                // table the lineage rereads on every batch.
+                if output.is_sent || output.note.value().inner() != 0 {
+                    continue;
                 }
+                let Some(nf) = output.nf else {
+                    continue;
+                };
+                let nf = AnchorNf::from_scan(nf);
+                db_tx.execute(
+                    "INSERT OR IGNORE INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+                     VALUES (?1, 0, ?2, ?3, ?4, ?5, NULL)",
+                    params![
+                        nf.as_bytes().as_slice(),
+                        block_height as i64,
+                        tx_index as i64,
+                        output.index as i64,
+                        candidate_count as i64,
+                    ],
+                )?;
             }
             for spend in &tx_data.ironwood_spends {
                 let nf = AnchorNf::from_scan(spend.nf);
@@ -327,18 +373,15 @@ pub(crate) fn apply_batch(
     Ok(())
 }
 
-/// Folds the stored anchor facts into the lineage as of the last checkpoint.
-/// The facts are replayed in canonical order; each zero-value received note
-/// is an adoption at its own position, each spent zero-value note a
-/// retirement at its spending position, and a transaction's candidate count
-/// carries the accept-path marker.
-fn load_lineage(conn: &Connection) -> rusqlite::Result<Lineage> {
+/// The zero-value anchor facts, as adoption and retirement events. The caller
+/// folds them with [`fold_lineage`] after releasing the database lock.
+pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position, FactEvent)>> {
     let mut stmt = conn.prepare(
-        "SELECT nullifier, value, height, tx_index, action_index, name_note_candidates,
+        "SELECT nullifier, height, tx_index, action_index, name_note_candidates,
                 spent_height, spent_tx_index, spent_action_index
-         FROM anchor_facts",
+         FROM anchor_facts
+         WHERE value = 0",
     )?;
-    let mut events: Vec<(Position, FactEvent)> = Vec::new();
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
@@ -346,23 +389,20 @@ fn load_lineage(conn: &Connection) -> rusqlite::Result<Lineage> {
             row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
+            row.get::<_, Option<i64>>(5)?,
             row.get::<_, Option<i64>>(6)?,
             row.get::<_, Option<i64>>(7)?,
-            row.get::<_, Option<i64>>(8)?,
         ))
     })?;
+    let mut events = Vec::new();
     for row in rows {
-        let (nf, value, height, tx_index, action_index, cands, spent_h, spent_tx, spent_a) = row?;
-        if value != 0 {
-            continue;
-        }
+        let (nf, height, tx_index, action_index, cands, spent_h, spent_tx, spent_a) = row?;
         let nf_bytes: [u8; 32] = nf.try_into().map_err(|_| corrupt_record())?;
         let nf = AnchorNf::from_bytes(&nf_bytes);
         let adopt_at = Position {
-            height: height as u32,
-            tx_index: tx_index as u32,
-            action_index: action_index as u32,
+            height: row_u32(height)?,
+            tx_index: row_u32(tx_index)?,
+            action_index: row_u32(action_index)?,
         };
         events.push((
             adopt_at,
@@ -374,14 +414,26 @@ fn load_lineage(conn: &Connection) -> rusqlite::Result<Lineage> {
         if let (Some(sh), Some(stx), Some(sa)) = (spent_h, spent_tx, spent_a) {
             events.push((
                 Position {
-                    height: sh as u32,
-                    tx_index: stx as u32,
-                    action_index: sa as u32,
+                    height: row_u32(sh)?,
+                    tx_index: row_u32(stx)?,
+                    action_index: row_u32(sa)?,
                 },
                 FactEvent::Retirement(nf),
             ));
         }
     }
+    Ok(events)
+}
+
+fn row_u32(value: i64) -> rusqlite::Result<u32> {
+    u32::try_from(value).map_err(|_| corrupt_record())
+}
+
+/// Folds anchor facts into the lineage. Each zero-value received note is an
+/// adoption at its own position, each spent zero-value note a retirement at
+/// its spending position, and a transaction's candidate count carries the
+/// accept-path marker.
+pub(crate) fn fold_lineage(mut events: Vec<(Position, FactEvent)>) -> Lineage {
     events.sort_by_key(|(pos, _)| *pos);
 
     // Group by transaction, in canonical order.
@@ -412,13 +464,13 @@ fn load_lineage(conn: &Connection) -> rusqlite::Result<Lineage> {
         established = lineage.established(),
         "anchor lineage folded from facts"
     );
-    Ok(lineage)
+    lineage
 }
 
 /// One replayed fact: an adoption carrying its transaction's candidate
 /// count (the accept-path marker), or a retirement.
 #[derive(Debug, Clone, Copy)]
-enum FactEvent {
+pub(crate) enum FactEvent {
     Adoption {
         nf: AnchorNf,
         name_note_candidates: i64,
@@ -938,7 +990,8 @@ pub(crate) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Cursor>> 
 /// unspent watched ironwood notes plus every admitted name's nullifier.
 pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<AnchorNf>> {
     let mut statement = conn.prepare(
-        "SELECT nullifier FROM anchor_facts WHERE spent_height IS NULL
+        "SELECT nullifier FROM anchor_facts
+         WHERE value = 0 AND spent_height IS NULL
          UNION
          SELECT nullifier FROM names",
     )?;
@@ -1575,6 +1628,110 @@ mod tests {
             })
             .unwrap();
         assert_eq!(releases, 0);
+    }
+
+    fn account(conn: &Connection) -> (String, String, i64) {
+        conn.query_row(
+            "SELECT ufvk, network, birthday FROM registry_account WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unscanned_registry_takes_a_new_configuration() {
+        let conn = database();
+        install_registry_config(&conn, "old", "test", 1).unwrap();
+        install_registry_config(&conn, "new", "main", 9).unwrap();
+        assert_eq!(account(&conn), ("new".into(), "main".into(), 9));
+    }
+
+    #[test]
+    fn scanned_registry_refuses_a_different_ufvk_or_network() {
+        let conn = database();
+        install_registry_config(&conn, "ufvk", "test", 1).unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 0, 10, 0, 0, 0, NULL)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+
+        let different_key = install_registry_config(&conn, "other", "test", 1).unwrap_err();
+        assert!(
+            different_key
+                .to_string()
+                .contains("different ufvk or network"),
+            "{different_key}"
+        );
+        let different_network = install_registry_config(&conn, "ufvk", "main", 1).unwrap_err();
+        assert!(
+            different_network
+                .to_string()
+                .contains("different ufvk or network"),
+            "{different_network}"
+        );
+        assert_eq!(account(&conn).0, "ufvk");
+        assert_eq!(account(&conn).1, "test");
+    }
+
+    #[test]
+    fn scanned_registry_keeps_its_birthday() {
+        let conn = database();
+        install_registry_config(&conn, "ufvk", "test", 10).unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 0, 10, 0, 0, 0, NULL)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+
+        install_registry_config(&conn, "ufvk", "test", 99).unwrap();
+        assert_eq!(account(&conn).2, 10);
+    }
+
+    #[test]
+    fn lineage_ignores_payment_notes() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 0, 10, 0, 0, 0, NULL)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 5, 11, 0, 0, 0, NULL)",
+            params![vec![2u8; 32]],
+        )
+        .unwrap();
+
+        let lineage = fold_lineage(lineage_facts(&conn).unwrap());
+        assert_eq!(lineage.len(), 1);
+        assert_eq!(ironwood_nullifiers(&conn).unwrap().len(), 1);
+        assert_eq!(drop_payment_notes(&conn).unwrap(), 1);
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 1);
+    }
+
+    #[test]
+    fn a_fact_height_that_does_not_fit_fails_the_snapshot() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
+             VALUES (?1, 0, -1, 0, 0, 0, NULL)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+
+        let error = lineage_facts(&conn).unwrap_err();
+        assert!(
+            error.to_string().contains("registry record is corrupt"),
+            "{error}"
+        );
     }
 }
 
