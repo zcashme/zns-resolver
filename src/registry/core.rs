@@ -15,7 +15,7 @@ use zcash_protocol::consensus::{BlockHeight, Parameters as _};
 use zns_verify::{pallas, Action, Memo, NameNote, PrimeField, Tip};
 
 use super::anchor_lineage::{Adoption, Lineage, Position, Retirement, TxAnchorFacts};
-use super::nf::AnchorNf;
+use super::nf::{AnchorNf, TipNf};
 use super::notes;
 use super::{Event, Registration};
 
@@ -172,7 +172,7 @@ pub(crate) fn apply_batch(
     let db_tx = conn.unchecked_transaction()?;
 
     // The live name nullifiers feed the claim law's no-name-spend condition.
-    let mut live_names: HashSet<[u8; 32]> = live_name_nullifiers(&db_tx)?;
+    let mut live_names: HashSet<TipNf> = live_name_nullifiers(&db_tx)?;
 
     // The clock input: persist the batch's block times, then evaluate
     // each block's rules at its own MTP (median of the trailing eleven,
@@ -332,7 +332,7 @@ pub(crate) fn apply_batch(
                 )?;
                 // Name-tip spends are watched and revealed here, and they are
                 // not anchor facts. Any other miss is a spend we cannot place.
-                if updated == 0 && !live_names.contains(nf.as_bytes()) {
+                if updated == 0 && !live_names.contains(&TipNf::from_revealed(&nf)) {
                     tracing::debug!(
                         nullifier = ?nf.as_bytes(),
                         height = block_height,
@@ -507,7 +507,7 @@ pub(crate) enum FactEvent {
 
 /// The live name tips' nullifiers — the claim law's "spends no live name
 /// note" set.
-fn live_name_nullifiers(conn: &Connection) -> rusqlite::Result<HashSet<[u8; 32]>> {
+fn live_name_nullifiers(conn: &Connection) -> rusqlite::Result<HashSet<TipNf>> {
     let mut stmt = conn.prepare("SELECT nullifier FROM names")?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     let mut set = HashSet::new();
@@ -515,7 +515,7 @@ fn live_name_nullifiers(conn: &Connection) -> rusqlite::Result<HashSet<[u8; 32]>
         let bytes: Vec<u8> = bytes?;
         let len = bytes.len();
         if let Ok(nf) = <[u8; 32]>::try_from(bytes) {
-            set.insert(nf);
+            set.insert(TipNf::from_bytes(&nf));
         } else {
             tracing::warn!(len, "name nullifier has an unexpected length");
         }
@@ -537,7 +537,7 @@ fn apply_candidates(
     height: u32,
     mtp: Option<i64>,
     candidates: &[Candidate],
-    live_names: &mut HashSet<[u8; 32]>,
+    live_names: &mut HashSet<TipNf>,
     tx_law: &[TxLaw],
     fvk: &FullViewingKey,
 ) -> rusqlite::Result<()> {
@@ -579,12 +579,16 @@ fn apply_candidates(
         // actions. The mint's `predecessor_spent` looks at every nullifier
         // in the transaction, not at the output's own action.
         let tip_nf = binding.as_ref().map(|b| b.nullifier);
-        let tip_consumed =
-            tip_nf.is_some_and(|nf| tx_facts.retirements.iter().any(|r| r.nf.as_bytes() == &nf));
+        let tip_consumed = tip_nf.is_some_and(|nf| {
+            tx_facts
+                .retirements
+                .iter()
+                .any(|r| TipNf::from_revealed(&r.nf) == nf)
+        });
         let spent_a_live_name = tx_facts
             .retirements
             .iter()
-            .any(|r| live_names.contains(r.nf.as_bytes()));
+            .any(|r| live_names.contains(&TipNf::from_revealed(&r.nf)));
 
         match note.action() {
             Action::Claim => {
@@ -644,7 +648,7 @@ fn apply_candidates(
                         rcm: candidate.rcm.to_repr().as_slice(),
                         psi: candidate.psi.to_repr().as_slice(),
                         cmx: &candidate.cand_cmx,
-                        nullifier: nullifier.as_slice(),
+                        nullifier: nullifier.as_bytes(),
                         txid: candidate.txid.as_slice(),
                         tx_index: law.tx_index as i64,
                         action_index: candidate.action_index as i64,
@@ -660,8 +664,8 @@ fn apply_candidates(
                 // else is follow_spends: every spent live name ends its
                 // binding.
                 let spent_other_live = tx_facts.retirements.iter().any(|r| {
-                    let nf = r.nf.as_bytes();
-                    live_names.contains(nf) && tip_nf != Some(*nf)
+                    let nf = TipNf::from_revealed(&r.nf);
+                    live_names.contains(&nf) && tip_nf != Some(nf)
                 });
                 if !tip_consumed || spent_other_live || snapshot.touches_live_anchor(tx_facts) {
                     mark_released_spent(
@@ -762,7 +766,7 @@ fn apply_candidates(
                         rcm: candidate.rcm.to_repr().as_slice(),
                         psi: candidate.psi.to_repr().as_slice(),
                         cmx: &candidate.cand_cmx,
-                        nullifier: nullifier.as_slice(),
+                        nullifier: nullifier.as_bytes(),
                         txid: candidate.txid.as_slice(),
                         tx_index: law.tx_index as i64,
                         action_index: candidate.action_index as i64,
@@ -816,7 +820,7 @@ fn admission_dropped(reason: &'static str, name: &str, txid: &[u8; 32], height: 
 }
 
 /// The admission nullifier of a verified candidate.
-fn admit_nullifier(candidate: &Candidate, fvk: &FullViewingKey) -> Option<[u8; 32]> {
+fn admit_nullifier(candidate: &Candidate, fvk: &FullViewingKey) -> Option<TipNf> {
     #[cfg(test)]
     if candidate.fail_nullifier {
         return None;
@@ -828,14 +832,14 @@ fn admit_nullifier(candidate: &Candidate, fvk: &FullViewingKey) -> Option<[u8; 3
             NoteCommitTrapdoor::from_inner(candidate.rcm),
             candidate.psi,
         )
-        .map(|n| n.to_bytes())
+        .map(TipNf::from_scan)
 }
 
 /// The mint's `mark_released`: every live name whose tip this transaction
 /// spent ends its binding, recorded as an implicit release.
 fn mark_released_spent(
     db_tx: &Transaction<'_>,
-    live_names: &mut HashSet<[u8; 32]>,
+    live_names: &mut HashSet<TipNf>,
     facts: &TxAnchorFacts,
     height: u32,
     txid: &[u8],
@@ -843,24 +847,24 @@ fn mark_released_spent(
     action_index: usize,
 ) -> rusqlite::Result<()> {
     for retirement in &facts.retirements {
-        let nf = retirement.nf.as_bytes();
-        if !live_names.contains(nf) {
+        let nf = TipNf::from_revealed(&retirement.nf);
+        if !live_names.contains(&nf) {
             continue;
         }
         let name: String = db_tx
             .query_row(
                 "SELECT name FROM names WHERE nullifier = ?1",
-                params![nf],
+                params![nf.as_bytes()],
                 |r| r.get(0),
             )
             .optional()?
             .ok_or_else(|| invariant_failure("live-name set does not match the names table"))?;
-        live_names.remove(nf);
+        live_names.remove(&nf);
         db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
         db_tx.execute(
             "INSERT OR IGNORE INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![name, height as i64, txid, tx_index as i64, action_index as i64, nf],
+            params![name, height as i64, txid, tx_index as i64, action_index as i64, nf.as_bytes()],
         )?;
     }
     Ok(())
@@ -871,20 +875,27 @@ fn mark_released_spent(
 #[allow(clippy::too_many_arguments)]
 fn end_binding_implicitly(
     db_tx: &Transaction<'_>,
-    live_names: &mut HashSet<[u8; 32]>,
+    live_names: &mut HashSet<TipNf>,
     name: &str,
     height: u32,
     txid: &[u8],
     tx_index: u32,
     action_index: usize,
-    consumed: &[u8; 32],
+    consumed: &TipNf,
 ) -> rusqlite::Result<()> {
     live_names.remove(consumed);
     db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
     db_tx.execute(
         "INSERT OR IGNORE INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![name, height as i64, txid, tx_index as i64, action_index as i64, consumed],
+        params![
+            name,
+            height as i64,
+            txid,
+            tx_index as i64,
+            action_index as i64,
+            consumed.as_bytes()
+        ],
     )?;
     Ok(())
 }
@@ -1010,14 +1021,11 @@ pub(crate) fn resume(conn: &Connection) -> rusqlite::Result<Resume> {
     let checkpoint = checkpoint(conn)?;
     let ironwood: Vec<Nullifier> = ironwood_nullifiers(conn)?
         .into_iter()
-        .filter_map(|nf| {
-            let bytes = *nf.as_bytes();
-            match Option::from(Nullifier::from_bytes(&bytes)) {
-                Some(decoded) => Some(decoded),
-                None => {
-                    tracing::warn!(nullifier = ?bytes, "watch-set nullifier failed to decode");
-                    None
-                }
+        .filter_map(|bytes| match Option::from(Nullifier::from_bytes(&bytes)) {
+            Some(decoded) => Some(decoded),
+            None => {
+                tracing::warn!(nullifier = ?bytes, "watch-set nullifier failed to decode");
+                None
             }
         })
         .collect();
@@ -1074,8 +1082,9 @@ pub(crate) fn checkpoint(conn: &Connection) -> rusqlite::Result<Option<Cursor>> 
 }
 
 /// The watch-set: every nullifier whose consumption we must detect —
-/// unspent watched ironwood notes plus every admitted name's nullifier.
-pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<AnchorNf>> {
+/// unspent anchors plus every admitted name tip. The two families meet
+/// here as bytes for seer-sync, which has one ironwood watch list.
+pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut statement = conn.prepare(
         "SELECT nullifier FROM anchor_facts
          WHERE value = 0 AND spent_height IS NULL
@@ -1084,8 +1093,7 @@ pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<Anc
     )?;
     let rows = statement.query_map([], |row| {
         let bytes: Vec<u8> = row.get(0)?;
-        let nf: [u8; 32] = bytes.try_into().map_err(|_| corrupt_record())?;
-        Ok(AnchorNf::from_bytes(&nf))
+        bytes.try_into().map_err(|_| corrupt_record())
     })?;
     rows.collect()
 }
@@ -1264,7 +1272,7 @@ fn registry_config(conn: &Connection) -> rusqlite::Result<Option<(String, String
 /// every earlier admission in the same batch.
 struct LiveTip {
     tip: Tip,
-    nullifier: [u8; 32],
+    nullifier: TipNf,
     confirmed_mtp: Option<i64>,
     expires_at: String,
 }
@@ -1282,7 +1290,7 @@ fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<Li
             let nullifier: [u8; 32] = nullifier.try_into().map_err(|_| corrupt_record())?;
             Ok(LiveTip {
                 tip: Tip { action, rcm },
-                nullifier,
+                nullifier: TipNf::from_bytes(&nullifier),
                 confirmed_mtp: row.get(3)?,
                 expires_at: row.get(4)?,
             })
@@ -1839,7 +1847,7 @@ mod tests {
         let conn = database();
         let tx = conn.unchecked_transaction().unwrap();
         let nf = [0x5a_u8; 32];
-        let mut live_names = HashSet::from([nf]);
+        let mut live_names = HashSet::from([TipNf::from_bytes(&nf)]);
         let facts = TxAnchorFacts {
             adoptions: vec![],
             retirements: vec![Retirement {
@@ -1857,7 +1865,7 @@ mod tests {
                 .contains("live-name set does not match the names table"),
             "{error}"
         );
-        assert!(live_names.contains(&nf));
+        assert!(live_names.contains(&TipNf::from_bytes(&nf)));
         let releases: i64 = tx
             .query_row("SELECT COUNT(*) FROM implicit_releases", [], |row| {
                 row.get(0)
@@ -2195,7 +2203,7 @@ mod admission {
             vec![Retirement { nf: nf(1) }],
             true,
         )];
-        let mut live_names: HashSet<[u8; 32]> = HashSet::new();
+        let mut live_names: HashSet<TipNf> = HashSet::new();
         let mut lineage = seeded;
         let _ = snapshot;
 
@@ -2301,7 +2309,7 @@ mod admission {
             }],
             true,
         )];
-        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
         let mut lineage = seeded;
         lineage.step_tx(100, &tx_law[0].facts);
 
@@ -2363,13 +2371,13 @@ mod admission {
                 seeded.clone(),
                 vec![],
                 vec![Retirement {
-                    nf: AnchorNf::from_bytes(&nullifier_u),
+                    nf: AnchorNf::from_bytes(nullifier_u.as_bytes()),
                 }],
                 true,
             ),
         ];
 
-        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
         let mut lineage = seeded;
         lineage.step_tx(100, &tx_law[0].facts);
         lineage.step_tx(100, &tx_law[1].facts);
@@ -2387,7 +2395,7 @@ mod admission {
             })
             .unwrap();
         assert_eq!(rel_name, "z");
-        assert_eq!(rel_nf, nullifier_u);
+        assert_eq!(rel_nf.as_slice(), nullifier_u.as_bytes());
     }
 
     /// The tip was spent and the chain rule passed, but the successor
@@ -2421,14 +2429,14 @@ mod admission {
             }],
             true,
         )];
-        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
         apply_candidates(&tx, 100, None, &[update], &mut live_names, &tx_law, &fvk).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
-        assert!(!live_names.contains(&[0x5a; 32]));
+        assert!(!live_names.contains(&TipNf::from_bytes(&[0x5a; 32])));
     }
 
     /// The mint spends the live tip in one action and writes the release
@@ -2471,7 +2479,7 @@ mod admission {
             ],
             true,
         )];
-        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
         apply_candidates(&tx, 100, None, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
 
@@ -2521,7 +2529,7 @@ mod admission {
             }],
             false, // two candidates: follow_spends
         )];
-        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
         let mut lineage = seeded;
         lineage.step_tx(100, &tx_law[0].facts);
 
@@ -2560,7 +2568,7 @@ mod admission {
             }],
             false,
         )];
-        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
         let mut lineage = seeded;
         lineage.step_tx(100, &tx_law[0].facts);
 
@@ -2605,7 +2613,7 @@ mod admission {
             }],
             true,
         )];
-        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
         let stale_mtp = 1_000_000_000 + LIVENESS_INTERVAL + 1;
         let candidates = vec![update];
@@ -2681,7 +2689,7 @@ mod admission {
             }],
             true,
         )];
-        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
         let candidates = vec![update];
         apply_candidates(
@@ -2731,7 +2739,7 @@ mod admission {
             }],
             true,
         )];
-        let mut live_names: HashSet<[u8; 32]> = HashSet::from([[0x5a; 32]]);
+        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
         apply_candidates(
             &tx,
