@@ -367,9 +367,9 @@ pub(crate) fn apply_batch(
         let mut txs: Vec<&WalletTx> = block.iter().collect();
         txs.sort_by_key(|tx| tx.tx_index);
         let mut tx_law: Vec<TxLaw> = Vec::new();
-        // Names admitted earlier in this batch are not in the table yet.
-        // A later claim in the same block must see them as taken.
-        let mut bound_names: HashSet<String> = HashSet::new();
+        // Earlier transactions in this block are not in the table yet.
+        // A later claim is judged against the name state they left.
+        let mut batch_names: HashMap<String, BatchName> = HashMap::new();
         for tx in txs {
             let txid = *tx.txid.as_ref();
             let tx_index = tx.tx_index;
@@ -405,14 +405,19 @@ pub(crate) fn apply_batch(
                 .iter()
                 .any(|r| live_names.contains(&TipNf::from_revealed(&r.nf)));
             let one_live_anchor = snapshot.live_retirements(&facts) == 1;
+            let preceding = candidates
+                .iter()
+                .find(|candidate| candidate.txid == txid)
+                .map(|candidate| preceding_name(&batch_names, candidate.name()))
+                .unwrap_or(PrecedingName::Unchanged);
             let admitted = if shape && one_live_anchor && !spent_a_live_name {
                 admitted_claim_successor(
                     &db_tx,
                     &candidates,
                     txid,
-                    &bound_names,
                     fvk,
                     expiries.get(&txid).copied(),
+                    preceding,
                 )?
             } else {
                 None
@@ -431,9 +436,32 @@ pub(crate) fn apply_batch(
             facts.claim_successor = admitted.is_some();
             if let Some(nullifier) = admitted {
                 if let Some(candidate) = candidates.iter().find(|c| c.txid == txid) {
-                    bound_names.insert(candidate.name().to_string());
+                    batch_names.insert(
+                        candidate.name().to_string(),
+                        BatchName::Claimed {
+                            nullifier,
+                            action: candidate.note.action(),
+                            rcm: scalar_bytes(&candidate.rcm),
+                        },
+                    );
                 }
                 live_names.insert(nullifier);
+            } else if let Some((name, consumed)) = standing_release(
+                &db_tx,
+                &candidates,
+                txid,
+                &ReleaseView {
+                    facts: &facts,
+                    snapshot: &snapshot,
+                    live_names: &live_names,
+                    batch: &batch_names,
+                },
+                fvk,
+            )? {
+                // A release earlier in the block frees the name before a
+                // later claim is judged. The table still holds the old tip.
+                batch_names.insert(name, BatchName::Released(height));
+                live_names.remove(&consumed);
             }
             lineage.step_tx(height, &facts);
             tx_law.push(TxLaw {
@@ -533,23 +561,70 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
 /// received, and the transaction's one name note is a claim. A sent note
 /// is not stored as an adoption, so it cannot be the successor the fold
 /// seats.
+/// How earlier transactions in this block left the name. The table still
+/// shows the state from before the block.
+#[derive(Clone, Copy)]
+enum PrecedingName {
+    /// No earlier transaction in this block changed the name.
+    Unchanged,
+    /// An earlier claim was admitted. The name is taken.
+    Taken,
+    /// An earlier release freed the name. The expiry window is this height.
+    Released(u32),
+}
+
+/// The name state earlier transactions in this block have already produced.
+enum BatchName {
+    Claimed {
+        nullifier: TipNf,
+        action: Action,
+        rcm: [u8; 32],
+    },
+    Released(u32),
+}
+
+fn preceding_name(batch: &HashMap<String, BatchName>, name: &str) -> PrecedingName {
+    match batch.get(name) {
+        Some(BatchName::Claimed { .. }) => PrecedingName::Taken,
+        Some(BatchName::Released(height)) => PrecedingName::Released(*height),
+        None => PrecedingName::Unchanged,
+    }
+}
+
+fn scalar_bytes(scalar: &pallas::Scalar) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(scalar.to_repr().as_ref());
+    bytes
+}
+
 /// The mint seats a successor only for a claim it admits: the name is
-/// free, including names already admitted earlier in this batch, the
-/// claim was not built before the latest release, and the note's
-/// nullifier derives. `None` leaves the successor out.
+/// free, including a name freed or taken by an earlier transaction in
+/// this block, the claim was not built before the release that precedes
+/// it, and the note's nullifier derives. `None` leaves the successor out.
 fn admitted_claim_successor(
     db: &Connection,
     candidates: &[Candidate<'_>],
     txid: [u8; 32],
-    bound_names: &HashSet<String>,
     fvk: &FullViewingKey,
     expiry: Option<u32>,
+    preceding: PrecedingName,
 ) -> rusqlite::Result<Option<TipNf>> {
     let Some(candidate) = candidates.iter().find(|candidate| candidate.txid == txid) else {
         return Ok(None);
     };
-    if bound_names.contains(candidate.name()) {
+    if matches!(preceding, PrecedingName::Taken) {
         return Ok(None);
+    }
+    // A release earlier in this block freed the name. The table still
+    // holds the old tip, and the expiry window is that release's height.
+    if let PrecedingName::Released(release_height) = preceding {
+        if notes::check_chain_rule(None, &candidate.note).is_none() {
+            return Ok(None);
+        }
+        if expiry_inside_release(release_height, expiry) {
+            return Ok(None);
+        }
+        return Ok(admit_nullifier(candidate, fvk));
     }
     if read_tip_offline(db, candidate.name())?.is_some() {
         return Ok(None);
@@ -561,6 +636,89 @@ fn admitted_claim_successor(
         return Ok(None);
     }
     Ok(admit_nullifier(candidate, fvk))
+}
+
+struct ReleaseView<'a> {
+    facts: &'a TxAnchorFacts,
+    snapshot: &'a Lineage,
+    live_names: &'a HashSet<TipNf>,
+    batch: &'a HashMap<String, BatchName>,
+}
+
+/// A release note this transaction will admit, and the tip nullifier it
+/// spends. A claim that follows sees the name free. A claim that precedes
+/// this release does not: the release is not recorded until it is reached.
+fn standing_release(
+    db: &Connection,
+    candidates: &[Candidate<'_>],
+    txid: [u8; 32],
+    view: &ReleaseView<'_>,
+    fvk: &FullViewingKey,
+) -> rusqlite::Result<Option<(String, TipNf)>> {
+    let mut notes = candidates.iter().filter(|candidate| candidate.txid == txid);
+    let Some(candidate) = notes.next() else {
+        return Ok(None);
+    };
+    if notes.next().is_some() || candidate.note.action() != Action::Release {
+        return Ok(None);
+    }
+    let Some(current) = tip_before_this_tx(db, candidate.name(), view.batch)? else {
+        return Ok(None);
+    };
+    let tip_consumed = view
+        .facts
+        .retirements
+        .iter()
+        .any(|retirement| TipNf::from_revealed(&retirement.nf) == current.nullifier);
+    let spent_other_live = view.facts.retirements.iter().any(|retirement| {
+        let nf = TipNf::from_revealed(&retirement.nf);
+        view.live_names.contains(&nf) && nf != current.nullifier
+    });
+    if !tip_consumed || spent_other_live || view.snapshot.touches_live_anchor(view.facts) {
+        return Ok(None);
+    }
+    if notes::check_chain_rule(Some(&current.tip), &candidate.note).is_none() {
+        return Ok(None);
+    }
+    if admit_nullifier(candidate, fvk).is_none() {
+        return Ok(None);
+    }
+    Ok(Some((candidate.name().to_string(), current.nullifier)))
+}
+
+struct OpenTip {
+    tip: Tip,
+    nullifier: TipNf,
+}
+
+fn tip_before_this_tx(
+    db: &Connection,
+    name: &str,
+    batch: &HashMap<String, BatchName>,
+) -> rusqlite::Result<Option<OpenTip>> {
+    match batch.get(name) {
+        Some(BatchName::Released(_)) => Ok(None),
+        Some(BatchName::Claimed {
+            nullifier,
+            action,
+            rcm,
+        }) => Ok(Some(OpenTip {
+            tip: Tip {
+                action: *action,
+                rcm: *rcm,
+            },
+            nullifier: *nullifier,
+        })),
+        None => {
+            let Some(live) = read_tip_offline(db, name)? else {
+                return Ok(None);
+            };
+            Ok(Some(OpenTip {
+                tip: live.tip,
+                nullifier: live.nullifier,
+            }))
+        }
+    }
 }
 
 /// The mint builds a claim only after a release is applied, and sets
@@ -576,10 +734,16 @@ fn built_before_release(
     let Some(release_height) = latest_release_height(db, name)? else {
         return Ok(false);
     };
+    Ok(expiry_inside_release(release_height, expiry))
+}
+
+/// `expiry` falls inside the standard window of a release at `release_height`.
+/// A missing expiry fails closed.
+fn expiry_inside_release(release_height: u32, expiry: Option<u32>) -> bool {
     let Some(expiry) = expiry else {
-        return Ok(true);
+        return true;
     };
-    Ok(expiry <= release_height.saturating_add(DEFAULT_TX_EXPIRY_DELTA))
+    expiry <= release_height.saturating_add(DEFAULT_TX_EXPIRY_DELTA)
 }
 
 /// Height of the latest record when that record is a release. A later
@@ -3004,17 +3168,22 @@ mod admission {
             &tx,
             &stale,
             [1; 32],
-            &HashSet::new(),
             &fvk,
             Some(inside),
+            PrecedingName::Unchanged,
         )
         .unwrap()
         .is_none());
-        assert!(
-            admitted_claim_successor(&tx, &stale, [1; 32], &HashSet::new(), &fvk, None)
-                .unwrap()
-                .is_none()
-        );
+        assert!(admitted_claim_successor(
+            &tx,
+            &stale,
+            [1; 32],
+            &fvk,
+            None,
+            PrecedingName::Unchanged,
+        )
+        .unwrap()
+        .is_none());
 
         let seeded = seeded_lineage(&[1]);
         let mut stale_law = tx_law_for(
@@ -3034,11 +3203,16 @@ mod admission {
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
 
         let past = release_height + DEFAULT_TX_EXPIRY_DELTA + 1;
-        assert!(
-            admitted_claim_successor(&tx, &stale, [1; 32], &HashSet::new(), &fvk, Some(past),)
-                .unwrap()
-                .is_some()
-        );
+        assert!(admitted_claim_successor(
+            &tx,
+            &stale,
+            [1; 32],
+            &fvk,
+            Some(past),
+            PrecedingName::Unchanged,
+        )
+        .unwrap()
+        .is_some());
         let mut fresh_law = tx_law_for(
             [1; 32],
             lineage.clone(),
@@ -3052,6 +3226,105 @@ mod admission {
         assert!(lineage.contains(&nf(201)));
         apply_candidates(&tx, 121, None, &stale, &mut live_names, &[fresh_law], &fvk).unwrap();
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
+    }
+
+    /// A release earlier in the block frees the name before the claim is
+    /// judged. The expiry window is that release. A claim that precedes the
+    /// release still sees the live tip and is refused.
+    #[test]
+    fn a_later_claim_in_the_block_is_judged_against_the_release() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+        let release_height = 200u32;
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('alice', 100, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            params![vec![0x5a_u8; 32]],
+        )
+        .unwrap();
+
+        let release_memos = vec![memo_for("release", "alice", &[0x02; 32])];
+        let release = vec![candidate(
+            &release_memos,
+            0,
+            0,
+            0,
+            [3; 32],
+            "release",
+            "alice",
+            [0x02; 32],
+        )];
+        let seeded = seeded_lineage(&[1]);
+        let release_facts = TxAnchorFacts {
+            adoptions: vec![],
+            retirements: vec![Retirement {
+                nf: AnchorNf::from_bytes(&[0x5a; 32]),
+            }],
+            has_single_name_note: true,
+            name_notes: 1,
+            claim_successor: false,
+        };
+        let live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
+        let stood = standing_release(
+            &tx,
+            &release,
+            [3; 32],
+            &ReleaseView {
+                facts: &release_facts,
+                snapshot: &seeded,
+                live_names: &live_names,
+                batch: &HashMap::new(),
+            },
+            &fvk,
+        )
+        .unwrap();
+        assert_eq!(stood.map(|(name, _)| name).as_deref(), Some("alice"));
+
+        let claim_memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let claim = vec![candidate(
+            &claim_memos,
+            0,
+            0,
+            0,
+            [1; 32],
+            "claim",
+            "alice",
+            [0u8; 32],
+        )];
+        // The claim precedes the release: the tip is still live.
+        assert!(admitted_claim_successor(
+            &tx,
+            &claim,
+            [1; 32],
+            &fvk,
+            Some(release_height + DEFAULT_TX_EXPIRY_DELTA + 1),
+            PrecedingName::Unchanged,
+        )
+        .unwrap()
+        .is_none());
+        // The release precedes the claim. Expiry inside the window stays out.
+        assert!(admitted_claim_successor(
+            &tx,
+            &claim,
+            [1; 32],
+            &fvk,
+            Some(release_height + DEFAULT_TX_EXPIRY_DELTA),
+            PrecedingName::Released(release_height),
+        )
+        .unwrap()
+        .is_none());
+        // Expiry past the window registers, even though the old tip is still stored.
+        assert!(admitted_claim_successor(
+            &tx,
+            &claim,
+            [1; 32],
+            &fvk,
+            Some(release_height + DEFAULT_TX_EXPIRY_DELTA + 1),
+            PrecedingName::Released(release_height),
+        )
+        .unwrap()
+        .is_some());
     }
 
     /// An implicit release is a release record. A later claim ends the window.
