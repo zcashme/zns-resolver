@@ -655,13 +655,14 @@ mod canon {
                 "ceremony_closes_once",
                 "ceremony_fill",
                 "claim_after_release",
+                "claim_inside_release_window",
                 "duplicate_claim",
                 "reorg",
                 "unbacked_claim",
                 "update_then_release",
             ]
         );
-        assert_eq!(fixture.scenarios.len(), 8);
+        assert_eq!(fixture.scenarios.len(), 9);
 
         for scenario in &fixture.scenarios {
             let mut applied: Vec<Applied> = Vec::new();

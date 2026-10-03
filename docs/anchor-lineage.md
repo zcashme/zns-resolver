@@ -89,7 +89,7 @@ is not the name note's own action; fee inputs sit between them, same as a claim.
 ## The canon contract
 
 `tests/fixtures/canon-vectors-v1.json` is vendored from zns-mint
-(provenance in `tests/fixtures/README.md`). All eight scenarios replay
+(provenance in `tests/fixtures/README.md`). All nine scenarios replay
 into the fold; the live set and `adoption_closed` must equal the mint's
 recorded snapshot after every event. Each `adopt_anchor` event is the
 mint's `adopt()` call. The scan applies the keygen check before it

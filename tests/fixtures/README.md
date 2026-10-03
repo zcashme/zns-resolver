@@ -4,7 +4,7 @@ Vendored from zcashme/zns-mint `tests/fixtures/canon-vectors-v1.json`
 (cross-repo admission contract; see zns-mint `anchor_pool.rs`).
 
 - Source: zns-mint `master`
-- SHA-256: `a7c73e076a112ea03b280229ff8e24b5964c587215d315909a4a3dcb824a6f57`
+- SHA-256: `1a0345cd1027c4483453c57610b4edae3096f0c2c5468e075791cc4189355aef`
 - Pinned by: `src/registry/anchor_lineage.rs` canon test (compile-time
   `include_str!` binding; the test asserts the fixture version, the
   standing size, and the exact scenario set).
