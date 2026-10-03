@@ -2,15 +2,55 @@
 
 use std::sync::{Arc, Mutex};
 
+use orchard::keys::FullViewingKey;
 use rusqlite::Connection;
-use zcash_protocol::consensus::Network;
+use seer_sync::{Cursor, Resume};
+use zcash_protocol::consensus::{BlockHeight, Network};
 use zns_verify::Action;
 
+use self::batch::BatchTx;
+
 mod anchor_lineage;
+pub(crate) mod batch;
 pub(crate) mod core;
 mod nf;
 mod notes;
 pub(crate) mod storage;
+
+/// The local registry replica and the key used to verify its name notes.
+pub(crate) struct Registry {
+    pub(crate) db: Db,
+    pub(crate) fvk: FullViewingKey,
+}
+
+impl Registry {
+    pub(crate) fn resume(&self) -> rusqlite::Result<Resume> {
+        let conn = self.db.lock();
+        core::resume(&conn)
+    }
+
+    pub(crate) fn rewind(&self, to: BlockHeight) -> rusqlite::Result<()> {
+        let conn = self.db.lock();
+        core::rewind(&conn, u32::from(to))
+    }
+
+    pub(crate) fn apply_batch(
+        &self,
+        at: Cursor,
+        transactions: &[BatchTx],
+        block_times: &[(u32, u64)],
+    ) -> rusqlite::Result<()> {
+        // Fold outside the connection lock so queries can run during replay.
+        // The indexer is the only writer, so the facts still match this batch.
+        let facts = {
+            let conn = self.db.lock();
+            core::lineage_facts(&conn)?
+        };
+        let lineage = core::fold_lineage(facts);
+        let conn = self.db.lock();
+        core::apply_batch(&conn, at, transactions, block_times, &self.fvk, lineage)
+    }
+}
 
 // ── Db handle ───────────────────────────────────────────────────────────────
 

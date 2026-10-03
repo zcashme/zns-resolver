@@ -7,7 +7,6 @@ use orchard::note::Note;
 use orchard::note::NoteCommitTrapdoor;
 use orchard::note::Nullifier;
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
-use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
 use zcash_address::unified::Encoding as _;
 use zcash_primitives::block::BlockHash;
@@ -17,6 +16,7 @@ use zns_verify::{pallas, Action, Memo, NameNote, PrimeField, Tip};
 use super::anchor_lineage::{
     keeps_anchor_note, Adoption, Lineage, Position, Retirement, TxAnchorFacts,
 };
+use super::batch::{BatchCandidate, BatchTx};
 use super::nf::{AnchorNf, TipNf};
 use super::notes;
 use super::{Event, Registration};
@@ -166,7 +166,7 @@ struct Source<'a> {
 pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
-    transactions: &[WalletTx],
+    transactions: &[BatchTx],
     block_times: &[(u32, u64)],
     fvk: &FullViewingKey,
     mut lineage: Lineage,
@@ -205,9 +205,12 @@ pub(crate) fn apply_batch(
         let mut sources: Vec<Source> = Vec::new();
         for tx in block {
             let txid = *tx.txid.as_ref();
-            for output in &tx.relaxed_ironwood_outputs {
-                let (action_index, cand_note, _action_nullifier, memo, _) = output;
-
+            for BatchCandidate {
+                action_index,
+                note: cand_note,
+                memo,
+            } in &tx.relaxed_ironwood_outputs
+            {
                 let Some(memo) = memo else {
                     candidate_dropped("missing memo", &txid, *action_index);
                     continue;
@@ -302,9 +305,7 @@ pub(crate) fn apply_batch(
             let zero_value_notes = tx_data
                 .ironwood_outputs
                 .iter()
-                .filter(|output| {
-                    !output.is_sent && output.note.value().inner() == 0 && output.nf.is_some()
-                })
+                .filter(|output| !output.is_sent && output.value == 0 && output.nf.is_some())
                 .count();
             // The keygen transaction, or a claim's one successor. A
             // zero-value note in any other transaction does not join.
@@ -314,7 +315,7 @@ pub(crate) fn apply_batch(
             for output in &tx_data.ironwood_outputs {
                 // A payment is not an anchor fact. Storing it would grow the
                 // table the lineage rereads on every batch.
-                if !keep_notes || output.is_sent || output.note.value().inner() != 0 {
+                if !keep_notes || output.is_sent || output.value != 0 {
                     continue;
                 }
                 let Some(nf) = output.nf else {
@@ -362,7 +363,7 @@ pub(crate) fn apply_batch(
         // Per-transaction anchor facts and pre-transaction lineage
         // snapshots, in canonical order: a candidate is judged against the
         // lineage its own transaction was judged against.
-        let mut txs: Vec<&WalletTx> = block.iter().collect();
+        let mut txs: Vec<&BatchTx> = block.iter().collect();
         txs.sort_by_key(|tx| tx.tx_index);
         let mut tx_law: Vec<TxLaw> = Vec::new();
         // Names admitted earlier in this batch are not in the table yet.
@@ -376,7 +377,7 @@ pub(crate) fn apply_batch(
             let adoptions: Vec<Adoption> = tx
                 .ironwood_outputs
                 .iter()
-                .filter(|o| !o.is_sent && o.note.value().inner() == 0)
+                .filter(|o| !o.is_sent && o.value == 0)
                 .filter_map(|o| o.nf.map(AnchorNf::from_scan))
                 .map(|nf| Adoption { nf })
                 .collect();
@@ -549,11 +550,11 @@ fn admitted_claim_successor(
     Ok(admit_nullifier(candidate, fvk))
 }
 
-fn claim_successor_output(tx: &WalletTx, candidates: &[Candidate<'_>]) -> bool {
+fn claim_successor_output(tx: &BatchTx, candidates: &[Candidate<'_>]) -> bool {
     let [output] = tx.ironwood_outputs.as_slice() else {
         return false;
     };
-    if output.is_sent || output.note.value().inner() != 0 || output.nf.is_none() {
+    if output.is_sent || output.value != 0 || output.nf.is_none() {
         return false;
     }
     let txid = *tx.txid.as_ref();
@@ -3526,15 +3527,13 @@ mod admission {
     /// account sent are not stored either. The block time is still recorded.
     #[test]
     fn a_batch_skips_a_note_outside_the_keygen_transaction_and_a_payment() {
-        use orchard::keys::Scope;
-        use orchard::note::{Nullifier, RandomSeed, Rho};
-        use orchard::value::NoteValue;
-        use orchard::Address;
-        use seer_sync::sync::scan::WalletTx;
+        use orchard::note::Nullifier;
         use seer_sync::Cursor;
         use zcash_primitives::block::BlockHash;
         use zcash_primitives::transaction::TxId;
         use zcash_protocol::consensus::BlockHeight;
+
+        use crate::registry::batch::BatchOutput;
 
         let conn = db();
         conn.execute(
@@ -3543,73 +3542,35 @@ mod admission {
         )
         .unwrap();
 
-        let rho = Rho::from_bytes(&[9u8; 32]).into_option().expect("rho");
-        let rseed = RandomSeed::from_bytes([4u8; 32], &rho)
-            .into_option()
-            .expect("rseed");
-        let recipient = Address::from_raw_address_bytes(&RAW_ADDR)
-            .into_option()
-            .expect("address");
-        let payment = Note::from_parts(
-            recipient,
-            NoteValue::from_raw(1),
-            rho,
-            rseed,
-            orchard::note::NoteVersion::V3,
-        )
-        .into_option()
-        .expect("payment note");
-        let zero = test_note();
         let nf_bytes = [9u8; 32];
         let nullifier = Option::from(Nullifier::from_bytes(&nf_bytes)).expect("nullifier");
 
-        let tx = WalletTx {
+        let tx = BatchTx {
             txid: TxId::from_bytes([1; 32]),
             height: BlockHeight::from_u32(10),
             tx_index: 0,
-            sapling_outputs: vec![],
-            sapling_spends: vec![],
-            orchard_outputs: vec![],
-            orchard_spends: vec![],
             ironwood_outputs: vec![
-                seer_sync::sync::scan::OrchardOutput {
+                BatchOutput {
                     index: 0,
-                    note: zero,
-                    recipient,
+                    value: 0,
                     nf: Some(nullifier),
-                    position: 0,
-                    scope: Scope::External,
-                    memo: None,
                     is_sent: false,
-                    is_change: false,
                 },
-                seer_sync::sync::scan::OrchardOutput {
+                BatchOutput {
                     index: 1,
-                    note: payment,
-                    recipient,
+                    value: 1,
                     nf: Some(nullifier),
-                    position: 1,
-                    scope: Scope::External,
-                    memo: None,
                     is_sent: false,
-                    is_change: false,
                 },
-                seer_sync::sync::scan::OrchardOutput {
+                BatchOutput {
                     index: 2,
-                    note: zero,
-                    recipient,
+                    value: 0,
                     nf: Some(nullifier),
-                    position: 2,
-                    scope: Scope::External,
-                    memo: None,
                     is_sent: true,
-                    is_change: false,
                 },
             ],
             ironwood_spends: vec![],
             relaxed_ironwood_outputs: vec![],
-            transparent_outputs: vec![],
-            transparent_spends: vec![],
         };
         apply_batch(
             &conn,
