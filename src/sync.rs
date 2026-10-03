@@ -14,12 +14,12 @@ use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::registry::batch::BatchTx;
-use crate::registry::{core, Registry};
+use crate::registry::Registry;
 
 use self::batch::project_tx;
 
 /// Adapts seer-sync's two callbacks to one registry batch application.
-pub(crate) struct SyncAccount {
+pub(crate) struct RegistryAdapter {
     registry: Registry,
     batch: Mutex<Option<ScannedBatch>>,
 }
@@ -30,7 +30,7 @@ struct ScannedBatch {
     transactions: Vec<BatchTx>,
 }
 
-impl SyncAccount {
+impl RegistryAdapter {
     pub(crate) fn new(registry: Registry) -> Self {
         Self {
             registry,
@@ -57,15 +57,13 @@ impl std::fmt::Display for ScanBatchError {
 
 impl Error for ScanBatchError {}
 
-impl Account for SyncAccount {
+impl Account for RegistryAdapter {
     fn resume(&self) -> Result<Resume, Box<dyn Error + Send + Sync>> {
-        let conn = self.registry.db.lock();
-        Ok(core::resume(&conn)?)
+        Ok(self.registry.resume()?)
     }
 
     fn rewind(&self, to: BlockHeight) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let conn = self.registry.db.lock();
-        core::rewind(&conn, u32::from(to))?;
+        self.registry.rewind(to)?;
         Ok(())
     }
 
@@ -108,23 +106,8 @@ impl Account for SyncAccount {
                 block_times.push((height, u64::from(block.time)));
             }
         }
-        // Fold the snapshot without the connection so a name query is not
-        // stuck behind the replay. The indexer is the only writer, so the
-        // snapshot still matches the batch.
-        let facts = {
-            let conn = self.registry.db.lock();
-            core::lineage_facts(&conn)?
-        };
-        let lineage = core::fold_lineage(facts);
-        let conn = self.registry.db.lock();
-        core::apply_batch(
-            &conn,
-            at,
-            &batch.transactions,
-            &block_times,
-            &self.registry.fvk,
-            lineage,
-        )?;
+        self.registry
+            .apply_batch(at, &batch.transactions, &block_times)?;
         Ok(())
     }
 }
