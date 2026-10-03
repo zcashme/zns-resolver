@@ -7,7 +7,6 @@ use orchard::note::Note;
 use orchard::note::NoteCommitTrapdoor;
 use orchard::note::Nullifier;
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
-use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
 use zcash_address::unified::Encoding as _;
 use zcash_primitives::block::BlockHash;
@@ -19,6 +18,7 @@ use super::anchor_lineage::{
 };
 use super::nf::{AnchorNf, TipNf};
 use super::notes;
+use super::scanned::{ScannedCandidate, ScannedTx};
 use super::{Event, Registration};
 
 /// The liveness interval, §4.5: a name whose tip is not renewed within
@@ -166,7 +166,7 @@ struct Source<'a> {
 pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
-    transactions: &[WalletTx],
+    transactions: &[ScannedTx],
     block_times: &[(u32, u64)],
     fvk: &FullViewingKey,
     mut lineage: Lineage,
@@ -205,9 +205,12 @@ pub(crate) fn apply_batch(
         let mut sources: Vec<Source> = Vec::new();
         for tx in block {
             let txid = *tx.txid.as_ref();
-            for output in &tx.relaxed_ironwood_outputs {
-                let (action_index, cand_note, _action_nullifier, memo, _) = output;
-
+            for ScannedCandidate {
+                action_index,
+                note: cand_note,
+                memo,
+            } in &tx.relaxed_ironwood_outputs
+            {
                 let Some(memo) = memo else {
                     candidate_dropped("missing memo", &txid, *action_index);
                     continue;
@@ -302,9 +305,7 @@ pub(crate) fn apply_batch(
             let zero_value_notes = tx_data
                 .ironwood_outputs
                 .iter()
-                .filter(|output| {
-                    !output.is_sent && output.note.value().inner() == 0 && output.nf.is_some()
-                })
+                .filter(|output| !output.is_sent && output.value == 0 && output.nf.is_some())
                 .count();
             // The keygen transaction, or a claim's one successor. A
             // zero-value note in any other transaction does not join.
@@ -314,7 +315,7 @@ pub(crate) fn apply_batch(
             for output in &tx_data.ironwood_outputs {
                 // A payment is not an anchor fact. Storing it would grow the
                 // table the lineage rereads on every batch.
-                if !keep_notes || output.is_sent || output.note.value().inner() != 0 {
+                if !keep_notes || output.is_sent || output.value != 0 {
                     continue;
                 }
                 let Some(nf) = output.nf else {
@@ -362,7 +363,7 @@ pub(crate) fn apply_batch(
         // Per-transaction anchor facts and pre-transaction lineage
         // snapshots, in canonical order: a candidate is judged against the
         // lineage its own transaction was judged against.
-        let mut txs: Vec<&WalletTx> = block.iter().collect();
+        let mut txs: Vec<&ScannedTx> = block.iter().collect();
         txs.sort_by_key(|tx| tx.tx_index);
         let mut tx_law: Vec<TxLaw> = Vec::new();
         // Names admitted earlier in this batch are not in the table yet.
@@ -376,7 +377,7 @@ pub(crate) fn apply_batch(
             let adoptions: Vec<Adoption> = tx
                 .ironwood_outputs
                 .iter()
-                .filter(|o| !o.is_sent && o.note.value().inner() == 0)
+                .filter(|o| !o.is_sent && o.value == 0)
                 .filter_map(|o| o.nf.map(AnchorNf::from_scan))
                 .map(|nf| Adoption { nf })
                 .collect();
@@ -549,11 +550,11 @@ fn admitted_claim_successor(
     Ok(admit_nullifier(candidate, fvk))
 }
 
-fn claim_successor_output(tx: &WalletTx, candidates: &[Candidate<'_>]) -> bool {
+fn claim_successor_output(tx: &ScannedTx, candidates: &[Candidate<'_>]) -> bool {
     let [output] = tx.ironwood_outputs.as_slice() else {
         return false;
     };
-    if output.is_sent || output.note.value().inner() != 0 || output.nf.is_none() {
+    if output.is_sent || output.value != 0 || output.nf.is_none() {
         return false;
     }
     let txid = *tx.txid.as_ref();
@@ -3617,7 +3618,7 @@ mod admission {
                 height: BlockHeight::from_u32(10),
                 hash: BlockHash([2; 32]),
             },
-            &[tx],
+            &[ScannedTx::from_wallet(&tx)],
             &[(10, 1_000)],
             &fvk(),
             Lineage::new(),

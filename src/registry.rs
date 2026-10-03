@@ -10,6 +10,7 @@ mod anchor_lineage;
 pub(crate) mod core;
 mod nf;
 mod notes;
+pub(crate) mod scanned;
 pub(crate) mod storage;
 
 // ── Db handle ───────────────────────────────────────────────────────────────
