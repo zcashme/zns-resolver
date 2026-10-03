@@ -12,7 +12,7 @@ mod registry; // Name index Database
 mod sync; // Sync Loop
 
 use seer_sync::UnifiedFullViewingKey;
-use sync::{live_tip, Pending, Registry};
+use sync::{live_tip, Registry};
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
@@ -117,11 +117,7 @@ async fn main() {
 
     // --- The indexer: run forever, reconnecting when sync returns ---
     tracing::info!(network = ?NETWORK, birthday = MINT_BIRTHDAY, "starting indexer");
-    let account = Registry {
-        db,
-        fvk,
-        pending: Pending::new(),
-    };
+    let account = Registry { db, fvk };
 
     loop {
         if let Err(error) = seer_sync::run(UFVK, NETWORK, &account).await {

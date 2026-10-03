@@ -5,7 +5,7 @@ use rusqlite::Connection;
 /// The SQL to create the name index tables (and supporting state).
 /// Run once by the writer connection at startup.
 pub(crate) const SCHEMA_SQL: &str = r#"
-PRAGMA user_version = 5;
+PRAGMA user_version = 1;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;
@@ -36,7 +36,6 @@ CREATE TABLE IF NOT EXISTS name_events (
     txid         BLOB    NOT NULL,
     tx_index     INTEGER NOT NULL,
     action_index INTEGER NOT NULL,
-    confirmed_mtp INTEGER,
     memo         BLOB    NOT NULL,
     PRIMARY KEY (name, height, txid, action_index)
 );
@@ -57,13 +56,7 @@ CREATE TABLE IF NOT EXISTS names (
     txid         BLOB    NOT NULL,
     tx_index     INTEGER NOT NULL,
     action_index INTEGER NOT NULL,
-    confirmed_mtp INTEGER,
     memo         BLOB    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS block_times (
-    height INTEGER NOT NULL PRIMARY KEY,
-    time   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS implicit_releases (
@@ -93,63 +86,16 @@ CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 
 "#;
 
-/// Installs the schema, wiping pre-lineage databases. A database written
-/// before the anchor-fact tables cannot be upgraded in place: the old
-/// watch table lacks value and canonical-position data, and its names
-/// rows lack tx_index. The version gate drops everything and reinstalls,
-/// so the next open rescans from the configured birthday. A version 1
-/// database has tips and no confirmation times. Keeping those rows would
-/// admit a clock-due update as a renewal. A version 2 database stored
-/// every one-candidate zero-value note as a successor, so an update or a
-/// claim with a second registry output would seat an anchor the mint
-/// rejects. A version 3 database stored every zero-value note, so the
-/// pool can contain anchors the keygen transaction did not create, and a
-/// name may have been bound to one of them. A version 4 database stored
-/// a successor for every claim-shaped note, including a claim that was
-/// not admitted. A later claim may already have spent that successor and
-/// been recorded. A replay from the birthday would not admit that later
-/// claim, because the successor it spent would never have entered the
-/// pool. Those scans cannot be replayed into the mint's pool. In each
-/// case the chain tables and the checkpoint are dropped and the next
-/// open replays from the birthday.
+/// Installs the single supported schema. Older database files are not
+/// migrated; remove them before running a build with a changed schema.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version < 1 {
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS registry_account;
-             DROP TABLE IF EXISTS name_events;
-             DROP TABLE IF EXISTS names;
-             DROP TABLE IF EXISTS watched_ironwood_notes;
-             DROP TABLE IF EXISTS anchor_facts;
-             DROP TABLE IF EXISTS implicit_releases;
-             DROP TABLE IF EXISTS block_times;",
-        )?;
-    } else if version < 5 {
-        if version == 1 {
-            tracing::warn!(
-                "schema version 1 has no confirmation times; dropping the scan so it replays from the birthday"
-            );
-        } else if version == 2 {
-            tracing::warn!(
-                "schema version 2 cannot tell a claim successor from any other zero-value note; dropping the scan so it replays from the birthday"
-            );
-        } else if version == 3 {
-            tracing::warn!(
-                "schema version 3 stored every zero-value note; the ceremony is only the keygen transaction, so the scan replays from the birthday"
-            );
-        } else {
-            tracing::warn!(
-                "schema version 4 kept a successor for a claim that was not admitted; a later claim may have spent it, so the scan replays from the birthday"
-            );
-        }
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS name_events;
-             DROP TABLE IF EXISTS names;
-             DROP TABLE IF EXISTS anchor_facts;
-             DROP TABLE IF EXISTS implicit_releases;
-             DROP TABLE IF EXISTS block_times;
-             UPDATE registry_account SET sync_height = NULL, sync_hash = NULL WHERE id = 0;",
-        )?;
+    if version != 0 && version != 1 {
+        tracing::error!(
+            version,
+            "unsupported registry database; delete the old SQLite file and rescan"
+        );
+        return Err(rusqlite::Error::InvalidQuery);
     }
     conn.execute_batch(SCHEMA_SQL)?;
     Ok(())
