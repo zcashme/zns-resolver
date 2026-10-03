@@ -11,6 +11,7 @@ use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
 use zcash_address::unified::Encoding as _;
 use zcash_primitives::block::BlockHash;
+use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
 use zcash_protocol::consensus::{BlockHeight, Parameters as _};
 use zns_verify::{pallas, Action, Memo, NameNote, PrimeField, Tip};
 
@@ -167,6 +168,7 @@ pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
     transactions: &[WalletTx],
+    expiries: &HashMap<[u8; 32], u32>,
     block_times: &[(u32, u64)],
     fvk: &FullViewingKey,
     mut lineage: Lineage,
@@ -404,7 +406,14 @@ pub(crate) fn apply_batch(
                 .any(|r| live_names.contains(&TipNf::from_revealed(&r.nf)));
             let one_live_anchor = snapshot.live_retirements(&facts) == 1;
             let admitted = if shape && one_live_anchor && !spent_a_live_name {
-                admitted_claim_successor(&db_tx, &candidates, txid, &bound_names, fvk)?
+                admitted_claim_successor(
+                    &db_tx,
+                    &candidates,
+                    txid,
+                    &bound_names,
+                    fvk,
+                    expiries.get(&txid).copied(),
+                )?
             } else {
                 None
             };
@@ -525,14 +534,16 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
 /// is not stored as an adoption, so it cannot be the successor the fold
 /// seats.
 /// The mint seats a successor only for a claim it admits: the name is
-/// free, including names already admitted earlier in this batch, and the
-/// note's nullifier derives. `None` leaves the successor out.
+/// free, including names already admitted earlier in this batch, the
+/// claim was not built before the latest release, and the note's
+/// nullifier derives. `None` leaves the successor out.
 fn admitted_claim_successor(
     db: &Connection,
     candidates: &[Candidate<'_>],
     txid: [u8; 32],
     bound_names: &HashSet<String>,
     fvk: &FullViewingKey,
+    expiry: Option<u32>,
 ) -> rusqlite::Result<Option<TipNf>> {
     let Some(candidate) = candidates.iter().find(|candidate| candidate.txid == txid) else {
         return Ok(None);
@@ -546,7 +557,73 @@ fn admitted_claim_successor(
     if notes::check_chain_rule(None, &candidate.note).is_none() {
         return Ok(None);
     }
+    if built_before_release(db, candidate.name(), expiry)? {
+        return Ok(None);
+    }
     Ok(admit_nullifier(candidate, fvk))
+}
+
+/// The mint builds a claim only after a release is applied, and sets
+/// expiry to the target height plus [`DEFAULT_TX_EXPIRY_DELTA`]. A
+/// transaction inside that window was built before the release. The
+/// latest record may be an implicit release: the mint records that as a
+/// release too. A missing expiry fails closed.
+fn built_before_release(
+    db: &Connection,
+    name: &str,
+    expiry: Option<u32>,
+) -> rusqlite::Result<bool> {
+    let Some(release_height) = latest_release_height(db, name)? else {
+        return Ok(false);
+    };
+    let Some(expiry) = expiry else {
+        return Ok(true);
+    };
+    Ok(expiry <= release_height.saturating_add(DEFAULT_TX_EXPIRY_DELTA))
+}
+
+/// Height of the latest record when that record is a release. A later
+/// claim or update means the name is no longer in the post-release window.
+fn latest_release_height(db: &Connection, name: &str) -> rusqlite::Result<Option<u32>> {
+    let event: Option<(String, i64, i64, i64)> = db
+        .query_row(
+            "SELECT action, height, tx_index, action_index FROM name_events WHERE name = ?1
+             ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT 1",
+            params![name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let implicit: Option<(i64, i64, i64)> = db
+        .query_row(
+            "SELECT height, tx_index, action_index FROM implicit_releases WHERE name = ?1
+             ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT 1",
+            params![name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let event_is_latest = match (&event, &implicit) {
+        (Some((_, height, tx_index, action_index)), Some((ih, itx, ia))) => {
+            (*height, *tx_index, *action_index) >= (*ih, *itx, *ia)
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => return Ok(None),
+    };
+    let height = if event_is_latest {
+        let Some((action, height, _, _)) = event else {
+            return Ok(None);
+        };
+        if action != "release" {
+            return Ok(None);
+        }
+        height
+    } else {
+        let Some((height, _, _)) = implicit else {
+            return Ok(None);
+        };
+        height
+    };
+    Ok(Some(row_u32(height)?))
 }
 
 fn claim_successor_output(tx: &WalletTx, candidates: &[Candidate<'_>]) -> bool {
@@ -1765,7 +1842,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1796,7 +1873,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1878,7 +1955,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -1940,7 +2017,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -2024,7 +2101,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -2124,7 +2201,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let birthday: i64 = conn
             .query_row(
                 "SELECT birthday FROM registry_account WHERE id = 0",
@@ -2140,6 +2217,74 @@ mod tests {
                 .unwrap();
             assert_eq!(rows, 0, "{table}");
         }
+    }
+
+    /// A version 5 database did not store transaction expiry, so a claim
+    /// built before a release may already be admitted. Opening it drops
+    /// the scan and keeps the account.
+    #[test]
+    fn version_5_database_rescans_from_the_birthday() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 5;
+             CREATE TABLE registry_account (
+                id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+                ufvk TEXT NOT NULL,
+                network TEXT NOT NULL,
+                birthday INTEGER NOT NULL,
+                sync_height INTEGER,
+                sync_hash BLOB
+             );
+             CREATE TABLE names (
+                name TEXT NOT NULL PRIMARY KEY,
+                height INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                ua TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                prev_rcm BLOB NOT NULL,
+                rcm BLOB NOT NULL,
+                psi BLOB NOT NULL,
+                cmx BLOB NOT NULL,
+                nullifier BLOB NOT NULL,
+                txid BLOB NOT NULL,
+                tx_index INTEGER NOT NULL,
+                action_index INTEGER NOT NULL,
+                memo BLOB NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO registry_account (id, ufvk, network, birthday, sync_height, sync_hash)
+             VALUES (0, 'ufvk', 'test', 90, 100, ?1)",
+            params![vec![1u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('alice', 120, 'claim', 'u', 'none', x'00', x'00', x'00', x'00', x'00', x'00', 0, 0, x'00')",
+            [],
+        )
+        .unwrap();
+
+        crate::registry::storage::install_schema(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+        let birthday: i64 = conn
+            .query_row(
+                "SELECT birthday FROM registry_account WHERE id = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(birthday, 90);
+        assert!(checkpoint(&conn).unwrap().is_none());
+        let names: i64 = conn
+            .query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(names, 0);
     }
 
     #[test]
@@ -2832,6 +2977,102 @@ mod admission {
             })
             .unwrap();
         assert_eq!(height, 100);
+    }
+
+    /// A claim whose expiry falls inside the standard window of the latest
+    /// release was built before that release. The anchor retires and the
+    /// successor stays out. A claim built after the release registers.
+    #[test]
+    fn a_claim_built_before_a_release_does_not_register() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fvk = fvk();
+        let release_height = 110u32;
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('alice', ?1, 'release', 'u', 'none', x'00', x'00', x'00', x'00', x'00', x'11', 0, 0, x'00')",
+            params![release_height],
+        )
+        .unwrap();
+
+        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let stale = vec![candidate(
+            &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
+        )];
+        let inside = release_height + DEFAULT_TX_EXPIRY_DELTA;
+        assert!(admitted_claim_successor(
+            &tx,
+            &stale,
+            [1; 32],
+            &HashSet::new(),
+            &fvk,
+            Some(inside),
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            admitted_claim_successor(&tx, &stale, [1; 32], &HashSet::new(), &fvk, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let seeded = seeded_lineage(&[1]);
+        let mut stale_law = tx_law_for(
+            [1; 32],
+            seeded.clone(),
+            vec![Adoption { nf: nf(200) }],
+            vec![Retirement { nf: nf(1) }],
+            true,
+        );
+        stale_law.facts.claim_successor = false;
+        let mut lineage = seeded;
+        lineage.step_tx(120, &stale_law.facts);
+        assert!(!lineage.contains(&nf(200)));
+        assert!(!lineage.contains(&nf(1)));
+        let mut live_names: HashSet<TipNf> = HashSet::new();
+        apply_candidates(&tx, 120, None, &stale, &mut live_names, &[stale_law], &fvk).unwrap();
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+
+        let past = release_height + DEFAULT_TX_EXPIRY_DELTA + 1;
+        assert!(
+            admitted_claim_successor(&tx, &stale, [1; 32], &HashSet::new(), &fvk, Some(past),)
+                .unwrap()
+                .is_some()
+        );
+        let mut fresh_law = tx_law_for(
+            [1; 32],
+            lineage.clone(),
+            vec![Adoption { nf: nf(201) }],
+            vec![Retirement { nf: nf(2) }],
+            true,
+        );
+        lineage.adopt(110, nf(2));
+        fresh_law.snapshot = lineage.clone();
+        lineage.step_tx(121, &fresh_law.facts);
+        assert!(lineage.contains(&nf(201)));
+        apply_candidates(&tx, 121, None, &stale, &mut live_names, &[fresh_law], &fvk).unwrap();
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
+    }
+
+    /// An implicit release is a release record. A later claim ends the window.
+    #[test]
+    fn an_implicit_release_starts_the_expiry_window() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
+             VALUES ('alice', 110, x'11', 0, 0, x'22')",
+            [],
+        )
+        .unwrap();
+        let inside = 110 + DEFAULT_TX_EXPIRY_DELTA;
+        assert!(built_before_release(&conn, "alice", Some(inside)).unwrap());
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('alice', 130, 'claim', 'u', 'none', x'00', x'00', x'00', x'00', x'00', x'33', 0, 0, x'00')",
+            [],
+        )
+        .unwrap();
+        assert!(!built_before_release(&conn, "alice", Some(inside)).unwrap());
     }
 
     /// An update that also spends a live anchor does not renew the name.
@@ -3618,6 +3859,7 @@ mod admission {
                 hash: BlockHash([2; 32]),
             },
             &[tx],
+            &HashMap::new(),
             &[(10, 1_000)],
             &fvk(),
             Lineage::new(),

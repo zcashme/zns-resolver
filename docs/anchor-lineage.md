@@ -36,7 +36,10 @@ authority — is a pure function of position-ordered chain facts:
    turned out to be — including a candidate-free Registry spend;
 3. a **successor** joins one-for-one — including while the pool is
    short — only when the claim is admitted. The claim spends exactly
-   one live anchor, spends no name note, and the name is free. A
+   one live anchor, spends no name note, and the name is free. After a
+   release, the claim's expiry must sit past the standard expiry window
+   of that release. A claim inside the window was built before the
+   release: the anchor retires and the successor stays out. A
    duplicate on a live name, or a claim that also spends a name note,
    retires the anchor and leaves the successor out. A note cannot
    create a new claim permission on its own. It only replaces the one
@@ -69,7 +72,10 @@ at the candidate's transaction position:
 3. the transaction's registry outputs are exactly one note, and that
    note is zero-value;
 4. the name is free (the chain rule: `prev_rcm_for(non-release tip, Claim)
-   → None`).
+   → None`);
+5. when the latest record is a release, the transaction expiry sits past
+   that release's height plus the standard expiry delta (40). A claim
+   inside that window was built before the release.
 
 The anchor spend and the name note are not the same action. The mint's
 builder places fee inputs between them, so requiring the name note's own
