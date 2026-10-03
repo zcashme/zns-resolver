@@ -2,16 +2,23 @@
 
 use std::sync::{Arc, Mutex};
 
+use orchard::keys::FullViewingKey;
 use rusqlite::Connection;
 use zcash_protocol::consensus::Network;
 use zns_verify::Action;
 
 mod anchor_lineage;
+pub(crate) mod batch;
 pub(crate) mod core;
 mod nf;
 mod notes;
-pub(crate) mod scanned;
 pub(crate) mod storage;
+
+/// The local registry replica and the key used to verify its name notes.
+pub(crate) struct Registry {
+    pub(crate) db: Db,
+    pub(crate) fvk: FullViewingKey,
+}
 
 // ── Db handle ───────────────────────────────────────────────────────────────
 
