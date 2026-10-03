@@ -1,5 +1,6 @@
 //! ZNS-specific persistence on top of seer-sync's generic scan pipeline.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -117,7 +118,7 @@ impl Account for Registry {
         &self,
         at: SeerCursor,
         blocks: &[seer_sync::proto::CompactBlock],
-        _full_txs: &[(TxId, BlockHeight, Transaction)],
+        full_txs: &[(TxId, BlockHeight, Transaction)],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let batch = self
             .pending
@@ -145,11 +146,16 @@ impl Account for Registry {
             core::lineage_facts(&conn)?
         };
         let lineage = core::fold_lineage(facts);
+        let mut expiries = HashMap::with_capacity(full_txs.len());
+        for (txid, _, tx) in full_txs {
+            expiries.insert(*txid.as_ref(), u32::from(tx.expiry_height()));
+        }
         let conn = self.db.lock();
         core::apply_batch(
             &conn,
             at,
             &batch.transactions,
+            &expiries,
             &block_times,
             &self.fvk,
             lineage,
