@@ -11,9 +11,8 @@ mod jsonrpc; // API implementation
 mod registry; // Name index Database
 mod sync; // Sync Loop
 
-use orchard::keys::FullViewingKey;
 use seer_sync::UnifiedFullViewingKey;
-use sync::{live_tip, run_indexer, Pending};
+use sync::{live_tip, Pending, Registry};
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
@@ -57,14 +56,6 @@ const MINT_BIRTHDAY: u32 = 4_338_933;
 
 const RPC_ADDR: &str = "127.0.0.1:8080"; // where clients send JSON-RPC name queries
 
-/// The registry: the resolver's local registry replica, wearing seer-sync's
-/// `Account` face — the scan pipeline applies chain observations to it.
-pub(crate) struct Registry {
-    pub(crate) db: Db,
-    pub(crate) fvk: FullViewingKey,
-    pub(crate) pending: Pending,
-}
-
 /// The mainnet placeholder is an all-`q` bech32 body. A real viewing key is not.
 fn ufvk_is_placeholder(ufvk: &str) -> bool {
     match ufvk.strip_prefix("ufvk1") {
@@ -104,7 +95,7 @@ async fn main() {
 
     // --- Network path: the live chain head, observed and published ---
     let (tip_tx, tip_rx) = tokio::sync::watch::channel(None);
-    tokio::spawn(live_tip(tip_tx));
+    tokio::spawn(live_tip(tip_tx, NETWORK));
 
     // --- Persistent layer bootstrap. Without it there is nothing to serve. ---
     let db = match Db::open(UFVK, MINT_BIRTHDAY, DB_PATH) {
@@ -124,8 +115,20 @@ async fn main() {
         }
     };
 
-    // --- The indexer: everything passed — run forever ---
-    run_indexer(db, UFVK, fvk, MINT_BIRTHDAY).await;
+    // --- The indexer: run forever, reconnecting when sync returns ---
+    tracing::info!(network = ?NETWORK, birthday = MINT_BIRTHDAY, "starting indexer");
+    let account = Registry {
+        db,
+        fvk,
+        pending: Pending::new(),
+    };
+
+    loop {
+        if let Err(error) = seer_sync::run(UFVK, NETWORK, &account).await {
+            tracing::warn!(%error, "sync error; reconnecting");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 #[cfg(test)]

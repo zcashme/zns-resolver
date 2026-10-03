@@ -10,20 +10,26 @@ use seer_sync::sync::scan::{OrchardSpend, WalletOutput, WalletTx};
 use seer_sync::{Account, Cursor as SeerCursor, Resume};
 use tokio::sync::watch;
 use zcash_primitives::transaction::{Transaction, TxId};
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, Network};
 
 use crate::registry::{core, Db};
-use crate::Registry;
+
+/// The resolver's local registry replica as a seer-sync account.
+pub(crate) struct Registry {
+    pub(crate) db: Db,
+    pub(crate) fvk: FullViewingKey,
+    pub(crate) pending: Pending,
+}
 
 /// The network path: observes the chain head live and publishes it to status
 /// readers. Separate from the indexer — the tip is an observation, never
 /// correctness state, so it is never persisted.
-pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<u32>>) {
-    let mut client = LwdClient::connect_auto(crate::NETWORK).await.ok();
+pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<u32>>, network: Network) {
+    let mut client = LwdClient::connect_auto(network).await.ok();
 
     loop {
         if client.is_none() {
-            client = LwdClient::connect_auto(crate::NETWORK).await.ok();
+            client = LwdClient::connect_auto(network).await.ok();
             if client.is_none() {
                 tracing::warn!("no lightwalletd server for the tip publisher; retrying");
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -38,30 +44,10 @@ pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<u32>>) {
             }
             Err(error) => {
                 tracing::warn!(%error, "tip poll failed; reconnecting");
-                client = LwdClient::connect_auto(crate::NETWORK).await.ok();
+                client = LwdClient::connect_auto(network).await.ok();
             }
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
-    }
-}
-
-/// Runs the name indexer forever: drives seer-sync's scan pipeline so newly
-/// published name notes are verified and indexed as they arrive.
-pub(crate) async fn run_indexer(db: Db, ufvk: &str, fvk: FullViewingKey, birthday: u32) {
-    tracing::info!(network = ?crate::NETWORK, birthday, "starting indexer");
-    let account = Registry {
-        db,
-        fvk,
-        pending: Pending::new(),
-    };
-
-    // seer-sync's run loops internally until an error; any return is a
-    // restart, never a hot loop.
-    loop {
-        if let Err(error) = seer_sync::run(ufvk, crate::NETWORK, &account).await {
-            tracing::warn!(%error, "sync error; reconnecting");
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
