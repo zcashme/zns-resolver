@@ -2,14 +2,20 @@
 
 use rusqlite::Connection;
 
-/// The SQL to create the name index tables (and supporting state).
-/// Run once by the writer connection at startup.
-pub(crate) const SCHEMA_SQL: &str = r#"
-PRAGMA journal_mode = WAL;
+/// Connection-local settings. WAL mode persists in the database file, but
+/// these apply only to the current connection, so they must be reapplied on
+/// every open — not just when a fresh database is initialized.
+pub(crate) const CONNECTION_SQL: &str = r#"
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
+"#;
+
+/// The SQL to create the name index tables (and supporting state).
+/// Run once, when an empty database file is initialized.
+pub(crate) const SCHEMA_SQL: &str = r#"
+PRAGMA journal_mode = WAL;
 
 CREATE TABLE IF NOT EXISTS registry_account (
     id          INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
@@ -99,6 +105,7 @@ PRAGMA user_version = 1;
 /// Opens only this schema. An older database must be removed by the operator
 /// and rebuilt by scanning from the birthday; no old checkpoint is reused.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(CONNECTION_SQL)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let application_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
     let objects: i64 = conn.query_row(
@@ -118,4 +125,37 @@ pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
         "unsupported registry database; remove the old SQLite file and rescan"
     );
     Err(rusqlite::Error::InvalidQuery)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The connection-local pragmas survive into later opens: the fast path
+    /// for an already-marked database must not skip them.
+    #[test]
+    fn connection_settings_apply_on_every_open() {
+        // A process-unique directory: parallel test runs must not share it.
+        let dir =
+            std::env::temp_dir().join(format!("zns-install-schema-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("connection-settings.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        let conn = Connection::open(&path).unwrap();
+        install_schema(&conn).unwrap();
+        drop(conn);
+
+        // A fresh connection on an existing database: the early-return path.
+        let conn = Connection::open(&path).unwrap();
+        install_schema(&conn).unwrap();
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        let checkpoint: i64 = conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous = NORMAL on reopen");
+        assert_eq!(checkpoint, 5000, "checkpoint threshold survives reopen");
+    }
 }
