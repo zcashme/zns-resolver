@@ -2,15 +2,20 @@
 
 use rusqlite::Connection;
 
-/// The SQL to create the name index tables (and supporting state).
-/// Run once by the writer connection at startup.
-pub(crate) const SCHEMA_SQL: &str = r#"
-PRAGMA user_version = 6;
-PRAGMA journal_mode = WAL;
+/// Connection-local settings. WAL mode persists in the database file, but
+/// these apply only to the current connection, so they must be reapplied on
+/// every open — not just when a fresh database is initialized.
+pub(crate) const CONNECTION_SQL: &str = r#"
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 5000;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
+"#;
+
+/// The SQL to create the name index tables (and supporting state).
+/// Run once, when an empty database file is initialized.
+pub(crate) const SCHEMA_SQL: &str = r#"
+PRAGMA journal_mode = WAL;
 
 CREATE TABLE IF NOT EXISTS registry_account (
     id          INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
@@ -91,72 +96,66 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
 );
 CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 
+-- Older databases used user_version = 1 but never this application ID.
+-- Mark the schema only after all tables have been created.
+PRAGMA application_id = 1515082545; -- ZNS1
+PRAGMA user_version = 1;
 "#;
 
-/// Installs the schema, wiping pre-lineage databases. A database written
-/// before the anchor-fact tables cannot be upgraded in place: the old
-/// watch table lacks value and canonical-position data, and its names
-/// rows lack tx_index. The version gate drops everything and reinstalls,
-/// so the next open rescans from the configured birthday. A version 1
-/// database has tips and no confirmation times. Keeping those rows would
-/// admit a clock-due update as a renewal. A version 2 database stored
-/// every one-candidate zero-value note as a successor, so an update or a
-/// claim with a second registry output would seat an anchor the mint
-/// rejects. A version 3 database stored every zero-value note, so the
-/// pool can contain anchors the keygen transaction did not create, and a
-/// name may have been bound to one of them. A version 4 database stored
-/// a successor for every claim-shaped note, including a claim that was
-/// not admitted. A later claim may already have spent that successor and
-/// been recorded. A replay from the birthday would not admit that later
-/// claim, because the successor it spent would never have entered the
-/// pool. A version 5 database did not store transaction expiry. A claim
-/// built before the latest release may have been admitted, and a later
-/// claim may have spent its successor. Those scans cannot be replayed
-/// into the mint's pool. In each case the chain tables and the checkpoint
-/// are dropped and the next open replays from the birthday.
+/// Opens only this schema. An older database must be removed by the operator
+/// and rebuilt by scanning from the birthday; no old checkpoint is reused.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(CONNECTION_SQL)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version < 1 {
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS registry_account;
-             DROP TABLE IF EXISTS name_events;
-             DROP TABLE IF EXISTS names;
-             DROP TABLE IF EXISTS watched_ironwood_notes;
-             DROP TABLE IF EXISTS anchor_facts;
-             DROP TABLE IF EXISTS implicit_releases;
-             DROP TABLE IF EXISTS block_times;",
-        )?;
-    } else if version < 6 {
-        if version == 1 {
-            tracing::warn!(
-                "schema version 1 has no confirmation times; dropping the scan so it replays from the birthday"
-            );
-        } else if version == 2 {
-            tracing::warn!(
-                "schema version 2 cannot tell a claim successor from any other zero-value note; dropping the scan so it replays from the birthday"
-            );
-        } else if version == 3 {
-            tracing::warn!(
-                "schema version 3 stored every zero-value note; the ceremony is only the keygen transaction, so the scan replays from the birthday"
-            );
-        } else if version == 4 {
-            tracing::warn!(
-                "schema version 4 kept a successor for a claim that was not admitted; a later claim may have spent it, so the scan replays from the birthday"
-            );
-        } else {
-            tracing::warn!(
-                "schema version 5 admitted a claim built before the latest release; the scan replays from the birthday"
-            );
-        }
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS name_events;
-             DROP TABLE IF EXISTS names;
-             DROP TABLE IF EXISTS anchor_facts;
-             DROP TABLE IF EXISTS implicit_releases;
-             DROP TABLE IF EXISTS block_times;
-             UPDATE registry_account SET sync_height = NULL, sync_hash = NULL WHERE id = 0;",
-        )?;
+    let application_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+    let objects: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+        [],
+        |r| r.get(0),
+    )?;
+    if objects == 0 && version == 0 && application_id == 0 {
+        return conn.execute_batch(SCHEMA_SQL);
     }
-    conn.execute_batch(SCHEMA_SQL)?;
-    Ok(())
+    if version == 1 && application_id == 1515082545 {
+        return Ok(());
+    }
+    tracing::error!(
+        version,
+        application_id,
+        "unsupported registry database; remove the old SQLite file and rescan"
+    );
+    Err(rusqlite::Error::InvalidQuery)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The connection-local pragmas survive into later opens: the fast path
+    /// for an already-marked database must not skip them.
+    #[test]
+    fn connection_settings_apply_on_every_open() {
+        // A process-unique directory: parallel test runs must not share it.
+        let dir =
+            std::env::temp_dir().join(format!("zns-install-schema-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("connection-settings.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        let conn = Connection::open(&path).unwrap();
+        install_schema(&conn).unwrap();
+        drop(conn);
+
+        // A fresh connection on an existing database: the early-return path.
+        let conn = Connection::open(&path).unwrap();
+        install_schema(&conn).unwrap();
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        let checkpoint: i64 = conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous = NORMAL on reopen");
+        assert_eq!(checkpoint, 5000, "checkpoint threshold survives reopen");
+    }
 }
