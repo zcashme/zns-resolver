@@ -117,7 +117,7 @@ impl Account for Registry {
     fn apply_blocks(
         &self,
         at: SeerCursor,
-        blocks: &[seer_sync::proto::CompactBlock],
+        _blocks: &[seer_sync::proto::CompactBlock],
         full_txs: &[(TxId, BlockHeight, Transaction)],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let batch = self
@@ -129,14 +129,6 @@ impl Account for Registry {
             return Err(
                 ScanBatchError("compact blocks do not match the pending scan batch").into(),
             );
-        }
-        let mut block_times = Vec::with_capacity(blocks.len());
-        for block in blocks {
-            let height = u32::try_from(block.height)
-                .map_err(|_| ScanBatchError("compact block height does not fit"))?;
-            if block.time != 0 {
-                block_times.push((height, u64::from(block.time)));
-            }
         }
         // Fold the snapshot without the connection so a name query is not
         // stuck behind the replay. The indexer is the only writer, so the
@@ -156,7 +148,6 @@ impl Account for Registry {
             at,
             &batch.transactions,
             &expiries,
-            &block_times,
             &self.fvk,
             lineage,
         )?;
