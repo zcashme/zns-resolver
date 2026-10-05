@@ -41,7 +41,6 @@ CREATE TABLE IF NOT EXISTS name_events (
     txid         BLOB    NOT NULL,
     tx_index     INTEGER NOT NULL,
     action_index INTEGER NOT NULL,
-    confirmed_mtp INTEGER,
     memo         BLOB    NOT NULL,
     PRIMARY KEY (name, height, txid, action_index)
 );
@@ -62,13 +61,7 @@ CREATE TABLE IF NOT EXISTS names (
     txid         BLOB    NOT NULL,
     tx_index     INTEGER NOT NULL,
     action_index INTEGER NOT NULL,
-    confirmed_mtp INTEGER,
     memo         BLOB    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS block_times (
-    height INTEGER NOT NULL PRIMARY KEY,
-    time   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS implicit_releases (
@@ -96,8 +89,9 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
 );
 CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 
--- Older databases used user_version = 1 but never this application ID.
--- Mark the schema only after all tables have been created.
+-- The resolver keeps no confirmation-time tables: the mint owns the
+-- term and liveness clocks alone (issue #61). Mark the schema only
+-- after all tables have been created.
 PRAGMA application_id = 1515082545; -- ZNS1
 PRAGMA user_version = 1;
 "#;
