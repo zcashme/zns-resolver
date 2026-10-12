@@ -26,17 +26,14 @@ mainnet = []
 testnet = []
 
 [dependencies]
-# ZNS fork of seer-sync — relaxed Ironwood scan (Name Note candidates) via `zns-decrypt`.
-# rev is the merged watch-list fix (seer-sync #3). Switch back to a tag when
-# seer-sync-v0.4.1 is cut. Do not move the seer-sync-v0.4.0 tag.
-seer-sync = { git = "https://github.com/zcashme/seer-sync.git", rev = "707d8d930a57215957fcd99ab2d143ce4173801d", default-features = false, features = ["zns-decrypt"] }
-zns-verify = { git = "https://github.com/zcashme/zns-verify.git", tag = "v0.1.1" }
-zcash_address = "0.13"
-orchard = { version = "0.15.5", default-features = false, features = ["std"] }
-zcash_protocol = { version = "0.10", default-features = false, features = ["std"] }
-zcash_primitives = { version = "0.29", default-features = false }
-pasta_curves = "0.5"
-group = "0.13"
+seer-sync = { git = "https://github.com/zcashme/seer-sync.git", tag = "seer-sync-v0.5.0", default-features = false, features = ["zns-decrypt"] }
+zns-verify = { git = "https://github.com/zcashme/zns-verify.git", tag = "v0.1.3" }
+zcash_address = "0.14.0-pre.1"
+orchard = { version = "0.16", default-features = false, features = ["std"] }
+zcash_protocol = { version = "0.11.0-pre.0", default-features = false, features = ["std"] }
+zcash_primitives = { version = "0.31.0-pre.1", default-features = false }
+pasta_curves = "0.6"
+group = "0.14"
 rusqlite = { version = "0.32", features = ["bundled"] }
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 serde = { version = "1", features = ["derive"] }
@@ -48,7 +45,8 @@ tracing-subscriber = { version = "0.3", default-features = true }
 
 [patch.crates-io]
 # ZNS orchard fork; keeps package name `orchard` so the patched crates.io dep unifies
-# the whole graph (zcash_keys, zcash_primitives, etc.).
-orchard = { git = "https://github.com/zcashme/orchard.git", tag = "zns-orchard-v0.15.5.2" }
+# the whole graph (zcash_keys, zcash_primitives, etc.). NU7 line: fork tag ported
+# onto upstream 0.16.0 (package version 0.16.0).
+orchard = { git = "https://github.com/zcashme/orchard.git", tag = "zns-orchard-v0.16.0-pre.1" }
 [dev-dependencies]
 serde_json = "1"
