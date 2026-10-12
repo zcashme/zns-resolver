@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use orchard::keys::{FullViewingKey, Scope};
 use orchard::note::Note;
-use orchard::note::NoteCommitTrapdoor;
 use orchard::note::Nullifier;
+use orchard::note::{NoteCommitTrapdoor, Psi};
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
 use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
@@ -226,12 +226,20 @@ pub(crate) fn apply_batch(
                 // Gate: the bound UA must decode as a Unified Address on this
                 // network (restores 304193b, lost in the #27 refactor).
                 let ua = note.ua().as_str();
-                let Some((ua_network, _)) = zcash_address::unified::Address::decode(ua).ok() else {
+                let Some((ua_network, revision, _)) =
+                    zcash_address::unified::Address::decode(ua).ok()
+                else {
                     candidate_dropped("ua does not decode", &txid, *action_index);
                     continue;
                 };
                 if ua_network != crate::NETWORK.network_type() {
                     candidate_dropped("ua is for another network", &txid, *action_index);
+                    continue;
+                }
+                // The mint only speaks revision-0 unified encoding (ZIP 316);
+                // a later revision is a UA the mint cannot have produced.
+                if revision != zcash_protocol::address::Revision::R0 {
+                    candidate_dropped("ua is not revision 0", &txid, *action_index);
                     continue;
                 }
 
@@ -1116,7 +1124,7 @@ fn admit_nullifier(candidate: &Candidate, fvk: &FullViewingKey) -> Option<TipNf>
         .zns_nullifier(
             fvk,
             NoteCommitTrapdoor::from_inner(candidate.rcm),
-            candidate.psi,
+            Psi::from_inner(candidate.psi),
         )
         .map(TipNf::from_scan)
 }
@@ -2367,9 +2375,12 @@ mod admission {
         } else {
             NetworkType::Main
         };
-        unified::Address::try_from_items(vec![unified::Receiver::Orchard([0x03; 43])])
-            .expect("orchard-only UA")
-            .encode(&network)
+        unified::Address::try_from_items(
+            zcash_protocol::address::Revision::R0,
+            vec![unified::Uitem::Data(unified::Receiver::Orchard([0x03; 43]))],
+        )
+        .expect("orchard-only UA")
+        .encode(&network)
     }
 
     fn memo_for(action: &str, name: &str, prev: &[u8; 32]) -> Memo {
