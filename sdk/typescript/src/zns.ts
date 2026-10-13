@@ -319,7 +319,8 @@ export class ZNS {
         ? setTimeout(() => controller.abort(), this.timeoutMs)
         : null;
     const forward = () => controller.abort();
-    signal?.addEventListener("abort", forward);
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener("abort", forward);
     try {
       const res = await fetch(this.url, {
         method: "POST",

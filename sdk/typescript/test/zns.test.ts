@@ -343,6 +343,21 @@ describe("ZNS", () => {
       await vi.advanceTimersByTimeAsync(60);
       await assertion;
     });
+
+    it("rejects when the caller's signal is already aborted", async () => {
+      const z = new ZNS({ url: "https://resolver.example" });
+      const controller = new AbortController();
+      controller.abort();
+      vi.stubGlobal("fetch", vi.fn(async (
+        _url: string,
+        init: { signal: AbortSignal },
+      ) => {
+        if (init.signal.aborted) throw new Error("This operation was aborted");
+        return { ok: true, json: async () => ({ result: {} }) };
+      }));
+
+      await expect(z.status(controller.signal)).rejects.toThrow(/aborted/);
+    });
   });
 
 });
