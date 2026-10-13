@@ -19,7 +19,8 @@ export interface Status {
   synced?: boolean;
   /** Registry viewing key. */
   viewingKey: string;
-  registered: number;
+  /** Treasury payment address, published by the mint. */
+  treasuryAddress?: string;
 }
 
 /** Paginated result envelope from the typed list verbs (`list_names`,

@@ -116,25 +116,6 @@ describe("ZNS", () => {
       vi.unstubAllGlobals();
     });
 
-    it("returns the current resolver status shape", async () => {
-      vi.stubGlobal("fetch", vi.fn(async () => ({
-        ok: true,
-        json: async () => ({ result: {
-          synced_height: 123,
-          synced: true,
-          viewing_key: "ufvk-test",
-          registered: 7,
-        } }),
-      })));
-
-      await expect(zns.status()).resolves.toEqual({
-        syncedHeight: 123,
-        synced: true,
-        viewingKey: "ufvk-test",
-        registered: 7,
-      });
-    });
-
     it("sends lowercase event filters using resolver parameter names", async () => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
@@ -251,7 +232,6 @@ describe("ZNS", () => {
       stubStatus({
         synced_height: 1,
         viewing_key: ZNS_NETWORKS.testnet.viewingKey,
-        registered: 1,
       });
       await expect(z.verify()).resolves.toBeUndefined();
     });
@@ -261,7 +241,6 @@ describe("ZNS", () => {
       stubStatus({
         synced_height: 1,
         viewing_key: ZNS_NETWORKS.mainnet.viewingKey,
-        registered: 70,
       });
       await expect(z.verify()).resolves.toBeUndefined();
     });
@@ -280,7 +259,6 @@ describe("ZNS", () => {
         json: async () => ({ result: {
           synced_height: 3516184,
           viewing_key: ZNS_NETWORKS.mainnet.viewingKey,
-          registered: 70,
         } }),
       })));
 
@@ -290,7 +268,7 @@ describe("ZNS", () => {
 
     it("throws with upgrade guidance on a key mismatch", async () => {
       const z = new ZNS({ network: "testnet", url: "https://resolver.example" });
-      stubStatus({ synced_height: 1, viewing_key: "uviewtest1rotated", registered: 1 });
+      stubStatus({ synced_height: 1, viewing_key: "uviewtest1rotated" });
       await expect(z.verify()).rejects.toThrow(/registry rotation\. Upgrade zcashname-sdk/);
     });
   });
