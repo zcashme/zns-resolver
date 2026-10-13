@@ -19,20 +19,7 @@ export interface Status {
   synced?: boolean;
   /** Registry viewing key. */
   viewingKey: string;
-  /** Legacy mainnet indexer pricing: admin-set zats tiers indexed by name
-   *  length, the last tier is the catchall. Only the legacy mainnet indexer
-   *  serves pricing today. */
-  pricing?: Pricing;
   registered: number;
-}
-
-/** Legacy mainnet indexer pricing: admin-set zats tiers indexed by name
- *  length, the last tier is the catchall for longer names. The current
- *  (Name Note) resolver does not serve pricing. */
-export interface Pricing {
-  nonce: number;
-  height: number;
-  tiers: number[];
 }
 
 /** Paginated result envelope from the typed list verbs (`list_names`,
