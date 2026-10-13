@@ -67,8 +67,8 @@ The SDK carries the pricing law (mirrors the mint):
 ```ts
 import { ZNS_PRICING, annualUsd, foreverUsd } from "zcashname-sdk";
 
-annualUsd("alice"); // 800 — USD per year (3-char tier)
-foreverUsd("alice"); // 2400 — one-time
+annualUsd("alice"); // 100 — USD per year (5-char tier)
+foreverUsd("alice"); // 300 — one-time
 ```
 
 Tiers: 1-char $10,000/yr · 2-char $2,500 · 3-char $800 · 4-char $400 ·
