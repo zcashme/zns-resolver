@@ -19,6 +19,19 @@ use super::records::{EventsPage, NameEvent, NameRecord, Paginated, ResolveResult
 /// first poll lands.
 type ChainTip = watch::Receiver<Option<u32>>;
 
+/// Treasury payment address, published by the mint. Hardcoded on purpose:
+/// this is protocol-level identity, not deployment config. Claim payments
+/// are displayed against this address; nothing verifies funds against it.
+/// Mainnet and testnet treasuries are distinct, like the registry UFVK.
+///
+/// TODO(zcashme): replace both with the mint-published values before merge.
+#[cfg(feature = "mainnet")]
+const TREASURY_ADDRESS: &str =
+    "u1PLACEHOLDER-MAINNET-TREASURY-ADDRESS-REPLACE-WITH-MINT-PUBLISHED-VALUE";
+#[cfg(feature = "testnet")]
+const TREASURY_ADDRESS: &str =
+    "utest1PLACEHOLDER-TESTNET-TREASURY-ADDRESS-REPLACE-WITH-MINT-PUBLISHED-VALUE";
+
 /// Public JSON-RPC API for the ZNS resolver.
 ///
 /// One query verb: `resolve` dispatches on the query — an exact name
@@ -199,7 +212,6 @@ impl ZnsApiServer for JsonRpcApi {
         let conn = self.db.lock();
         let position = core::checkpoint(&conn).map_err(RpcError::from)?;
         let viewing_key = core::registry_ufvk(&conn).map_err(RpcError::from)?;
-        let registered = core::name_count(&conn).map_err(RpcError::from)?;
         drop(conn);
 
         // The network path's live observation: None until the first poll lands.
@@ -216,7 +228,7 @@ impl ZnsApiServer for JsonRpcApi {
             synced_height: position.map_or(0, |c| u64::from(u32::from(c.height))),
             synced,
             viewing_key,
-            registered,
+            treasury_address: TREASURY_ADDRESS.to_string(),
         })
     }
 

@@ -1399,11 +1399,6 @@ pub(crate) fn registry_ufvk(conn: &Connection) -> rusqlite::Result<String> {
     )
 }
 
-pub(crate) fn name_count(conn: &Connection) -> rusqlite::Result<u64> {
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM names", [], |r| r.get(0))?;
-    Ok(n as u64)
-}
-
 pub(crate) fn resolve_by_name(
     conn: &Connection,
     name: &str,

@@ -90,8 +90,9 @@ pub struct Status {
     /// The viewing key (as a string) used to observe name bindings.
     /// Exposed so clients can verify they are talking to the expected resolver.
     pub viewing_key: String,
-    /// Total number of currently registered names.
-    pub registered: u64,
+    /// Treasury payment address, published by the mint. Informational:
+    /// displayed against claims; nothing verifies funds against it.
+    pub treasury_address: String,
 }
 
 // ── conversions: registry rows → API DTOs (total and context-free) ──────────
