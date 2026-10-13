@@ -17,10 +17,10 @@ export interface Registration {
 export interface Status {
   syncedHeight: number;
   synced?: boolean;
-  /** Registry viewing key, as served by the current (Name Note) resolver. */
-  viewingKey?: string;
-  /** Legacy mainnet indexer field (UIVK era). */
-  uivk?: string;
+  /** Registry viewing key. The current resolver serves `viewing_key`; the
+   *  legacy mainnet indexer's `uivk` is folded into this field by the SDK,
+   *  so app code never sees the legacy name. */
+  viewingKey: string;
   /** Legacy mainnet indexer fields. */
   adminPubkey?: string;
   address?: string;

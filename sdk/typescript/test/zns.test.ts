@@ -273,6 +273,22 @@ describe("ZNS", () => {
       expect(getRequest()?.method).toBe("status");
     });
 
+    it("folds the legacy mainnet uivk into viewingKey", async () => {
+      const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
+      vi.stubGlobal("fetch", vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ result: {
+          synced_height: 3516184,
+          uivk: ZNS_NETWORKS.mainnet.viewingKey,
+          registered: 70,
+        } }),
+      })));
+
+      const status = await z.status();
+      expect(status.viewingKey).toBe(ZNS_NETWORKS.mainnet.viewingKey);
+      expect((status as { uivk?: string }).uivk).toBeUndefined();
+    });
+
     it("throws with upgrade guidance on a key mismatch", async () => {
       const z = new ZNS({ network: "testnet", url: "https://resolver.example" });
       stubStatus({ synced_height: 1, viewing_key: "uviewtest1rotated", registered: 1 });
