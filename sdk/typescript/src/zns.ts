@@ -118,17 +118,10 @@ export class ZNS {
     this.timeoutMs = options.timeout;
   }
 
-  /** Fetch current server status. The legacy mainnet indexer serves its
-   *  UIVK-era key as `uivk`; this is folded into the canonical `viewingKey`
-   *  field so callers never see the legacy name. */
+  /** Fetch current server status. */
   async status(signal?: AbortSignal): Promise<Status> {
     const raw = await this.rpc<Record<string, unknown>>("status", {}, signal);
-    const normalized = normalizeApiResponse<Status & { uivk?: string }>(raw);
-    if (normalized.viewingKey === undefined && normalized.uivk !== undefined) {
-      normalized.viewingKey = normalized.uivk;
-    }
-    delete (normalized as { uivk?: string }).uivk;
-    return normalized;
+    return normalizeApiResponse<Status>(raw);
   }
 
   /**

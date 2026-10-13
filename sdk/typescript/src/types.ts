@@ -17,14 +17,11 @@ export interface Registration {
 export interface Status {
   syncedHeight: number;
   synced?: boolean;
-  /** Registry viewing key. The current resolver serves `viewing_key`; the
-   *  legacy mainnet indexer's `uivk` is folded into this field by the SDK,
-   *  so app code never sees the legacy name. */
+  /** Registry viewing key. */
   viewingKey: string;
-  /** Legacy mainnet indexer fields. */
-  adminPubkey?: string;
-  address?: string;
-  listed?: number;
+  /** Legacy mainnet indexer pricing: admin-set zats tiers indexed by name
+   *  length, the last tier is the catchall. Only the legacy mainnet indexer
+   *  serves pricing today. */
   pricing?: Pricing;
   registered: number;
 }

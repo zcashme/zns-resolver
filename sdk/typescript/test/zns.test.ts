@@ -256,11 +256,11 @@ describe("ZNS", () => {
       await expect(z.verify()).resolves.toBeUndefined();
     });
 
-    it("passes against the legacy mainnet indexer's uivk", async () => {
+    it("passes against the mainnet indexer serving viewing_key", async () => {
       const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
       stubStatus({
         synced_height: 1,
-        uivk: ZNS_NETWORKS.mainnet.viewingKey,
+        viewing_key: ZNS_NETWORKS.mainnet.viewingKey,
         registered: 70,
       });
       await expect(z.verify()).resolves.toBeUndefined();
@@ -273,20 +273,19 @@ describe("ZNS", () => {
       expect(getRequest()?.method).toBe("status");
     });
 
-    it("folds the legacy mainnet uivk into viewingKey", async () => {
+    it("reports the server's key through the single viewingKey field", async () => {
       const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
       vi.stubGlobal("fetch", vi.fn(async () => ({
         ok: true,
         json: async () => ({ result: {
           synced_height: 3516184,
-          uivk: ZNS_NETWORKS.mainnet.viewingKey,
+          viewing_key: ZNS_NETWORKS.mainnet.viewingKey,
           registered: 70,
         } }),
       })));
 
       const status = await z.status();
       expect(status.viewingKey).toBe(ZNS_NETWORKS.mainnet.viewingKey);
-      expect((status as { uivk?: string }).uivk).toBeUndefined();
     });
 
     it("throws with upgrade guidance on a key mismatch", async () => {
