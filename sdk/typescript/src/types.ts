@@ -16,9 +16,35 @@ export interface Registration {
 
 export interface Status {
   syncedHeight: number;
-  synced: boolean;
-  viewingKey: string;
+  synced?: boolean;
+  /** Registry viewing key, as served by the current (Name Note) resolver. */
+  viewingKey?: string;
+  /** Legacy mainnet indexer field (UIVK era). */
+  uivk?: string;
+  /** Legacy mainnet indexer fields. */
+  adminPubkey?: string;
+  address?: string;
+  listed?: number;
+  pricing?: Pricing;
   registered: number;
+}
+
+/** Legacy mainnet indexer pricing: admin-set zats tiers indexed by name
+ *  length, the last tier is the catchall for longer names. The current
+ *  (Name Note) resolver does not serve pricing. */
+export interface Pricing {
+  nonce: number;
+  height: number;
+  tiers: number[];
+}
+
+/** Paginated result envelope from the typed list verbs (`list_names`,
+ *  `reverse_lookup`). Mirrors the resolver's `Paginated<T>`. */
+export interface Paginated<T> {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface Event {

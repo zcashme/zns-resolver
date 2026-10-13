@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { ZNS } from "../src/zns.js";
+import { ZNS, ZNS_NETWORKS } from "../src/zns.js";
 
 const VALID_TESTNET_UA = "utest100qlkeru5c3m5kfrwe2hsmcfzmusreaza2prdyelg2kd2tr2842nceq952vay3gpmgky09fgft4z57h4z2zqzz5rcwgd4q90u54ek5yyca4s6e6y2jja9sww27kzedzznjcupcu0svq2exvq995c0lhl5zm53g4ksnm2xuwt3snv4dgh";
 const VALID_MAINNET_UA = "u1q8g0h9cn2x4eq8jd7k0d5y3zf6vhb5w4xj9tz3m5p6r2s1t0u7v8w9x0y1z";
@@ -206,6 +206,149 @@ describe("ZNS", () => {
     it("handles zcash: prefix case-insensitively", () => {
       const result = zns.parseZip321Uri("ZCASH:u1abc");
       expect(result.address).toBe("u1abc");
+    });
+  });
+
+  describe("network presets", () => {
+    it("defaults to the testnet preset (fail safe)", () => {
+      const z = new ZNS();
+      expect(z.network).toBe("testnet");
+      expect(z.url).toBe("https://light.zcash.me/zns-testnet");
+    });
+
+    it("selects the mainnet preset by network", () => {
+      const z = new ZNS({ network: "mainnet" });
+      expect(z.network).toBe("mainnet");
+      expect(z.url).toBe("https://light.zcash.me/zns-mainnet");
+    });
+
+    it("an explicit url always wins over the preset", () => {
+      const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
+      expect(z.network).toBe("mainnet");
+      expect(z.url).toBe("https://resolver.example");
+    });
+  });
+
+  describe("verify", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const stubStatus = (body: Record<string, unknown>) => {
+      let request: Record<string, unknown> | undefined;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_url: string, init: { body: string }) => {
+          request = JSON.parse(init.body);
+          return { ok: true, json: async () => ({ result: body }) };
+        }),
+      );
+      return () => request;
+    };
+
+    it("passes when the server serves the baked testnet viewing key", async () => {
+      const z = new ZNS({ network: "testnet", url: "https://resolver.example" });
+      stubStatus({
+        synced_height: 1,
+        viewing_key: ZNS_NETWORKS.testnet.viewingKey,
+        registered: 1,
+      });
+      await expect(z.verify()).resolves.toBeUndefined();
+    });
+
+    it("passes against the legacy mainnet indexer's uivk", async () => {
+      const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
+      stubStatus({
+        synced_height: 1,
+        uivk: ZNS_NETWORKS.mainnet.viewingKey,
+        registered: 70,
+      });
+      await expect(z.verify()).resolves.toBeUndefined();
+    });
+
+    it("sends a status request", async () => {
+      const z = new ZNS({ network: "testnet", url: "https://resolver.example" });
+      const getRequest = stubStatus({ viewing_key: ZNS_NETWORKS.testnet.viewingKey });
+      await z.verify();
+      expect(getRequest()?.method).toBe("status");
+    });
+
+    it("throws with upgrade guidance on a key mismatch", async () => {
+      const z = new ZNS({ network: "testnet", url: "https://resolver.example" });
+      stubStatus({ synced_height: 1, viewing_key: "uviewtest1rotated", registered: 1 });
+      await expect(z.verify()).rejects.toThrow(/registry rotation\. Upgrade zcashname-sdk/);
+    });
+  });
+
+  describe("reverseLookup and listNames", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("calls the typed reverse_lookup verb and returns the total", async () => {
+      let request: Record<string, unknown> | undefined;
+      vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
+        request = JSON.parse(init.body);
+        return { ok: true, json: async () => ({ result: {
+          items: [{
+            name: "alice",
+            address: VALID_TESTNET_UA,
+            txid: "ab".repeat(32),
+            height: 100,
+            last_action: "claim",
+            expires_at: "none",
+          }],
+          total: 3,
+          limit: 1,
+          offset: 0,
+        } }) };
+      }));
+
+      const page = await zns.reverseLookup(VALID_TESTNET_UA, 1, 0);
+      expect(request?.method).toBe("reverse_lookup");
+      expect(request?.params).toEqual({ address: VALID_TESTNET_UA, limit: 1, offset: 0 });
+      expect(page.total).toBe(3);
+      expect(page.items[0]).toMatchObject({ name: "alice", lastAction: "claim" });
+    });
+
+    it("calls the typed list_names verb", async () => {
+      let request: Record<string, unknown> | undefined;
+      vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
+        request = JSON.parse(init.body);
+        return { ok: true, json: async () => ({ result: { items: [], total: 0, limit: 50, offset: 0 } }) };
+      }));
+
+      const page = await zns.listNames(50, 10);
+      expect(request?.method).toBe("list_names");
+      expect(request?.params).toEqual({ limit: 50, offset: 10 });
+      expect(page.items).toEqual([]);
+    });
+  });
+
+  describe("timeout", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    });
+
+    it("aborts an in-flight request after the configured timeout", async () => {
+      vi.useFakeTimers();
+      const z = new ZNS({ url: "https://resolver.example", timeout: 50 });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          (_url: string, init: { signal: AbortSignal }) =>
+            new Promise((_resolve, reject) => {
+              init.signal.addEventListener("abort", () =>
+                reject(new Error("The operation was aborted")),
+              );
+            }),
+        ),
+      );
+      const pending = z.status();
+      const assertion = expect(pending).rejects.toThrow();
+      await vi.advanceTimersByTimeAsync(60);
+      await assertion;
     });
   });
 
