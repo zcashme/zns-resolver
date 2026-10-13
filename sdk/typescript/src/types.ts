@@ -16,9 +16,20 @@ export interface Registration {
 
 export interface Status {
   syncedHeight: number;
-  synced: boolean;
+  synced?: boolean;
+  /** Registry viewing key. */
   viewingKey: string;
-  registered: number;
+  /** Treasury payment address, published by the mint. */
+  treasuryAddress?: string;
+}
+
+/** Paginated result envelope from the typed list verbs (`list_names`,
+ *  `reverse_lookup`). Mirrors the resolver's `Paginated<T>`. */
+export interface Paginated<T> {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface Event {

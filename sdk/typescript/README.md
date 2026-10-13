@@ -15,13 +15,50 @@ npm install zcashname-sdk
 ```ts
 import { ZNS } from "zcashname-sdk";
 
-const zns = new ZNS({ url: "https://your-resolver.example" });
+// Pick a network preset (testnet is the default), or pass an explicit url
+// which always wins:
+const zns = new ZNS({ network: "mainnet" });
 const name = await zns.resolveName("alice");
 if (name) console.log(name.address);
 
 const available = await zns.isAvailable("bob");
 console.log(available);
 ```
+
+## Networks and verification
+
+The client ships per-network endpoint presets and the registry viewing keys
+the live resolvers serve today:
+
+```ts
+import { ZNS, ZNS_NETWORKS } from "zcashname-sdk";
+
+const zns = new ZNS({ network: "testnet", timeout: 5_000 });
+await zns.verify(); // throws unless status().viewingKey matches the baked key
+```
+
+`verify()` fails closed: either the endpoint is not the ZNS resolver, or this
+SDK predates a registry rotation — upgrade the package.
+
+> ⚠️ **0.14.0-rc releases carry placeholder registry keys** (mainnet still
+> runs the legacy indexer, whose key is UIVK-era). The final ceremony keys
+> will replace them and the rc line will be superseded. Do not pin `rc.*`
+> in anything durable.
+
+## Reverse lookup
+
+```ts
+// All names bound to an address, with the total match count:
+const page = await zns.reverseLookup("u1...", 50, 0);
+console.log(page.total, page.items.map(r => r.name));
+
+// All registered names, with the total:
+const all = await zns.listNames(50, 0);
+```
+
+These use the resolver's typed `reverse_lookup` / `list_names` verbs and
+require the current (Name Note) resolver. The legacy mainnet indexer does
+not implement them yet.
 
 ## Query data
 
