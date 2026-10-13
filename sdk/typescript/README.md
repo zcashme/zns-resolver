@@ -60,6 +60,24 @@ These use the resolver's typed `reverse_lookup` / `list_names` verbs and
 require the current (Name Note) resolver. The legacy mainnet indexer does
 not implement them yet.
 
+## Pricing
+
+The SDK carries the pricing law (mirrors the mint):
+
+```ts
+import { ZNS_PRICING, annualUsd, foreverUsd } from "zcashname-sdk";
+
+annualUsd("alice"); // 100 — USD per year (5-char tier)
+foreverUsd("alice"); // 300 — one-time
+```
+
+Tiers: 1-char $10,000/yr · 2-char $2,500 · 3-char $800 · 4-char $400 ·
+5-char $100 · 6+ chars $20. Forever costs 3× annual.
+
+Prices are **USD**. The ZEC amount charged at payment is computed by the
+mint. `quoteZats(usd, zatsPerUsd)` converts for display when a rate is
+available; no exchange rate is baked into the SDK.
+
 ## Query data
 
 ```ts

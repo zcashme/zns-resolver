@@ -8,6 +8,8 @@ import type {
   Paginated,
 } from "./types.js";
 
+export * from "./pricing.js";
+
 /** Valid ZNS name pattern: 1-63 lowercase alphanumeric chars. */
 const NAME_RE = /^[a-z0-9]{1,63}$/;
 
