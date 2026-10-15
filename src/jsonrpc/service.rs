@@ -23,14 +23,12 @@ type ChainTip = watch::Receiver<Option<u32>>;
 /// this is protocol-level identity, not deployment config. Claim payments
 /// are displayed against this address; nothing verifies funds against it.
 /// Mainnet and testnet treasuries are distinct, like the registry UFVK.
-///
-/// TODO(zcashme): replace both with the mint-published values before merge.
 #[cfg(feature = "mainnet")]
 const TREASURY_ADDRESS: &str =
-    "u1PLACEHOLDER-MAINNET-TREASURY-ADDRESS-REPLACE-WITH-MINT-PUBLISHED-VALUE";
+    "u1f68wxdxsrswjl04kcc397a9ljedg88rl8dgazrk8l9v8jx6t3gqsktvqyvmc3ypgf4pum03q4ftvy5s0fe803nrxm8kw6dgzlvnv83nv";
 #[cfg(feature = "testnet")]
 const TREASURY_ADDRESS: &str =
-    "utest1PLACEHOLDER-TESTNET-TREASURY-ADDRESS-REPLACE-WITH-MINT-PUBLISHED-VALUE";
+    "utest1tquw9k9qlsphhf30tau2qh758vfvf7xkvjea3rlc5mj4cjscgzfzgjeafjnl7r8tvv0akq3v2ze5q0azf4lnd4vf7kusrfensdsrr7tsgruvuqk0dv0hepnrk0pzgz3fj0mxc0lr29yf65nkwvw74gzep4792rkqa769lxl0sua09s0r";
 
 /// Public JSON-RPC API for the ZNS resolver.
 ///
