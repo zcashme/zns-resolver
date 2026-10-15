@@ -57,7 +57,7 @@ const MINT_BIRTHDAY: u32 = 4_504_792;
 /// Where clients send JSON-RPC name queries. Distinct per network so both
 /// resolvers can run on one host.
 #[cfg(feature = "mainnet")]
-const RPC_ADDR: &str = "127.0.0.1:8081";
+const RPC_ADDR: &str = "127.0.0.1:3031";
 #[cfg(feature = "testnet")]
 const RPC_ADDR: &str = "127.0.0.1:8080";
 
