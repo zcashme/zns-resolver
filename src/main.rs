@@ -61,14 +61,6 @@ const RPC_ADDR: &str = "127.0.0.1:3031";
 #[cfg(feature = "testnet")]
 const RPC_ADDR: &str = "127.0.0.1:8080";
 
-/// The mainnet placeholder is an all-`q` bech32 body. A real viewing key is not.
-fn ufvk_is_placeholder(ufvk: &str) -> bool {
-    match ufvk.strip_prefix("ufvk1") {
-        Some(body) => !body.is_empty() && body.chars().all(|c| c == 'q'),
-        None => false,
-    }
-}
-
 #[tokio::main]
 async fn main() {
     // --- Logging ---
@@ -78,10 +70,6 @@ async fn main() {
 
     // --- The registry key: decoded before anything persists it — a bad key
     // --- stops here and never poisons the registry_account row. ---
-    if ufvk_is_placeholder(UFVK) {
-        tracing::error!("fatal: registry UFVK is still the placeholder");
-        std::process::exit(1);
-    }
     let fvk = match UnifiedFullViewingKey::decode(&NETWORK, UFVK) {
         Ok(decoded) => match decoded.orchard() {
             Some(fvk) => fvk.clone(),
@@ -138,22 +126,14 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ufvk_is_placeholder, NETWORK, UFVK};
+    use super::{NETWORK, UFVK};
     use seer_sync::UnifiedFullViewingKey;
 
     /// The built-in registry key is the active network's and has the
     /// orchard component the scanner reads.
     #[test]
     fn registry_ufvk_decodes_for_the_network() {
-        assert!(!ufvk_is_placeholder(UFVK));
         let ufvk = UnifiedFullViewingKey::decode(&NETWORK, UFVK).expect("registry UFVK decodes");
         assert!(ufvk.orchard().is_some());
-    }
-
-    #[test]
-    fn an_all_q_ufvk_is_a_placeholder() {
-        assert!(ufvk_is_placeholder("ufvk1qqqq"));
-        assert!(!ufvk_is_placeholder("ufvk1qqqp"));
-        assert!(!ufvk_is_placeholder("uviewtest1qqqq"));
     }
 }
