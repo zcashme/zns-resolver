@@ -236,7 +236,7 @@ describe("ZNS", () => {
       await expect(z.verify()).resolves.toBeUndefined();
     });
 
-    it("passes against the mainnet indexer serving viewing_key", async () => {
+    it("passes when the server serves the baked mainnet viewing key", async () => {
       const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
       stubStatus({
         synced_height: 1,
