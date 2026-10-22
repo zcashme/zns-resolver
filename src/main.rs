@@ -68,23 +68,13 @@ async fn main() {
         .with_max_level(LevelFilter::INFO)
         .init();
 
-    // --- The registry key: decoded before anything persists it — a bad key
-    // --- stops here and never poisons the registry_account row. ---
-    let fvk = match UnifiedFullViewingKey::decode(&NETWORK, UFVK) {
-        Ok(decoded) => match decoded.orchard() {
-            Some(fvk) => fvk.clone(),
-            None => {
-                tracing::error!(
-                    "fatal: resolver is unconfigured — registry UFVK has no orchard component"
-                );
-                std::process::exit(1);
-            }
-        },
-        Err(error) => {
-            tracing::error!(error = %error, "fatal: resolver is unconfigured — registry UFVK failed to decode");
-            std::process::exit(1);
-        }
-    };
+    // --- The registry key is decoded before anything persists it: a bad key
+    // --- panics here and never poisons the registry_account row. ---
+    let fvk = UnifiedFullViewingKey::decode(&NETWORK, UFVK)
+        .expect("registry UFVK decodes")
+        .orchard()
+        .expect("registry UFVK has an orchard component")
+        .clone();
 
     // --- Network path: the live chain head, observed and published ---
     let (tip_tx, tip_rx) = tokio::sync::watch::channel(None);
