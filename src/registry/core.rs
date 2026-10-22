@@ -51,12 +51,14 @@ impl Candidate<'_> {
     }
 }
 
-/// One transaction's law context: its identity, its pre-transaction lineage
-/// snapshot, and its anchor facts. Canonical order comes from the Vec.
+/// One transaction under the law: its identity and position, the expiry
+/// the mint set on it, and its anchor facts.
 struct TxLaw {
     txid: [u8; 32],
     tx_index: u32,
-    snapshot: Lineage,
+    height: u32,
+    /// The transaction's expiry height, when the scan supplied one.
+    expiry: Option<u32>,
     facts: TxAnchorFacts,
 }
 
@@ -275,64 +277,29 @@ pub(crate) fn apply_batch(
             });
         }
 
-        // The accept-path marker per transaction: the mint offers
-        // exactly-one-candidate transactions to the law; every other
-        // transaction is follow_spends.
-        let mut candidate_counts: HashMap<[u8; 32], usize> = HashMap::new();
-        for candidate in &candidates {
-            *candidate_counts.entry(candidate.txid).or_insert(0) += 1;
-        }
+        // The law, in canonical transaction order: the mint evaluates
+        // transactions sequentially, each against the state its
+        // predecessors left. Each transaction's anchor facts land with
+        // their positions, its candidate is judged against the lineage and
+        // the name state of its own position, and its verdict is visible
+        // to the next transaction in the block.
+        let mut txs: Vec<&WalletTx> = block.iter().collect();
+        txs.sort_by_key(|tx| tx.tx_index);
+        for tx in txs {
+            let txid = *tx.txid.as_ref();
+            let tx_index = tx.tx_index;
+            let name_notes = candidates.iter().filter(|c| c.txid == txid).count();
+            let shape = claim_successor_output(tx, &candidates);
 
-        // Bookkeeping: the block's anchor facts land with their canonical
-        // positions and candidate counts.
-        for tx_data in block {
-            let txid = *tx_data.txid.as_ref();
-            let block_height = u32::from(tx_data.height);
-            let tx_index = tx_data.tx_index;
-            let candidate_count = candidate_counts.get(&txid).copied().unwrap_or(0);
-            let claim_successor = claim_successor_output(tx_data, &candidates);
-            let zero_value_notes = tx_data
-                .ironwood_outputs
-                .iter()
-                .filter(|output| {
-                    !output.is_sent && output.note.value().inner() == 0 && output.nf.is_some()
-                })
-                .count();
-            // The keygen transaction, or a claim's one successor. A
-            // zero-value note in any other transaction does not join.
-            // Spends are still recorded: a later transaction can retire
-            // an anchor this one did not create.
-            let keep_notes = keeps_anchor_note(zero_value_notes, candidate_count, claim_successor);
-            for output in &tx_data.ironwood_outputs {
-                // A payment is not an anchor fact. Storing it would grow the
-                // table the lineage rereads on every batch.
-                if !keep_notes || output.is_sent || output.note.value().inner() != 0 {
-                    continue;
-                }
-                let Some(nf) = output.nf else {
-                    continue;
-                };
-                let nf = AnchorNf::from_scan(nf);
-                db_tx.execute(
-                    "INSERT OR IGNORE INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor, spent_height)
-                     VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, NULL)",
-                    params![
-                        nf.as_bytes().as_slice(),
-                        block_height as i64,
-                        tx_index as i64,
-                        output.index as i64,
-                        candidate_count as i64,
-                        claim_successor as i64,
-                    ],
-                )?;
-            }
-            for spend in &tx_data.ironwood_spends {
+            // Spends are recorded whatever the verdict: a later transaction
+            // can retire an anchor this one did not create.
+            for spend in &tx.ironwood_spends {
                 let nf = AnchorNf::from_scan(spend.nf);
                 let updated = db_tx.execute(
                     "UPDATE anchor_facts SET spent_height = ?1, spent_tx_index = ?2, spent_action_index = ?3
                      WHERE nullifier = ?4 AND spent_height IS NULL",
                     params![
-                        block_height as i64,
+                        height as i64,
                         tx_index as i64,
                         spend.index as i64,
                         nf.as_bytes().as_slice()
@@ -343,28 +310,13 @@ pub(crate) fn apply_batch(
                 if updated == 0 && !live_names.contains(&TipNf::from_revealed(&nf)) {
                     tracing::debug!(
                         nullifier = ?nf.as_bytes(),
-                        height = block_height,
+                        height,
                         tx_index,
                         "spend matched no anchor fact"
                     );
                 }
             }
-        }
 
-        // Per-transaction anchor facts and pre-transaction lineage
-        // snapshots, in canonical order: a candidate is judged against the
-        // lineage its own transaction was judged against.
-        let mut txs: Vec<&WalletTx> = block.iter().collect();
-        txs.sort_by_key(|tx| tx.tx_index);
-        let mut tx_law: Vec<TxLaw> = Vec::new();
-        // Earlier transactions in this block are not in the table yet.
-        // A later claim is judged against the name state they left.
-        let mut batch_names: HashMap<String, BatchName> = HashMap::new();
-        for tx in txs {
-            let txid = *tx.txid.as_ref();
-            let tx_index = tx.tx_index;
-            let name_notes = candidate_counts.get(&txid).copied().unwrap_or(0);
-            let shape = claim_successor_output(tx, &candidates);
             let adoptions: Vec<Adoption> = tx
                 .ironwood_outputs
                 .iter()
@@ -372,101 +324,67 @@ pub(crate) fn apply_batch(
                 .filter_map(|o| o.nf.map(AnchorNf::from_scan))
                 .map(|nf| Adoption { nf })
                 .collect();
-            let mut facts = TxAnchorFacts {
-                adoptions: if keeps_anchor_note(adoptions.len(), name_notes, shape) {
-                    adoptions
-                } else {
-                    Vec::new()
-                },
-                retirements: tx
-                    .ironwood_spends
-                    .iter()
-                    .map(|s| Retirement {
-                        nf: AnchorNf::from_scan(s.nf),
-                    })
-                    .collect(),
-                has_single_name_note: name_notes == 1,
-                name_notes,
-                claim_successor: false,
-            };
-            let snapshot = lineage.clone();
-            let spent_a_live_name = facts
-                .retirements
-                .iter()
-                .any(|r| live_names.contains(&TipNf::from_revealed(&r.nf)));
-            let one_live_anchor = snapshot.live_retirements(&facts) == 1;
-            let preceding = candidates
-                .iter()
-                .find(|candidate| candidate.txid == txid)
-                .map(|candidate| preceding_name(&batch_names, candidate.name()))
-                .unwrap_or(PrecedingName::Unchanged);
-            let admitted = if shape && one_live_anchor && !spent_a_live_name {
-                admitted_claim_successor(
-                    &db_tx,
-                    &candidates,
-                    txid,
-                    fvk,
-                    expiries.get(&txid).copied(),
-                    preceding,
-                )?
-            } else {
-                None
-            };
-            if shape && admitted.is_none() {
-                // The note was stored from its output shape. A rejected
-                // claim does not keep it: the fold would seat it later.
-                if let Some(adoption) = facts.adoptions.first() {
-                    db_tx.execute(
-                        "DELETE FROM anchor_facts WHERE nullifier = ?1",
-                        params![adoption.nf.as_bytes().as_slice()],
-                    )?;
-                }
-                facts.adoptions.clear();
-            }
-            facts.claim_successor = admitted.is_some();
-            if let Some(nullifier) = admitted {
-                if let Some(candidate) = candidates.iter().find(|c| c.txid == txid) {
-                    batch_names.insert(
-                        candidate.name().to_string(),
-                        BatchName::Claimed {
-                            nullifier,
-                            action: candidate.note.action(),
-                            rcm: scalar_bytes(&candidate.rcm),
-                        },
-                    );
-                }
-                live_names.insert(nullifier);
-            } else if let Some((name, consumed)) = standing_release(
-                &db_tx,
-                &candidates,
-                txid,
-                &ReleaseView {
-                    facts: &facts,
-                    snapshot: &snapshot,
-                    live_names: &live_names,
-                    batch: &batch_names,
-                },
-                fvk,
-            )? {
-                // A release earlier in the block frees the name before a
-                // later claim is judged. The table still holds the old tip.
-                batch_names.insert(name, BatchName::Released(height));
-                live_names.remove(&consumed);
-            }
-            lineage.step_tx(height, &facts);
-            tx_law.push(TxLaw {
+            let mut law = TxLaw {
                 txid,
                 tx_index,
-                snapshot,
-                facts,
-            });
+                height,
+                expiry: expiries.get(&txid).copied(),
+                facts: TxAnchorFacts {
+                    // The keygen transaction's notes, or a claim's one
+                    // successor. A zero-value note in any other transaction
+                    // does not join.
+                    adoptions: if keeps_anchor_note(adoptions.len(), name_notes, shape) {
+                        adoptions
+                    } else {
+                        Vec::new()
+                    },
+                    retirements: tx
+                        .ironwood_spends
+                        .iter()
+                        .map(|s| Retirement {
+                            nf: AnchorNf::from_scan(s.nf),
+                        })
+                        .collect(),
+                    has_single_name_note: name_notes == 1,
+                    name_notes,
+                    // The output shape; the verdict narrows it.
+                    claim_successor: shape,
+                },
+            };
+            let seated =
+                apply_transaction(&db_tx, &candidates, &law, &lineage, &mut live_names, fvk)?;
+            // A rejected claim's zero-value note is not a successor: the
+            // fold would seat it later.
+            if shape && !seated {
+                law.facts.adoptions.clear();
+            }
+            law.facts.claim_successor = seated;
+            // A payment is not an anchor fact. Storing it would grow the
+            // table the lineage rereads on every batch.
+            if !law.facts.adoptions.is_empty() {
+                for output in &tx.ironwood_outputs {
+                    if output.is_sent || output.note.value().inner() != 0 {
+                        continue;
+                    }
+                    let Some(nf) = output.nf else {
+                        continue;
+                    };
+                    db_tx.execute(
+                        "INSERT OR IGNORE INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, claim_successor, spent_height)
+                         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, NULL)",
+                        params![
+                            AnchorNf::from_scan(nf).as_bytes().as_slice(),
+                            height as i64,
+                            tx_index as i64,
+                            output.index as i64,
+                            name_notes as i64,
+                            seated as i64,
+                        ],
+                    )?;
+                }
+            }
+            lineage.step_tx(height, &law.facts);
         }
-
-        // Consideration: canonical transaction order — the mint evaluates
-        // transactions sequentially, each against the state its
-        // predecessors left. The accept path admits at most one candidate
-        // per transaction, so this is a total order over admissions.
-        apply_candidates(&db_tx, height, &candidates, &mut live_names, &tx_law, fvk)?;
     }
 
     set_checkpoint_in_tx(&db_tx, &scanned)?;
@@ -538,170 +456,6 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
     Ok(events)
 }
 
-/// The mint's successor output: one registry output, zero-value and
-/// received, and the transaction's one name note is a claim. A sent note
-/// is not stored as an adoption, so it cannot be the successor the fold
-/// seats.
-/// How earlier transactions in this block left the name. The table still
-/// shows the state from before the block.
-#[derive(Clone, Copy)]
-enum PrecedingName {
-    /// No earlier transaction in this block changed the name.
-    Unchanged,
-    /// An earlier claim was admitted. The name is taken.
-    Taken,
-    /// An earlier release freed the name. The expiry window is this height.
-    Released(u32),
-}
-
-/// The name state earlier transactions in this block have already produced.
-enum BatchName {
-    Claimed {
-        nullifier: TipNf,
-        action: Action,
-        rcm: [u8; 32],
-    },
-    Released(u32),
-}
-
-fn preceding_name(batch: &HashMap<String, BatchName>, name: &str) -> PrecedingName {
-    match batch.get(name) {
-        Some(BatchName::Claimed { .. }) => PrecedingName::Taken,
-        Some(BatchName::Released(height)) => PrecedingName::Released(*height),
-        None => PrecedingName::Unchanged,
-    }
-}
-
-fn scalar_bytes(scalar: &pallas::Scalar) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(scalar.to_repr().as_ref());
-    bytes
-}
-
-/// The mint seats a successor only for a claim it admits: the name is
-/// free, including a name freed or taken by an earlier transaction in
-/// this block, the claim was not built before the release that precedes
-/// it, and the note's nullifier derives. `None` leaves the successor out.
-fn admitted_claim_successor(
-    db: &Connection,
-    candidates: &[Candidate<'_>],
-    txid: [u8; 32],
-    fvk: &FullViewingKey,
-    expiry: Option<u32>,
-    preceding: PrecedingName,
-) -> rusqlite::Result<Option<TipNf>> {
-    let Some(candidate) = candidates.iter().find(|candidate| candidate.txid == txid) else {
-        return Ok(None);
-    };
-    if matches!(preceding, PrecedingName::Taken) {
-        return Ok(None);
-    }
-    // A release earlier in this block freed the name. The table still
-    // holds the old tip, and the expiry window is that release's height.
-    if let PrecedingName::Released(release_height) = preceding {
-        if notes::check_chain_rule(None, &candidate.note).is_none() {
-            return Ok(None);
-        }
-        if expiry_inside_release(release_height, expiry) {
-            return Ok(None);
-        }
-        return Ok(admit_nullifier(candidate, fvk));
-    }
-    if read_tip_offline(db, candidate.name())?.is_some() {
-        return Ok(None);
-    }
-    if notes::check_chain_rule(None, &candidate.note).is_none() {
-        return Ok(None);
-    }
-    if built_before_release(db, candidate.name(), expiry)? {
-        return Ok(None);
-    }
-    Ok(admit_nullifier(candidate, fvk))
-}
-
-struct ReleaseView<'a> {
-    facts: &'a TxAnchorFacts,
-    snapshot: &'a Lineage,
-    live_names: &'a HashSet<TipNf>,
-    batch: &'a HashMap<String, BatchName>,
-}
-
-/// A release note this transaction will admit, and the tip nullifier it
-/// spends. A claim that follows sees the name free. A claim that precedes
-/// this release does not: the release is not recorded until it is reached.
-fn standing_release(
-    db: &Connection,
-    candidates: &[Candidate<'_>],
-    txid: [u8; 32],
-    view: &ReleaseView<'_>,
-    fvk: &FullViewingKey,
-) -> rusqlite::Result<Option<(String, TipNf)>> {
-    let mut notes = candidates.iter().filter(|candidate| candidate.txid == txid);
-    let Some(candidate) = notes.next() else {
-        return Ok(None);
-    };
-    if notes.next().is_some() || candidate.note.action() != Action::Release {
-        return Ok(None);
-    }
-    let Some(current) = tip_before_this_tx(db, candidate.name(), view.batch)? else {
-        return Ok(None);
-    };
-    let tip_consumed = view
-        .facts
-        .retirements
-        .iter()
-        .any(|retirement| TipNf::from_revealed(&retirement.nf) == current.nullifier);
-    let spent_other_live = view.facts.retirements.iter().any(|retirement| {
-        let nf = TipNf::from_revealed(&retirement.nf);
-        view.live_names.contains(&nf) && nf != current.nullifier
-    });
-    if !tip_consumed || spent_other_live || view.snapshot.touches_live_anchor(view.facts) {
-        return Ok(None);
-    }
-    if notes::check_chain_rule(Some(&current.tip), &candidate.note).is_none() {
-        return Ok(None);
-    }
-    if admit_nullifier(candidate, fvk).is_none() {
-        return Ok(None);
-    }
-    Ok(Some((candidate.name().to_string(), current.nullifier)))
-}
-
-struct OpenTip {
-    tip: Tip,
-    nullifier: TipNf,
-}
-
-fn tip_before_this_tx(
-    db: &Connection,
-    name: &str,
-    batch: &HashMap<String, BatchName>,
-) -> rusqlite::Result<Option<OpenTip>> {
-    match batch.get(name) {
-        Some(BatchName::Released(_)) => Ok(None),
-        Some(BatchName::Claimed {
-            nullifier,
-            action,
-            rcm,
-        }) => Ok(Some(OpenTip {
-            tip: Tip {
-                action: *action,
-                rcm: *rcm,
-            },
-            nullifier: *nullifier,
-        })),
-        None => {
-            let Some(live) = read_tip_offline(db, name)? else {
-                return Ok(None);
-            };
-            Ok(Some(OpenTip {
-                tip: live.tip,
-                nullifier: live.nullifier,
-            }))
-        }
-    }
-}
-
 /// The mint builds a claim only after a release is applied, and sets
 /// expiry to the target height plus [`DEFAULT_TX_EXPIRY_DELTA`]. A
 /// transaction inside that window was built before the release. The
@@ -771,6 +525,10 @@ fn latest_release_height(db: &Connection, name: &str) -> rusqlite::Result<Option
     Ok(Some(row_u32(height)?))
 }
 
+/// The mint's successor output: one registry output, zero-value and
+/// received, and the transaction's one name note is a claim. A sent note
+/// is not stored as an adoption, so it cannot be the successor the fold
+/// seats.
 fn claim_successor_output(tx: &WalletTx, candidates: &[Candidate<'_>]) -> bool {
     let [output] = tx.ironwood_outputs.as_slice() else {
         return false;
@@ -861,248 +619,252 @@ fn live_name_nullifiers(conn: &Connection) -> rusqlite::Result<HashSet<TipNf>> {
     Ok(set)
 }
 
-/// The law, in canonical transaction order. The accept path admits at most
-/// one candidate per transaction; each candidate is judged against the
-/// lineage snapshot and live-name state of its own position, and every
-/// admission is visible to later candidates in the same batch.
+/// The law for one transaction, the body of the mint's `apply_block`. The
+/// accept path admits at most one candidate, judged against the lineage
+/// and the live-name state its predecessors left; the table already holds
+/// every earlier verdict in the block. Returns whether a claim seated its
+/// successor.
 ///
 /// A transaction that consumes the live tip without a valid successor ends
 /// that binding (the mint's `release_predecessor`), and a transaction that
 /// spends any other live name tip ends that binding too (the mint's
 /// `mark_released`) — both recorded as implicit releases.
-fn apply_candidates(
+fn apply_transaction(
     db_tx: &Transaction<'_>,
-    height: u32,
     candidates: &[Candidate],
+    law: &TxLaw,
+    lineage: &Lineage,
     live_names: &mut HashSet<TipNf>,
-    tx_law: &[TxLaw],
     fvk: &FullViewingKey,
-) -> rusqlite::Result<()> {
-    // The accept path admits at most one candidate per transaction, so
-    // candidates index by transaction. The loop walks TRANSACTIONS in
-    // canonical order — including candidate-free ones, whose follow_spends
-    // behavior (ending the binding of every live name they spent) the mint
-    // applies to every transaction that is not exactly-one-candidate.
-    let mut candidate_by_tx: HashMap<[u8; 32], &Candidate> = HashMap::new();
-    for candidate in candidates {
-        candidate_by_tx.insert(candidate.txid, candidate);
-    }
+) -> rusqlite::Result<bool> {
+    let height = law.height;
+    let tx_facts = &law.facts;
+    // The accept path is exactly one candidate. Every other transaction —
+    // candidate-free, or two or more — takes follow_spends: the binding of
+    // every live name it spent ends.
+    let candidate = tx_facts
+        .has_single_name_note
+        .then(|| candidates.iter().find(|c| c.txid == law.txid))
+        .flatten();
+    let Some(candidate) = candidate else {
+        mark_released_spent(
+            db_tx,
+            live_names,
+            tx_facts,
+            height,
+            &law.txid,
+            law.tx_index,
+            0,
+        )?;
+        return Ok(false);
+    };
 
-    for law in tx_law {
-        let Some(candidate) = law
-            .facts
-            .has_single_name_note
-            .then(|| candidate_by_tx.get(&law.txid))
-            .flatten()
-        else {
-            // follow_spends: zero candidates, or two or more.
-            mark_released_spent(
-                db_tx,
-                live_names,
-                &law.facts,
-                height,
-                &law.txid,
-                law.tx_index,
-                0,
-            )?;
-            continue;
-        };
-        let snapshot = &law.snapshot;
-        let tx_facts = &law.facts;
-
-        let binding = read_tip_offline(db_tx, candidate.name())?;
-        let note = &candidate.note;
-        // The predecessor spend and the name-note output are different
-        // actions. The mint's `predecessor_spent` looks at every nullifier
-        // in the transaction, not at the output's own action.
-        let tip_nf = binding.as_ref().map(|b| b.nullifier);
-        let tip_consumed = tip_nf.is_some_and(|nf| {
-            tx_facts
-                .retirements
-                .iter()
-                .any(|r| TipNf::from_revealed(&r.nf) == nf)
-        });
-        let spent_a_live_name = tx_facts
+    let binding = read_tip_offline(db_tx, candidate.name())?;
+    let note = &candidate.note;
+    // The predecessor spend and the name-note output are different
+    // actions. The mint's `predecessor_spent` looks at every nullifier
+    // in the transaction, not at the output's own action.
+    let tip_nf = binding.as_ref().map(|b| b.nullifier);
+    let tip_consumed = tip_nf.is_some_and(|nf| {
+        tx_facts
             .retirements
             .iter()
-            .any(|r| live_names.contains(&TipNf::from_revealed(&r.nf)));
+            .any(|r| TipNf::from_revealed(&r.nf) == nf)
+    });
+    let spent_a_live_name = tx_facts
+        .retirements
+        .iter()
+        .any(|r| live_names.contains(&TipNf::from_revealed(&r.nf)));
 
-        match note.action() {
-            Action::Claim => {
-                // Gate: the mint's accept_claim. The anchor spend and the
-                // name note are separate actions — fee inputs sit between
-                // them — so the name note's own nullifier is not the anchor.
-                // The transaction must spend exactly one live anchor, spend
-                // no live name, and its registry outputs must be the one
-                // zero-value successor of a claim.
-                let law_ok = snapshot.live_retirements(tx_facts) == 1
-                    && !spent_a_live_name
-                    && tx_facts.claim_successor;
-                if !law_ok {
-                    // The mint's mark_released: every live name this
-                    // transaction spent ends its binding.
-                    mark_released_spent(
+    match note.action() {
+        Action::Claim => {
+            // Gate: the mint's accept_claim. The anchor spend and the
+            // name note are separate actions — fee inputs sit between
+            // them — so the name note's own nullifier is not the anchor.
+            // The transaction must spend exactly one live anchor, spend
+            // no live name, and its registry outputs must be the one
+            // zero-value successor of a claim.
+            let law_ok = lineage.live_retirements(tx_facts) == 1
+                && !spent_a_live_name
+                && tx_facts.claim_successor;
+            if !law_ok {
+                // The mint's mark_released: every live name this
+                // transaction spent ends its binding.
+                mark_released_spent(
+                    db_tx,
+                    live_names,
+                    tx_facts,
+                    height,
+                    &candidate.txid,
+                    law.tx_index,
+                    candidate.action_index,
+                )?;
+                return Ok(false);
+            }
+
+            // Gate: chain rule — a claim's predecessor is zero, which
+            // also requires the name free.
+            let Some(expected_prev) =
+                notes::check_chain_rule(binding.as_ref().map(|b| &b.tip), note)
+            else {
+                admission_dropped("chain rule", candidate.name(), &candidate.txid, height);
+                return Ok(false);
+            };
+
+            // Gate: the mint's built_before_release — a claim inside the
+            // latest release's expiry window was built before that release,
+            // even one released earlier in this block.
+            if built_before_release(db_tx, candidate.name(), law.expiry)? {
+                admission_dropped(
+                    "built before release",
+                    candidate.name(),
+                    &candidate.txid,
+                    height,
+                );
+                return Ok(false);
+            }
+
+            let Some(nullifier) = admit_nullifier(candidate, fvk) else {
+                admission_dropped(
+                    "nullifier underivable",
+                    candidate.name(),
+                    &candidate.txid,
+                    height,
+                );
+                return Ok(false);
+            };
+            if record_admission(
+                db_tx,
+                &AdmissionRow {
+                    name: candidate.name(),
+                    height: height as i64,
+                    action: note.action().as_str(),
+                    ua: note.ua().as_str(),
+                    expires_at: &note
+                        .expires_at()
+                        .map(|e| e.field_bytes().to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    prev_rcm: expected_prev.as_slice(),
+                    rcm: candidate.rcm.to_repr().as_slice(),
+                    psi: candidate.psi.to_repr().as_slice(),
+                    cmx: &candidate.cand_cmx,
+                    nullifier: nullifier.as_bytes(),
+                    txid: candidate.txid.as_slice(),
+                    tx_index: law.tx_index as i64,
+                    action_index: candidate.action_index as i64,
+                    memo: candidate.memo,
+                },
+            )? {
+                live_names.insert(nullifier);
+            }
+            Ok(true)
+        }
+        Action::Update | Action::Release => {
+            // Gate: predecessor — the transaction must consume this
+            // name's live tip, only this name's, and no anchor. Anything
+            // else is follow_spends: every spent live name ends its
+            // binding.
+            let spent_other_live = tx_facts.retirements.iter().any(|r| {
+                let nf = TipNf::from_revealed(&r.nf);
+                live_names.contains(&nf) && tip_nf != Some(nf)
+            });
+            if !tip_consumed || spent_other_live || lineage.touches_live_anchor(tx_facts) {
+                mark_released_spent(
+                    db_tx,
+                    live_names,
+                    tx_facts,
+                    height,
+                    &candidate.txid,
+                    law.tx_index,
+                    candidate.action_index,
+                )?;
+                return Ok(false);
+            }
+
+            // The tip was consumed: a valid successor advances an update
+            // or lands a proper release; an invalid one ends the binding
+            // — the mint's release_predecessor.
+            let Some(expected_prev) =
+                notes::check_chain_rule(binding.as_ref().map(|b| &b.tip), note)
+            else {
+                admission_dropped("chain rule", candidate.name(), &candidate.txid, height);
+                if let Some(consumed) = tip_nf {
+                    end_binding_implicitly(
                         db_tx,
                         live_names,
-                        tx_facts,
+                        candidate.name(),
                         height,
                         &candidate.txid,
                         law.tx_index,
                         candidate.action_index,
+                        &consumed,
                     )?;
-                    continue;
                 }
+                return Ok(false);
+            };
 
-                // Gate: chain rule — a claim's predecessor is zero, which
-                // also requires the name free.
-                let Some(expected_prev) =
-                    notes::check_chain_rule(binding.as_ref().map(|b| &b.tip), note)
-                else {
-                    admission_dropped("chain rule", candidate.name(), &candidate.txid, height);
-                    continue;
-                };
-
-                let Some(nullifier) = admit_nullifier(candidate, fvk) else {
-                    admission_dropped(
-                        "nullifier underivable",
+            // The mint owns the term and liveness clocks (§4.5): its
+            // tracker decides at acceptance whether an update renews
+            // or frees the name. The resolver does not re-evaluate the
+            // deadlines — a mint-authorized update that clears the
+            // predecessor and spend gates is the transition to index,
+            // so this tip follows the mint's ledger (issue #61).
+            let Some(nullifier) = admit_nullifier(candidate, fvk) else {
+                // The tip was spent on chain. Leaving the names row in
+                // place would keep serving a note that can never be spent
+                // again.
+                admission_dropped(
+                    "nullifier underivable",
+                    candidate.name(),
+                    &candidate.txid,
+                    height,
+                );
+                if let Some(consumed) = tip_nf {
+                    end_binding_implicitly(
+                        db_tx,
+                        live_names,
                         candidate.name(),
-                        &candidate.txid,
                         height,
-                    );
-                    continue;
-                };
-                if record_admission(
-                    db_tx,
-                    &AdmissionRow {
-                        name: candidate.name(),
-                        height: height as i64,
-                        action: note.action().as_str(),
-                        ua: note.ua().as_str(),
-                        expires_at: &note
-                            .expires_at()
-                            .map(|e| e.field_bytes().to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                        prev_rcm: expected_prev.as_slice(),
-                        rcm: candidate.rcm.to_repr().as_slice(),
-                        psi: candidate.psi.to_repr().as_slice(),
-                        cmx: &candidate.cand_cmx,
-                        nullifier: nullifier.as_bytes(),
-                        txid: candidate.txid.as_slice(),
-                        tx_index: law.tx_index as i64,
-                        action_index: candidate.action_index as i64,
-                        memo: candidate.memo,
-                    },
-                )? {
+                        &candidate.txid,
+                        law.tx_index,
+                        candidate.action_index,
+                        &consumed,
+                    )?;
+                }
+                return Ok(false);
+            };
+            if record_admission(
+                db_tx,
+                &AdmissionRow {
+                    name: candidate.name(),
+                    height: height as i64,
+                    action: note.action().as_str(),
+                    ua: note.ua().as_str(),
+                    expires_at: &note
+                        .expires_at()
+                        .map(|e| e.field_bytes().to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    prev_rcm: expected_prev.as_slice(),
+                    rcm: candidate.rcm.to_repr().as_slice(),
+                    psi: candidate.psi.to_repr().as_slice(),
+                    cmx: &candidate.cand_cmx,
+                    nullifier: nullifier.as_bytes(),
+                    txid: candidate.txid.as_slice(),
+                    tx_index: law.tx_index as i64,
+                    action_index: candidate.action_index as i64,
+                    memo: candidate.memo,
+                },
+            )? {
+                if let Some(live) = binding.as_ref() {
+                    live_names.remove(&live.nullifier);
+                }
+                if note.action() == Action::Update {
                     live_names.insert(nullifier);
                 }
             }
-            Action::Update | Action::Release => {
-                // Gate: predecessor — the transaction must consume this
-                // name's live tip, only this name's, and no anchor. Anything
-                // else is follow_spends: every spent live name ends its
-                // binding.
-                let spent_other_live = tx_facts.retirements.iter().any(|r| {
-                    let nf = TipNf::from_revealed(&r.nf);
-                    live_names.contains(&nf) && tip_nf != Some(nf)
-                });
-                if !tip_consumed || spent_other_live || snapshot.touches_live_anchor(tx_facts) {
-                    mark_released_spent(
-                        db_tx,
-                        live_names,
-                        tx_facts,
-                        height,
-                        &candidate.txid,
-                        law.tx_index,
-                        candidate.action_index,
-                    )?;
-                    continue;
-                }
-
-                // The tip was consumed: a valid successor advances an update
-                // or lands a proper release; an invalid one ends the binding
-                // — the mint's release_predecessor.
-                let Some(expected_prev) =
-                    notes::check_chain_rule(binding.as_ref().map(|b| &b.tip), note)
-                else {
-                    admission_dropped("chain rule", candidate.name(), &candidate.txid, height);
-                    if let Some(consumed) = tip_nf {
-                        end_binding_implicitly(
-                            db_tx,
-                            live_names,
-                            candidate.name(),
-                            height,
-                            &candidate.txid,
-                            law.tx_index,
-                            candidate.action_index,
-                            &consumed,
-                        )?;
-                    }
-                    continue;
-                };
-
-                // The mint owns the term and liveness clocks (§4.5): its
-                // tracker decides at acceptance whether an update renews
-                // or frees the name. The resolver does not re-evaluate the
-                // deadlines — a mint-authorized update that clears the
-                // predecessor and spend gates is the transition to index,
-                // so this tip follows the mint's ledger (issue #61).
-                let Some(nullifier) = admit_nullifier(candidate, fvk) else {
-                    // The tip was spent on chain. Leaving the names row in
-                    // place would keep serving a note that can never be spent
-                    // again.
-                    admission_dropped(
-                        "nullifier underivable",
-                        candidate.name(),
-                        &candidate.txid,
-                        height,
-                    );
-                    if let Some(consumed) = tip_nf {
-                        end_binding_implicitly(
-                            db_tx,
-                            live_names,
-                            candidate.name(),
-                            height,
-                            &candidate.txid,
-                            law.tx_index,
-                            candidate.action_index,
-                            &consumed,
-                        )?;
-                    }
-                    continue;
-                };
-                if record_admission(
-                    db_tx,
-                    &AdmissionRow {
-                        name: candidate.name(),
-                        height: height as i64,
-                        action: note.action().as_str(),
-                        ua: note.ua().as_str(),
-                        expires_at: &note
-                            .expires_at()
-                            .map(|e| e.field_bytes().to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                        prev_rcm: expected_prev.as_slice(),
-                        rcm: candidate.rcm.to_repr().as_slice(),
-                        psi: candidate.psi.to_repr().as_slice(),
-                        cmx: &candidate.cand_cmx,
-                        nullifier: nullifier.as_bytes(),
-                        txid: candidate.txid.as_slice(),
-                        tx_index: law.tx_index as i64,
-                        action_index: candidate.action_index as i64,
-                        memo: candidate.memo,
-                    },
-                )? {
-                    if let Some(live) = binding.as_ref() {
-                        live_names.remove(&live.nullifier);
-                    }
-                    if note.action() == Action::Update {
-                        live_names.insert(nullifier);
-                    }
-                }
-            }
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 fn candidate_dropped(reason: &'static str, txid: &[u8; 32], action_index: usize) {
@@ -2454,7 +2216,7 @@ mod admission {
 
     fn tx_law_for(
         txid: [u8; 32],
-        snapshot: Lineage,
+        height: u32,
         adoptions: Vec<Adoption>,
         retirements: Vec<Retirement>,
         has_single_name_note: bool,
@@ -2463,7 +2225,8 @@ mod admission {
         TxLaw {
             txid,
             tx_index: 0,
-            snapshot,
+            height,
+            expiry: None,
             facts: TxAnchorFacts {
                 adoptions,
                 retirements,
@@ -2494,23 +2257,17 @@ mod admission {
         let candidates = vec![candidate(
             &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
         )];
-        let snapshot = Lineage::new();
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![tx_law_for(
+        let law = tx_law_for(
             [1; 32],
-            seeded.clone(),
+            100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
             true,
-        )];
+        );
         let mut live_names: HashSet<TipNf> = HashSet::new();
-        let mut lineage = seeded;
-        let _ = snapshot;
 
-        // the fold already consumed the block's facts before admission
-        lineage.step_tx(100, &tx_law[0].facts);
-
-        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        assert!(apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap());
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
@@ -2529,18 +2286,19 @@ mod admission {
         let first = vec![candidate(
             &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
         )];
-        let seeded = seeded_lineage(&[1]);
+        let mut lineage = seeded_lineage(&[1]);
         let first_law = tx_law_for(
             [1; 32],
-            seeded.clone(),
+            100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
             true,
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
-        let mut lineage = seeded;
+        assert!(
+            apply_transaction(&tx, &first, &first_law, &lineage, &mut live_names, &fvk).unwrap()
+        );
         lineage.step_tx(100, &first_law.facts);
-        apply_candidates(&tx, 100, &first, &mut live_names, &[first_law], &fvk).unwrap();
 
         let second_memo = vec![memo_for("claim", "alice", &[0u8; 32])];
         let second = vec![candidate(
@@ -2555,18 +2313,20 @@ mod admission {
         )];
         let mut second_law = tx_law_for(
             [2; 32],
-            lineage.clone(),
+            101,
             vec![Adoption { nf: nf(201) }],
             vec![Retirement { nf: nf(200) }],
             true,
         );
         // The name is already live, so the successor stays out. The anchor
         // it spent still retires.
-        second_law.facts.claim_successor = false;
+        let seated =
+            apply_transaction(&tx, &second, &second_law, &lineage, &mut live_names, &fvk).unwrap();
+        assert!(!seated);
+        second_law.facts.claim_successor = seated;
         lineage.step_tx(101, &second_law.facts);
         assert!(!lineage.contains(&nf(201)));
         assert!(!lineage.contains(&nf(200)));
-        apply_candidates(&tx, 101, &second, &mut live_names, &[second_law], &fvk).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
@@ -2598,168 +2358,96 @@ mod admission {
         let stale = vec![candidate(
             &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
         )];
-        let inside = release_height + DEFAULT_TX_EXPIRY_DELTA;
-        assert!(admitted_claim_successor(
-            &tx,
-            &stale,
-            [1; 32],
-            &fvk,
-            Some(inside),
-            PrecedingName::Unchanged,
-        )
-        .unwrap()
-        .is_none());
-        assert!(admitted_claim_successor(
-            &tx,
-            &stale,
-            [1; 32],
-            &fvk,
-            None,
-            PrecedingName::Unchanged,
-        )
-        .unwrap()
-        .is_none());
-
-        let seeded = seeded_lineage(&[1]);
+        let mut lineage = seeded_lineage(&[1]);
         let mut stale_law = tx_law_for(
             [1; 32],
-            seeded.clone(),
+            120,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
             true,
         );
+        let mut live_names: HashSet<TipNf> = HashSet::new();
+        stale_law.expiry = Some(release_height + DEFAULT_TX_EXPIRY_DELTA);
+        assert!(
+            !apply_transaction(&tx, &stale, &stale_law, &lineage, &mut live_names, &fvk).unwrap()
+        );
+        // A missing expiry fails closed.
+        stale_law.expiry = None;
+        assert!(
+            !apply_transaction(&tx, &stale, &stale_law, &lineage, &mut live_names, &fvk).unwrap()
+        );
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        // The anchor it spent still retires; the successor stays out.
         stale_law.facts.claim_successor = false;
-        let mut lineage = seeded;
         lineage.step_tx(120, &stale_law.facts);
         assert!(!lineage.contains(&nf(200)));
         assert!(!lineage.contains(&nf(1)));
-        let mut live_names: HashSet<TipNf> = HashSet::new();
-        apply_candidates(&tx, 120, &stale, &mut live_names, &[stale_law], &fvk).unwrap();
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
 
-        let past = release_height + DEFAULT_TX_EXPIRY_DELTA + 1;
-        assert!(admitted_claim_successor(
-            &tx,
-            &stale,
-            [1; 32],
-            &fvk,
-            Some(past),
-            PrecedingName::Unchanged,
-        )
-        .unwrap()
-        .is_some());
+        lineage.adopt(110, nf(2));
         let mut fresh_law = tx_law_for(
             [1; 32],
-            lineage.clone(),
+            121,
             vec![Adoption { nf: nf(201) }],
             vec![Retirement { nf: nf(2) }],
             true,
         );
-        lineage.adopt(110, nf(2));
-        fresh_law.snapshot = lineage.clone();
+        fresh_law.expiry = Some(release_height + DEFAULT_TX_EXPIRY_DELTA + 1);
+        assert!(
+            apply_transaction(&tx, &stale, &fresh_law, &lineage, &mut live_names, &fvk).unwrap()
+        );
         lineage.step_tx(121, &fresh_law.facts);
         assert!(lineage.contains(&nf(201)));
-        apply_candidates(&tx, 121, &stale, &mut live_names, &[fresh_law], &fvk).unwrap();
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
     }
 
-    /// A release earlier in the block frees the name before the claim is
-    /// judged. The expiry window is that release. A claim that precedes the
-    /// release still sees the live tip and is refused.
+    /// A release earlier in the block frees the name for a later claim,
+    /// as the mint's `accept_release` then `accept_claim` do.
     #[test]
-    fn a_later_claim_in_the_block_is_judged_against_the_release() {
+    fn a_later_claim_in_the_block_follows_the_release() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
         let fvk = fvk();
-        let release_height = 200u32;
         conn.execute(
             "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
              VALUES ('alice', 100, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
-
-        let release_memos = vec![memo_for("release", "alice", &[0x02; 32])];
-        let release = vec![candidate(
-            &release_memos,
-            0,
-            0,
-            0,
-            [3; 32],
-            "release",
-            "alice",
-            [0x02; 32],
-        )];
+        let memos = vec![
+            memo_for("release", "alice", &[0x02; 32]),
+            memo_for("claim", "alice", &[0u8; 32]),
+        ];
+        let candidates = vec![
+            candidate(&memos, 0, 0, 0, [3; 32], "release", "alice", [0x02; 32]),
+            candidate(&memos, 1, 1, 0, [1; 32], "claim", "alice", [0u8; 32]),
+        ];
         let seeded = seeded_lineage(&[1]);
-        let release_facts = TxAnchorFacts {
-            adoptions: vec![],
-            retirements: vec![Retirement {
+        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
+
+        let release = tx_law_for(
+            [3; 32],
+            200,
+            vec![],
+            vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            has_single_name_note: true,
-            name_notes: 1,
-            claim_successor: false,
-        };
-        let live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
-        let stood = standing_release(
-            &tx,
-            &release,
-            [3; 32],
-            &ReleaseView {
-                facts: &release_facts,
-                snapshot: &seeded,
-                live_names: &live_names,
-                batch: &HashMap::new(),
-            },
-            &fvk,
-        )
-        .unwrap();
-        assert_eq!(stood.map(|(name, _)| name).as_deref(), Some("alice"));
+            true,
+        );
+        apply_transaction(&tx, &candidates, &release, &seeded, &mut live_names, &fvk).unwrap();
 
-        let claim_memos = vec![memo_for("claim", "alice", &[0u8; 32])];
-        let claim = vec![candidate(
-            &claim_memos,
-            0,
-            0,
-            0,
+        let mut claim = tx_law_for(
             [1; 32],
-            "claim",
-            "alice",
-            [0u8; 32],
-        )];
-        // The claim precedes the release: the tip is still live.
-        assert!(admitted_claim_successor(
-            &tx,
-            &claim,
-            [1; 32],
-            &fvk,
-            Some(release_height + DEFAULT_TX_EXPIRY_DELTA + 1),
-            PrecedingName::Unchanged,
-        )
-        .unwrap()
-        .is_none());
-        // The release precedes the claim. Expiry inside the window stays out.
-        assert!(admitted_claim_successor(
-            &tx,
-            &claim,
-            [1; 32],
-            &fvk,
-            Some(release_height + DEFAULT_TX_EXPIRY_DELTA),
-            PrecedingName::Released(release_height),
-        )
-        .unwrap()
-        .is_none());
-        // Expiry past the window registers, even though the old tip is still stored.
-        assert!(admitted_claim_successor(
-            &tx,
-            &claim,
-            [1; 32],
-            &fvk,
-            Some(release_height + DEFAULT_TX_EXPIRY_DELTA + 1),
-            PrecedingName::Released(release_height),
-        )
-        .unwrap()
-        .is_some());
+            200,
+            vec![Adoption { nf: nf(200) }],
+            vec![Retirement { nf: nf(1) }],
+            true,
+        );
+        claim.tx_index = 1;
+        claim.expiry = Some(200 + DEFAULT_TX_EXPIRY_DELTA + 1);
+        assert!(
+            apply_transaction(&tx, &candidates, &claim, &seeded, &mut live_names, &fvk).unwrap()
+        );
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
     }
 
     /// An implicit release is a release record. A later claim ends the window.
@@ -2795,18 +2483,19 @@ mod admission {
         let claim = vec![candidate(
             &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
         )];
-        let seeded = seeded_lineage(&[1]);
+        let mut lineage = seeded_lineage(&[1]);
         let claim_law = tx_law_for(
             [1; 32],
-            seeded.clone(),
+            100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
             true,
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
-        let mut lineage = seeded;
+        assert!(
+            apply_transaction(&tx, &claim, &claim_law, &lineage, &mut live_names, &fvk).unwrap()
+        );
         lineage.step_tx(100, &claim_law.facts);
-        apply_candidates(&tx, 100, &claim, &mut live_names, &[claim_law], &fvk).unwrap();
 
         let tip: Vec<u8> = tx
             .query_row(
@@ -2829,7 +2518,7 @@ mod admission {
         )];
         let update_law = tx_law_for(
             [3; 32],
-            lineage,
+            101,
             vec![],
             vec![
                 Retirement {
@@ -2839,7 +2528,7 @@ mod admission {
             ],
             true,
         );
-        apply_candidates(&tx, 101, &update, &mut live_names, &[update_law], &fvk).unwrap();
+        apply_transaction(&tx, &update, &update_law, &lineage, &mut live_names, &fvk).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(
@@ -2865,10 +2554,11 @@ mod admission {
             &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
         )];
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![TxLaw {
+        let law = TxLaw {
             txid: [1; 32],
             tx_index: 0,
-            snapshot: seeded,
+            height: 100,
+            expiry: None,
             facts: TxAnchorFacts {
                 adoptions: vec![Adoption { nf: nf(200) }],
                 retirements: vec![Retirement { nf: nf(1) }],
@@ -2876,10 +2566,12 @@ mod admission {
                 name_notes: 1,
                 claim_successor: false,
             },
-        }];
+        };
         let mut live_names: HashSet<TipNf> = HashSet::new();
 
-        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        assert!(
+            !apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap()
+        );
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
@@ -2906,16 +2598,16 @@ mod admission {
             &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
         )];
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![tx_law_for(
+        let law = tx_law_for(
             [1; 32],
-            seeded,
+            100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
             true,
-        )];
+        );
         let mut live_names = HashSet::new();
 
-        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap();
 
         assert!(live_names.is_empty());
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
@@ -2936,16 +2628,16 @@ mod admission {
             &memos, 0, 0, 0, [2; 32], "claim", "julian", [0u8; 32],
         )];
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![tx_law_for(
+        let law = tx_law_for(
             [2; 32],
-            seeded.clone(),
+            100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }, Retirement { nf: nf(9) }],
             true,
-        )];
+        );
         let mut live_names = HashSet::new();
 
-        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        assert!(apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap());
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(
@@ -2966,20 +2658,20 @@ mod admission {
             &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
         )];
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![tx_law_for(
+        let law = tx_law_for(
             [1; 32],
-            seeded.clone(),
+            100,
             vec![],
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[9; 32]),
             }],
             true,
-        )];
+        );
         let mut live_names = HashSet::new();
-        let mut lineage = seeded;
-        lineage.step_tx(100, &tx_law[0].facts);
 
-        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        assert!(
+            !apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap()
+        );
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
@@ -3005,20 +2697,20 @@ mod admission {
         let memos = vec![memo_for("claim", "a", &[0u8; 32])];
         let candidates = vec![candidate(&memos, 0, 0, 0, [1; 32], "claim", "a", [0u8; 32])];
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![tx_law_for(
+        let law = tx_law_for(
             [1; 32],
-            seeded.clone(),
+            100,
             vec![],
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
             true,
-        )];
+        );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
-        let mut lineage = seeded;
-        lineage.step_tx(100, &tx_law[0].facts);
 
-        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        assert!(
+            !apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap()
+        );
 
         // z's binding ended; the claim did not land.
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
@@ -3061,34 +2753,46 @@ mod admission {
         let nullifier_u = admit_nullifier(&update, &fvk).expect("update nullifier");
 
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![
-            tx_law_for(
-                [1; 32],
-                seeded.clone(),
-                vec![],
-                vec![Retirement {
-                    nf: AnchorNf::from_bytes(&[0x5a; 32]),
-                }],
-                true,
-            ),
-            tx_law_for(
-                [2; 32],
-                seeded.clone(),
-                vec![],
-                vec![Retirement {
-                    nf: AnchorNf::from_bytes(nullifier_u.as_bytes()),
-                }],
-                true,
-            ),
-        ];
+        let update_law = tx_law_for(
+            [1; 32],
+            100,
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&[0x5a; 32]),
+            }],
+            true,
+        );
+        let release_law = tx_law_for(
+            [2; 32],
+            100,
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(nullifier_u.as_bytes()),
+            }],
+            true,
+        );
 
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
-        let mut lineage = seeded;
-        lineage.step_tx(100, &tx_law[0].facts);
-        lineage.step_tx(100, &tx_law[1].facts);
 
         let candidates = vec![update, release];
-        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        apply_transaction(
+            &tx,
+            &candidates,
+            &update_law,
+            &seeded,
+            &mut live_names,
+            &fvk,
+        )
+        .unwrap();
+        apply_transaction(
+            &tx,
+            &candidates,
+            &release_law,
+            &seeded,
+            &mut live_names,
+            &fvk,
+        )
+        .unwrap();
 
         // The update admitted; the stale release ended the binding.
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
@@ -3125,18 +2829,18 @@ mod admission {
         assert!(admit_nullifier(&update, &fvk).is_none());
 
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![tx_law_for(
+        let law = tx_law_for(
             [1; 32],
-            seeded,
+            100,
             vec![],
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
             true,
-        )];
+        );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
-        apply_candidates(&tx, 100, &[update], &mut live_names, &tx_law, &fvk).unwrap();
+        apply_transaction(&tx, &[update], &law, &seeded, &mut live_names, &fvk).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
@@ -3172,9 +2876,9 @@ mod admission {
             [0x02; 32],
         )];
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![tx_law_for(
+        let law = tx_law_for(
             [3; 32],
-            seeded,
+            100,
             vec![],
             vec![
                 Retirement {
@@ -3183,10 +2887,10 @@ mod admission {
                 Retirement { nf: nf(9) },
             ],
             true,
-        )];
+        );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
-        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
@@ -3225,20 +2929,18 @@ mod admission {
             candidate(&memos, 1, 0, 1, [1; 32], "claim", "b", [0u8; 32]),
         ];
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![tx_law_for(
+        let law = tx_law_for(
             [1; 32],
-            seeded.clone(),
+            100,
             vec![],
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
             false, // two candidates: follow_spends
-        )];
+        );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
-        let mut lineage = seeded;
-        lineage.step_tx(100, &tx_law[0].facts);
 
-        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
@@ -3264,21 +2966,19 @@ mod admission {
 
         // No candidates at all: a spend-only transaction.
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![tx_law_for(
+        let law = tx_law_for(
             [7; 32],
-            seeded.clone(),
+            100,
             vec![],
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
             false,
-        )];
+        );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
-        let mut lineage = seeded;
-        lineage.step_tx(100, &tx_law[0].facts);
 
         let candidates: Vec<Candidate> = vec![];
-        apply_candidates(&tx, 100, &candidates, &mut live_names, &tx_law, &fvk).unwrap();
+        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
@@ -3306,18 +3006,18 @@ mod admission {
         let memos = vec![memo_for("update", "z", &[0x02; 32])];
         let update = candidate(&memos, 0, 0, 0, [1; 32], "update", "z", [0x02; 32]);
         let seeded = seeded_lineage(&[1]);
-        let tx_law = vec![tx_law_for(
+        let law = tx_law_for(
             [1; 32],
-            seeded,
+            100,
             vec![],
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
             true,
-        )];
+        );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
-        apply_candidates(&tx, 100, &[update], &mut live_names, &tx_law, &fvk).unwrap();
+        apply_transaction(&tx, &[update], &law, &seeded, &mut live_names, &fvk).unwrap();
 
         let action: String = tx
             .query_row("SELECT action FROM names WHERE name = 'z'", [], |r| {
