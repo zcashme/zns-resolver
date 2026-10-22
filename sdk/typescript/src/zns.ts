@@ -67,21 +67,23 @@ function isValidUnifiedAddress(address: string): boolean {
 export type Network = "mainnet" | "testnet";
 
 /**
- * Registry keys and treasury addresses, as the live resolvers report them in
- * `status`. `verify()` compares the server's viewing key against
+ * Registry keys, treasury addresses and endpoints, as the live resolvers
+ * report them in `status`. `urls` is tried in order: the first is primary,
+ * the rest are fallbacks used only when an endpoint cannot be reached.
+ * `verify()` compares the server's viewing key against
  * `viewingKey`: a mismatch means the endpoint is not this registry, or this
  * SDK predates a key rotation.
  */
 export const ZNS_NETWORKS = {
   testnet: {
-    url: "https://light.zcash.me/zns-testnet",
+    urls: ["https://light.zcash.me/zns-testnet"],
     viewingKey:
       "uviewtest1gkq78nsemsvs4qekadrv6qlqdmvcv2cct8k3c8cwycedpk90p8rtkx24qe8q73gg2ark8crqmmaavrerf7cxu0sp50an54crmeaalfxl72aetxnr89ksad4lvxzmnkyejhhwn65euzamt9wsukgfemeayhcesreasarmq600lfeju3qenh05e5e5cz6nhhsw3cfdcd3d08d0nxswxmkkxl2fq0hzv6t5dm3ftnz4y76236a49v3us4uq2tlsewf86tjtfwm6kue348me04rm7dw6uawv8myw7t5tyx2t453clhjz5f55lvh7hnvr8g8zt8lf4sy5rzq23ntp7g5ly6kyz2nkwfek06llhjtuz2fft9rg6cuuwg4n7299vajnmq6swg3sf563r0jjzuwuvfpjhmfmydar9dcu3fkuawt6u8qu08vhg5mthrcggrjuhht6f0perh0tqmdfrtgzvhjymay7h9ymvfxgd4r56uz6zrsf5gnvw5jy",
     treasuryAddress:
       "utest1tquw9k9qlsphhf30tau2qh758vfvf7xkvjea3rlc5mj4cjscgzfzgjeafjnl7r8tvv0akq3v2ze5q0azf4lnd4vf7kusrfensdsrr7tsgruvuqk0dv0hepnrk0pzgz3fj0mxc0lr29yf65nkwvw74gzep4792rkqa769lxl0sua09s0r",
   },
   mainnet: {
-    url: "https://main.zcashnames.com",
+    urls: ["https://main.zcashnames.com", "https://light.zcash.me/zns-mainnet"],
     viewingKey:
       "uview1209ld9y4fr2sel9q87kfjg7xm2sy53e3qf7dvcw3w8jwhhjpldl8z0vk0a6hveg4jk7xcn0rc9mr8yg77djfpc0uxrm5pqzt8q7ul4w0nvs3x5q9vmk9nm2crywtqaealek4mp47ur7ywu7g4g4xcdlwv6gnqzvu5panv5je2ps6rxmx4856unlt5wde8fpz8uhrqchmwhn2j252h3cyx5phad877xezerm6ex8l5kcfjw02ll7m0nspfufamh3ae9ea48395elptspnv6vvc70j2gcjrdze9syt8kpr2kc67flvg8687thdkpha7lpt9r4p9wjty90q2v2yjanqsr2zrecrqs7lfx9cpkmshf7jyh2vvwfqnyzwtpuy7p72hm2mjhperdafvm9u5rwa6s6urcy0uw30f687e3jnmas45qfqtwyz39kf6kxklfrdn7t4hkz56jegmlr8s8hwmt9wa8vz8zlmm76lrmzyj82nzpeqfu572njq",
     treasuryAddress:
@@ -89,14 +91,18 @@ export const ZNS_NETWORKS = {
   },
 } as const satisfies Record<
   Network,
-  { url: string; viewingKey: string; treasuryAddress: string }
+  { urls: readonly string[]; viewingKey: string; treasuryAddress: string }
 >;
 
+/** A resolver answered, so its reply is final and is not retried elsewhere. */
+class ZnsResponseError extends Error {}
+
 export class ZNS {
-  /** The resolver JSON-RPC endpoint in use. */
+  /** The primary resolver JSON-RPC endpoint. */
   url: string;
   /** The network preset in use. */
   network: Network;
+  private readonly urls: readonly string[];
   private rpcId = 0;
   private timeoutMs?: number;
 
@@ -111,7 +117,9 @@ export class ZNS {
    */
   constructor(options: { network?: Network; url?: string; timeout?: number } = {}) {
     this.network = options.network ?? "testnet";
-    this.url = options.url ?? ZNS_NETWORKS[this.network].url;
+    this.urls =
+      options.url != null ? [options.url] : ZNS_NETWORKS[this.network].urls;
+    this.url = this.urls[0];
     this.timeoutMs = options.timeout;
   }
 
@@ -308,6 +316,25 @@ export class ZNS {
     const id = ++this.rpcId;
     const body = JSON.stringify({ jsonrpc: "2.0", id, method, params });
 
+    // Endpoints are tried in preset order. Only a failure to get an answer
+    // moves on to the next one; a resolver's own reply, even an error, is final.
+    let lastError: unknown;
+    for (const url of this.urls) {
+      try {
+        return await this.post<T>(url, body, signal);
+      } catch (error) {
+        if (signal?.aborted || error instanceof ZnsResponseError) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  private async post<T>(
+    url: string,
+    body: string,
+    signal?: AbortSignal,
+  ): Promise<T> {
     // Combine the caller's optional signal with the configured timeout into
     // one controller so either cancels the in-flight request.
     const controller = new AbortController();
@@ -319,7 +346,7 @@ export class ZNS {
     if (signal?.aborted) controller.abort();
     else signal?.addEventListener("abort", forward);
     try {
-      const res = await fetch(this.url, {
+      const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
@@ -327,7 +354,11 @@ export class ZNS {
       });
 
       if (!res.ok) {
-        throw new Error(`ZNS HTTP ${res.status}: ${res.statusText}`);
+        const message = `ZNS HTTP ${res.status}: ${res.statusText}`;
+        // Server errors may be this node's alone; client errors are the answer.
+        throw res.status >= 500
+          ? new Error(message)
+          : new ZnsResponseError(message);
       }
 
       const json = (await res.json()) as {
@@ -336,7 +367,7 @@ export class ZNS {
       };
 
       if (json.error) {
-        throw new Error(
+        throw new ZnsResponseError(
           `ZNS RPC error ${json.error.code}: ${json.error.message}`,
         );
       }

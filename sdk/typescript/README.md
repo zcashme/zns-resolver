@@ -43,6 +43,11 @@ SDK predates a registry rotation — upgrade the package.
 `ZNS_NETWORKS[network].treasuryAddress` is the same address `status()` returns
 as `treasuryAddress`. `verify()` checks the viewing key only.
 
+Each preset lists its endpoints in `ZNS_NETWORKS[network].urls`. Mainnet tries
+`main.zcashnames.com` first and falls back to `light.zcash.me/zns-mainnet` when
+it cannot be reached. A resolver's own error reply is returned as is, with no
+fallback. Passing `url` to the constructor uses that one endpoint only.
+
 ## Reverse lookup
 
 ```ts
