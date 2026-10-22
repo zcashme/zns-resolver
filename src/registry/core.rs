@@ -1,6 +1,6 @@
 //! Transactional core of the registry.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use orchard::keys::{FullViewingKey, Scope};
 use orchard::note::Note;
@@ -11,7 +11,6 @@ use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Cursor, Nullifiers, Resume};
 use zcash_address::unified::Encoding as _;
 use zcash_primitives::block::BlockHash;
-use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
 use zcash_protocol::consensus::{BlockHeight, Parameters as _};
 use zns_verify::{pallas, Action, Memo, NameNote, PrimeField, Tip};
 
@@ -51,14 +50,12 @@ impl Candidate<'_> {
     }
 }
 
-/// One transaction under the law: its identity and position, the expiry
-/// the mint set on it, and its anchor facts.
+/// One transaction under the law: its identity and position, and its
+/// anchor facts.
 struct TxLaw {
     txid: [u8; 32],
     tx_index: u32,
     height: u32,
-    /// The transaction's expiry height, when the scan supplied one.
-    expiry: Option<u32>,
     facts: TxAnchorFacts,
 }
 
@@ -163,7 +160,6 @@ pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
     transactions: &[WalletTx],
-    expiries: &HashMap<[u8; 32], u32>,
     fvk: &FullViewingKey,
     mut lineage: Lineage,
 ) -> rusqlite::Result<()> {
@@ -328,7 +324,6 @@ pub(crate) fn apply_batch(
                 txid,
                 tx_index,
                 height,
-                expiry: expiries.get(&txid).copied(),
                 facts: TxAnchorFacts {
                     // The keygen transaction's notes, or a claim's one
                     // successor. A zero-value note in any other transaction
@@ -454,75 +449,6 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
         }
     }
     Ok(events)
-}
-
-/// The mint builds a claim only after a release is applied, and sets
-/// expiry to the target height plus [`DEFAULT_TX_EXPIRY_DELTA`]. A
-/// transaction inside that window was built before the release. The
-/// latest record may be an implicit release: the mint records that as a
-/// release too. A missing expiry fails closed.
-fn built_before_release(
-    db: &Connection,
-    name: &str,
-    expiry: Option<u32>,
-) -> rusqlite::Result<bool> {
-    let Some(release_height) = latest_release_height(db, name)? else {
-        return Ok(false);
-    };
-    Ok(expiry_inside_release(release_height, expiry))
-}
-
-/// `expiry` falls inside the standard window of a release at `release_height`.
-/// A missing expiry fails closed.
-fn expiry_inside_release(release_height: u32, expiry: Option<u32>) -> bool {
-    let Some(expiry) = expiry else {
-        return true;
-    };
-    expiry <= release_height.saturating_add(DEFAULT_TX_EXPIRY_DELTA)
-}
-
-/// Height of the latest record when that record is a release. A later
-/// claim or update means the name is no longer in the post-release window.
-fn latest_release_height(db: &Connection, name: &str) -> rusqlite::Result<Option<u32>> {
-    let event: Option<(String, i64, i64, i64)> = db
-        .query_row(
-            "SELECT action, height, tx_index, action_index FROM name_events WHERE name = ?1
-             ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT 1",
-            params![name],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let implicit: Option<(i64, i64, i64)> = db
-        .query_row(
-            "SELECT height, tx_index, action_index FROM implicit_releases WHERE name = ?1
-             ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT 1",
-            params![name],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let event_is_latest = match (&event, &implicit) {
-        (Some((_, height, tx_index, action_index)), Some((ih, itx, ia))) => {
-            (*height, *tx_index, *action_index) >= (*ih, *itx, *ia)
-        }
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => return Ok(None),
-    };
-    let height = if event_is_latest {
-        let Some((action, height, _, _)) = event else {
-            return Ok(None);
-        };
-        if action != "release" {
-            return Ok(None);
-        }
-        height
-    } else {
-        let Some((height, _, _)) = implicit else {
-            return Ok(None);
-        };
-        height
-    };
-    Ok(Some(row_u32(height)?))
 }
 
 /// The mint's successor output: one registry output, zero-value and
@@ -710,19 +636,6 @@ fn apply_transaction(
                 admission_dropped("chain rule", candidate.name(), &candidate.txid, height);
                 return Ok(false);
             };
-
-            // Gate: the mint's built_before_release — a claim inside the
-            // latest release's expiry window was built before that release,
-            // even one released earlier in this block.
-            if built_before_release(db_tx, candidate.name(), law.expiry)? {
-                admission_dropped(
-                    "built before release",
-                    candidate.name(),
-                    &candidate.txid,
-                    height,
-                );
-                return Ok(false);
-            }
 
             let Some(nullifier) = admit_nullifier(candidate, fvk) else {
                 admission_dropped(
@@ -2226,7 +2139,6 @@ mod admission {
             txid,
             tx_index: 0,
             height,
-            expiry: None,
             facts: TxAnchorFacts {
                 adoptions,
                 retirements,
@@ -2338,68 +2250,6 @@ mod admission {
         assert_eq!(height, 100);
     }
 
-    /// A claim whose expiry falls inside the standard window of the latest
-    /// release was built before that release. The anchor retires and the
-    /// successor stays out. A claim built after the release registers.
-    #[test]
-    fn a_claim_built_before_a_release_does_not_register() {
-        let conn = db();
-        let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
-        let release_height = 110u32;
-        conn.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('alice', ?1, 'release', 'u', 'none', x'00', x'00', x'00', x'00', x'00', x'11', 0, 0, x'00')",
-            params![release_height],
-        )
-        .unwrap();
-
-        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
-        let stale = vec![candidate(
-            &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
-        )];
-        let mut lineage = seeded_lineage(&[1]);
-        let mut stale_law = tx_law_for(
-            [1; 32],
-            120,
-            vec![Adoption { nf: nf(200) }],
-            vec![Retirement { nf: nf(1) }],
-            true,
-        );
-        let mut live_names: HashSet<TipNf> = HashSet::new();
-        stale_law.expiry = Some(release_height + DEFAULT_TX_EXPIRY_DELTA);
-        assert!(
-            !apply_transaction(&tx, &stale, &stale_law, &lineage, &mut live_names, &fvk).unwrap()
-        );
-        // A missing expiry fails closed.
-        stale_law.expiry = None;
-        assert!(
-            !apply_transaction(&tx, &stale, &stale_law, &lineage, &mut live_names, &fvk).unwrap()
-        );
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
-        // The anchor it spent still retires; the successor stays out.
-        stale_law.facts.claim_successor = false;
-        lineage.step_tx(120, &stale_law.facts);
-        assert!(!lineage.contains(&nf(200)));
-        assert!(!lineage.contains(&nf(1)));
-
-        lineage.adopt(110, nf(2));
-        let mut fresh_law = tx_law_for(
-            [1; 32],
-            121,
-            vec![Adoption { nf: nf(201) }],
-            vec![Retirement { nf: nf(2) }],
-            true,
-        );
-        fresh_law.expiry = Some(release_height + DEFAULT_TX_EXPIRY_DELTA + 1);
-        assert!(
-            apply_transaction(&tx, &stale, &fresh_law, &lineage, &mut live_names, &fvk).unwrap()
-        );
-        lineage.step_tx(121, &fresh_law.facts);
-        assert!(lineage.contains(&nf(201)));
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
-    }
-
     /// A release earlier in the block frees the name for a later claim,
     /// as the mint's `accept_release` then `accept_claim` do.
     #[test]
@@ -2443,32 +2293,10 @@ mod admission {
             true,
         );
         claim.tx_index = 1;
-        claim.expiry = Some(200 + DEFAULT_TX_EXPIRY_DELTA + 1);
         assert!(
             apply_transaction(&tx, &candidates, &claim, &seeded, &mut live_names, &fvk).unwrap()
         );
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
-    }
-
-    /// An implicit release is a release record. A later claim ends the window.
-    #[test]
-    fn an_implicit_release_starts_the_expiry_window() {
-        let conn = db();
-        conn.execute(
-            "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
-             VALUES ('alice', 110, x'11', 0, 0, x'22')",
-            [],
-        )
-        .unwrap();
-        let inside = 110 + DEFAULT_TX_EXPIRY_DELTA;
-        assert!(built_before_release(&conn, "alice", Some(inside)).unwrap());
-        conn.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('alice', 130, 'claim', 'u', 'none', x'00', x'00', x'00', x'00', x'00', x'33', 0, 0, x'00')",
-            [],
-        )
-        .unwrap();
-        assert!(!built_before_release(&conn, "alice", Some(inside)).unwrap());
     }
 
     /// An update that also spends a live anchor does not renew the name.
@@ -2558,7 +2386,6 @@ mod admission {
             txid: [1; 32],
             tx_index: 0,
             height: 100,
-            expiry: None,
             facts: TxAnchorFacts {
                 adoptions: vec![Adoption { nf: nf(200) }],
                 retirements: vec![Retirement { nf: nf(1) }],
@@ -3125,7 +2952,6 @@ mod admission {
                 hash: BlockHash([2; 32]),
             },
             &[tx],
-            &HashMap::new(),
             &fvk(),
             Lineage::new(),
         )

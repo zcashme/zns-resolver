@@ -12,7 +12,7 @@ mod registry; // Name index Database
 mod sync; // Sync Loop
 
 use seer_sync::UnifiedFullViewingKey;
-use sync::{live_tip, Pending, Registry};
+use sync::{live_tip, Registry};
 use tracing::level_filters::LevelFilter;
 use zcash_protocol::consensus::Network;
 
@@ -103,7 +103,6 @@ async fn main() {
     let account = Registry {
         db,
         fvk: registry_fvk,
-        pending: Pending::new(),
     };
 
     loop {
