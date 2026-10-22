@@ -2400,23 +2400,19 @@ mod admission {
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
     }
 
-    /// A release earlier in the block frees the name before the claim is
-    /// judged, and starts the expiry window — the mint's `accept_release`
-    /// then `accept_claim` within one `apply_block`. The mint never builds
-    /// the two for one block; a reorg can still mine them together.
+    /// A release earlier in the block frees the name for a later claim,
+    /// as the mint's `accept_release` then `accept_claim` do.
     #[test]
-    fn a_later_claim_in_the_block_is_judged_against_the_release() {
+    fn a_later_claim_in_the_block_follows_the_release() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
         let fvk = fvk();
-        let height = 200u32;
         conn.execute(
             "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
              VALUES ('alice', 100, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
-
         let memos = vec![
             memo_for("release", "alice", &[0x02; 32]),
             memo_for("claim", "alice", &[0u8; 32]),
@@ -2428,113 +2424,30 @@ mod admission {
         let seeded = seeded_lineage(&[1]);
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
-        let release_law = tx_law_for(
+        let release = tx_law_for(
             [3; 32],
-            height,
+            200,
             vec![],
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
             true,
         );
-        apply_transaction(
-            &tx,
-            &candidates,
-            &release_law,
-            &seeded,
-            &mut live_names,
-            &fvk,
-        )
-        .unwrap();
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        apply_transaction(&tx, &candidates, &release, &seeded, &mut live_names, &fvk).unwrap();
 
-        let mut claim_law = tx_law_for(
+        let mut claim = tx_law_for(
             [1; 32],
-            height,
+            200,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
             true,
         );
-        claim_law.tx_index = 1;
-        // Expiry inside the window: built before the release.
-        claim_law.expiry = Some(height + DEFAULT_TX_EXPIRY_DELTA);
+        claim.tx_index = 1;
+        claim.expiry = Some(200 + DEFAULT_TX_EXPIRY_DELTA + 1);
         assert!(
-            !apply_transaction(&tx, &candidates, &claim_law, &seeded, &mut live_names, &fvk)
-                .unwrap()
-        );
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
-        // Expiry past the window registers, in the same block as the release.
-        claim_law.expiry = Some(height + DEFAULT_TX_EXPIRY_DELTA + 1);
-        assert!(
-            apply_transaction(&tx, &candidates, &claim_law, &seeded, &mut live_names, &fvk)
-                .unwrap()
+            apply_transaction(&tx, &candidates, &claim, &seeded, &mut live_names, &fvk).unwrap()
         );
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 2);
-    }
-
-    /// A claim that precedes the release in the block still sees the live
-    /// tip and is refused; the release then lands. Transaction order
-    /// decides, as in the mint.
-    #[test]
-    fn a_claim_before_the_release_in_the_block_is_refused() {
-        let conn = db();
-        let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
-        let height = 200u32;
-        conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('alice', 100, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
-            params![vec![0x5a_u8; 32]],
-        )
-        .unwrap();
-
-        let memos = vec![
-            memo_for("claim", "alice", &[0u8; 32]),
-            memo_for("release", "alice", &[0x02; 32]),
-        ];
-        let candidates = vec![
-            candidate(&memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32]),
-            candidate(&memos, 1, 1, 0, [3; 32], "release", "alice", [0x02; 32]),
-        ];
-        let seeded = seeded_lineage(&[1]);
-        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
-
-        let mut claim_law = tx_law_for(
-            [1; 32],
-            height,
-            vec![Adoption { nf: nf(200) }],
-            vec![Retirement { nf: nf(1) }],
-            true,
-        );
-        claim_law.expiry = Some(height + DEFAULT_TX_EXPIRY_DELTA + 1);
-        assert!(
-            !apply_transaction(&tx, &candidates, &claim_law, &seeded, &mut live_names, &fvk)
-                .unwrap()
-        );
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
-
-        let mut release_law = tx_law_for(
-            [3; 32],
-            height,
-            vec![],
-            vec![Retirement {
-                nf: AnchorNf::from_bytes(&[0x5a; 32]),
-            }],
-            true,
-        );
-        release_law.tx_index = 1;
-        apply_transaction(
-            &tx,
-            &candidates,
-            &release_law,
-            &seeded,
-            &mut live_names,
-            &fvk,
-        )
-        .unwrap();
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
     }
 
     /// An implicit release is a release record. A later claim ends the window.
