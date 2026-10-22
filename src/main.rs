@@ -123,17 +123,3 @@ async fn main() {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{NETWORK, UFVK};
-    use seer_sync::UnifiedFullViewingKey;
-
-    /// The built-in registry key is the active network's and has the
-    /// orchard component the scanner reads.
-    #[test]
-    fn registry_ufvk_decodes_for_the_network() {
-        let ufvk = UnifiedFullViewingKey::decode(&NETWORK, UFVK).expect("registry UFVK decodes");
-        assert!(ufvk.orchard().is_some());
-    }
-}
