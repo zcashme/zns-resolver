@@ -68,23 +68,13 @@ async fn main() {
         .with_max_level(LevelFilter::INFO)
         .init();
 
-    // --- The registry key: decoded before anything persists it — a bad key
-    // --- stops here and never poisons the registry_account row. ---
-    let fvk = match UnifiedFullViewingKey::decode(&NETWORK, UFVK) {
-        Ok(decoded) => match decoded.orchard() {
-            Some(fvk) => fvk.clone(),
-            None => {
-                tracing::error!(
-                    "fatal: resolver is unconfigured — registry UFVK has no orchard component"
-                );
-                std::process::exit(1);
-            }
-        },
-        Err(error) => {
-            tracing::error!(error = %error, "fatal: resolver is unconfigured — registry UFVK failed to decode");
-            std::process::exit(1);
-        }
-    };
+    // --- The registry key is decoded before anything persists it: a bad key
+    // --- panics here and never poisons the registry_account row. ---
+    let registry_fvk = UnifiedFullViewingKey::decode(&NETWORK, UFVK)
+        .expect("registry UFVK decodes")
+        .orchard()
+        .expect("registry UFVK has an orchard component")
+        .clone();
 
     // --- Network path: the live chain head, observed and published ---
     let (tip_tx, tip_rx) = tokio::sync::watch::channel(None);
@@ -112,7 +102,7 @@ async fn main() {
     tracing::info!(network = ?NETWORK, birthday = MINT_BIRTHDAY, "starting indexer");
     let account = Registry {
         db,
-        fvk,
+        fvk: registry_fvk,
         pending: Pending::new(),
     };
 
@@ -121,19 +111,5 @@ async fn main() {
             tracing::warn!(%error, "sync error; reconnecting");
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{NETWORK, UFVK};
-    use seer_sync::UnifiedFullViewingKey;
-
-    /// The built-in registry key is the active network's and has the
-    /// orchard component the scanner reads.
-    #[test]
-    fn registry_ufvk_decodes_for_the_network() {
-        let ufvk = UnifiedFullViewingKey::decode(&NETWORK, UFVK).expect("registry UFVK decodes");
-        assert!(ufvk.orchard().is_some());
     }
 }
