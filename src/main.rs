@@ -70,7 +70,7 @@ async fn main() {
 
     // --- The registry key is decoded before anything persists it: a bad key
     // --- panics here and never poisons the registry_account row. ---
-    let fvk = UnifiedFullViewingKey::decode(&NETWORK, UFVK)
+    let registry_fvk = UnifiedFullViewingKey::decode(&NETWORK, UFVK)
         .expect("registry UFVK decodes")
         .orchard()
         .expect("registry UFVK has an orchard component")
@@ -102,7 +102,7 @@ async fn main() {
     tracing::info!(network = ?NETWORK, birthday = MINT_BIRTHDAY, "starting indexer");
     let account = Registry {
         db,
-        fvk,
+        fvk: registry_fvk,
         pending: Pending::new(),
     };
 
