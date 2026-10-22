@@ -200,7 +200,7 @@ describe("ZNS", () => {
     it("selects the mainnet preset by network", () => {
       const z = new ZNS({ network: "mainnet" });
       expect(z.network).toBe("mainnet");
-      expect(z.url).toBe("https://light.zcash.me/zns-mainnet");
+      expect(z.url).toBe("https://main.zcashnames.com");
     });
 
     it("an explicit url always wins over the preset", () => {
@@ -236,7 +236,7 @@ describe("ZNS", () => {
       await expect(z.verify()).resolves.toBeUndefined();
     });
 
-    it("passes against the mainnet indexer serving viewing_key", async () => {
+    it("passes when the server serves the baked mainnet viewing key", async () => {
       const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
       stubStatus({
         synced_height: 1,
@@ -264,6 +264,21 @@ describe("ZNS", () => {
 
       const status = await z.status();
       expect(status.viewingKey).toBe(ZNS_NETWORKS.mainnet.viewingKey);
+    });
+
+    it("reports the treasury address through the treasuryAddress field", async () => {
+      const z = new ZNS({ network: "testnet", url: "https://resolver.example" });
+      vi.stubGlobal("fetch", vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ result: {
+          synced_height: 4529119,
+          viewing_key: ZNS_NETWORKS.testnet.viewingKey,
+          treasury_address: ZNS_NETWORKS.testnet.treasuryAddress,
+        } }),
+      })));
+
+      const status = await z.status();
+      expect(status.treasuryAddress).toBe(ZNS_NETWORKS.testnet.treasuryAddress);
     });
 
     it("throws with upgrade guidance on a key mismatch", async () => {
@@ -360,4 +375,91 @@ describe("ZNS", () => {
     });
   });
 
+  describe("endpoint fallback", () => {
+    const okStatus = { result: { synced_height: 1, viewing_key: "uview-x" } };
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("uses the mainnet preset's endpoints in order", () => {
+      const z = new ZNS({ network: "mainnet" });
+      expect(z.url).toBe("https://main.zcashnames.com");
+    });
+
+    it("falls back to the next endpoint when one is unreachable", async () => {
+      const fetchMock = vi.fn(async (url: string) => {
+        if (url === "https://main.zcashnames.com") throw new TypeError("fetch failed");
+        return { ok: true, json: async () => okStatus };
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const status = await new ZNS({ network: "mainnet" }).status();
+      expect(status.syncedHeight).toBe(1);
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+        "https://main.zcashnames.com",
+        "https://light.zcash.me/zns-mainnet",
+      ]);
+    });
+
+    it("falls back on a server error", async () => {
+      const fetchMock = vi.fn(async (url: string) => {
+        if (url === "https://main.zcashnames.com") {
+          return { ok: false, status: 503, statusText: "Unavailable" };
+        }
+        return { ok: true, json: async () => okStatus };
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(new ZNS({ network: "mainnet" }).status()).resolves.toMatchObject({
+        syncedHeight: 1,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not fall back when the resolver answers with an RPC error", async () => {
+      const fetchMock = vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ error: { code: -1, message: "nope" } }),
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(new ZNS({ network: "mainnet" }).status()).rejects.toThrow(/nope/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not fall back on a client error", async () => {
+      const fetchMock = vi.fn(async () => ({
+        ok: false,
+        status: 404,
+        statusText: "Not Found",
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(new ZNS({ network: "mainnet" }).status()).rejects.toThrow(/404/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("throws the last failure when every endpoint is unreachable", async () => {
+      const fetchMock = vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(new ZNS({ network: "mainnet" }).status()).rejects.toThrow(/fetch failed/);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not fall back when an explicit url is set", async () => {
+      const fetchMock = vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(
+        new ZNS({ network: "mainnet", url: "https://resolver.example" }).status(),
+      ).rejects.toThrow(/fetch failed/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+  });
 });

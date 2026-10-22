@@ -27,8 +27,8 @@ console.log(available);
 
 ## Networks and verification
 
-The client ships per-network endpoint presets and the registry viewing keys
-the live resolvers serve today:
+The client ships per-network endpoint presets, the registry viewing keys, and
+the mint's treasury addresses, as the live resolvers serve them today:
 
 ```ts
 import { ZNS, ZNS_NETWORKS } from "zcashname-sdk";
@@ -40,10 +40,13 @@ await zns.verify(); // throws unless status().viewingKey matches the baked key
 `verify()` fails closed: either the endpoint is not the ZNS resolver, or this
 SDK predates a registry rotation — upgrade the package.
 
-> ⚠️ **0.14.0-rc releases carry placeholder registry keys** (mainnet still
-> runs the legacy indexer, whose key is UIVK-era). The final ceremony keys
-> will replace them and the rc line will be superseded. Do not pin `rc.*`
-> in anything durable.
+`ZNS_NETWORKS[network].treasuryAddress` is the same address `status()` returns
+as `treasuryAddress`. `verify()` checks the viewing key only.
+
+Each preset lists its endpoints in `ZNS_NETWORKS[network].urls`. Mainnet tries
+`main.zcashnames.com` first and falls back to `light.zcash.me/zns-mainnet` when
+it cannot be reached. A resolver's own error reply is returned as is, with no
+fallback. Passing `url` to the constructor uses that one endpoint only.
 
 ## Reverse lookup
 
