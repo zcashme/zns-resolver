@@ -200,7 +200,7 @@ describe("ZNS", () => {
     it("selects the mainnet preset by network", () => {
       const z = new ZNS({ network: "mainnet" });
       expect(z.network).toBe("mainnet");
-      expect(z.url).toBe("https://light.zcash.me/zns-mainnet");
+      expect(z.url).toBe("https://main.zcashnames.com");
     });
 
     it("an explicit url always wins over the preset", () => {
