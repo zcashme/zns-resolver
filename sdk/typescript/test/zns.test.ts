@@ -266,6 +266,21 @@ describe("ZNS", () => {
       expect(status.viewingKey).toBe(ZNS_NETWORKS.mainnet.viewingKey);
     });
 
+    it("reports the treasury address through the treasuryAddress field", async () => {
+      const z = new ZNS({ network: "testnet", url: "https://resolver.example" });
+      vi.stubGlobal("fetch", vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ result: {
+          synced_height: 4529119,
+          viewing_key: ZNS_NETWORKS.testnet.viewingKey,
+          treasury_address: ZNS_NETWORKS.testnet.treasuryAddress,
+        } }),
+      })));
+
+      const status = await z.status();
+      expect(status.treasuryAddress).toBe(ZNS_NETWORKS.testnet.treasuryAddress);
+    });
+
     it("throws with upgrade guidance on a key mismatch", async () => {
       const z = new ZNS({ network: "testnet", url: "https://resolver.example" });
       stubStatus({ synced_height: 1, viewing_key: "uviewtest1rotated" });
