@@ -236,7 +236,7 @@ pub(crate) fn apply_batch(
                 }
                 // The mint only speaks revision-0 unified encoding (ZIP 316);
                 // a later revision is a UA the mint cannot have produced.
-                if revision != zcash_protocol::address::Revision::R0 {
+                if revision != zcash_address::unified::Revision::R0 {
                     candidate_dropped("ua is not revision 0", &txid, *action_index);
                     continue;
                 }
@@ -2042,7 +2042,7 @@ mod admission {
     fn test_ua() -> String {
         let network = crate::NETWORK.network_type();
         unified::Address::try_from_items(
-            zcash_protocol::address::Revision::R0,
+            zcash_address::unified::Revision::R0,
             vec![unified::Uitem::Data(unified::Receiver::Orchard([0x03; 43]))],
         )
         .expect("orchard-only UA")
