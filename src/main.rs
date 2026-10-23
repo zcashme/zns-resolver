@@ -106,7 +106,7 @@ async fn main() {
     };
 
     loop {
-        if let Err(error) = seer_sync::run(UFVK, NETWORK, &account).await {
+        if let Err(error) = seer_sync::run(UFVK, &NETWORK, &account).await {
             tracing::warn!(%error, "sync error; reconnecting");
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
