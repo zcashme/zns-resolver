@@ -10,7 +10,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zcashme/zns-resolver"
-homepage = "https://zns.xyz"
+homepage = "https://zcashnames.com/docs"
 categories = ["cryptography::cryptocurrencies", "database"]
 keywords = ["zcash", "zns", "name-service", "resolver"]
 publish = false
@@ -44,7 +44,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = true }
 
 [patch.crates-io]
-# The zns-orchard fork for the whole graph, for `zns_nullifier`.
+# zns-orchard in place of crates.io orchard, for its `unsafe-zns` API.
 orchard = { git = "https://github.com/zcashme/orchard.git", tag = "zns-orchard-v0.16.0" }
 
 [dev-dependencies]
