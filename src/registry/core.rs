@@ -2863,8 +2863,8 @@ mod admission {
         use seer_sync::sync::scan::WalletTx;
         use seer_sync::Cursor;
         use zcash_primitives::block::BlockHash;
-        use zcash_primitives::transaction::TxId;
         use zcash_protocol::consensus::BlockHeight;
+        use zcash_protocol::TxId;
 
         let conn = db();
         conn.execute(
