@@ -2026,7 +2026,7 @@ mod admission {
     use orchard::keys::SpendingKey;
     use orchard::note::NoteVersion;
     use zcash_address::unified;
-    use zcash_protocol::consensus::NetworkType;
+    use zcash_protocol::consensus::Parameters;
     use zns_verify::zns_psi_rcm;
 
     const RAW_ADDR: [u8; 43] = [
@@ -2040,11 +2040,7 @@ mod admission {
 
     /// An orchard-only unified address for the active network.
     fn test_ua() -> String {
-        let network = if cfg!(feature = "testnet") {
-            NetworkType::Test
-        } else {
-            NetworkType::Main
-        };
+        let network = crate::NETWORK.network_type();
         unified::Address::try_from_items(
             zcash_protocol::address::Revision::R0,
             vec![unified::Uitem::Data(unified::Receiver::Orchard([0x03; 43]))],
