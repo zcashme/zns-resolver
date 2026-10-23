@@ -8,7 +8,7 @@ RUN test -n "$FEATURES" || (echo "FEATURES required (testnet or mainnet)" && exi
 WORKDIR /build
 
 # Dependency cache layer: manifests + lockfile first, fetch everything
-# (registry + git deps + the orchard patch), build against a stub main.
+# (registry crates + the orchard patch), build against a stub main.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo fetch
 RUN cargo build --release --no-default-features --features "$FEATURES"

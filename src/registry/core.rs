@@ -236,7 +236,7 @@ pub(crate) fn apply_batch(
                 }
                 // The mint only speaks revision-0 unified encoding (ZIP 316);
                 // a later revision is a UA the mint cannot have produced.
-                if revision != zcash_protocol::address::Revision::R0 {
+                if revision != zcash_address::unified::Revision::R0 {
                     candidate_dropped("ua is not revision 0", &txid, *action_index);
                     continue;
                 }
@@ -2026,7 +2026,7 @@ mod admission {
     use orchard::keys::SpendingKey;
     use orchard::note::NoteVersion;
     use zcash_address::unified;
-    use zcash_protocol::consensus::NetworkType;
+    use zcash_protocol::consensus::Parameters;
     use zns_verify::zns_psi_rcm;
 
     const RAW_ADDR: [u8; 43] = [
@@ -2040,13 +2040,9 @@ mod admission {
 
     /// An orchard-only unified address for the active network.
     fn test_ua() -> String {
-        let network = if cfg!(feature = "testnet") {
-            NetworkType::Test
-        } else {
-            NetworkType::Main
-        };
+        let network = crate::NETWORK.network_type();
         unified::Address::try_from_items(
-            zcash_protocol::address::Revision::R0,
+            unified::Revision::R0,
             vec![unified::Uitem::Data(unified::Receiver::Orchard([0x03; 43]))],
         )
         .expect("orchard-only UA")
@@ -2867,8 +2863,8 @@ mod admission {
         use seer_sync::sync::scan::WalletTx;
         use seer_sync::Cursor;
         use zcash_primitives::block::BlockHash;
-        use zcash_primitives::transaction::TxId;
         use zcash_protocol::consensus::BlockHeight;
+        use zcash_protocol::TxId;
 
         let conn = db();
         conn.execute(
