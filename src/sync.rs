@@ -21,7 +21,7 @@ pub(crate) struct Registry {
 /// The network path: observes the chain head live and publishes it to status
 /// readers. Separate from the indexer — the tip is an observation, never
 /// correctness state, so it is never persisted.
-pub(crate) async fn live_tip<P: Parameters + Send + 'static>(
+pub(crate) async fn live_tip<P: Parameters + Send + Sync + 'static>(
     tip_tx: watch::Sender<Option<u32>>,
     params: P,
 ) {
