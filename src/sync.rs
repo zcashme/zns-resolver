@@ -8,9 +8,16 @@ use seer_sync::sync::chain::LwdClient;
 use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Account, Cursor as SeerCursor, Resume};
 use tokio::sync::watch;
-use zcash_protocol::consensus::{BlockHeight, Parameters};
+use zcash_protocol::consensus::{BlockHeight, Network};
 
 use crate::registry::{core, Db};
+
+/// The chain head as last reported by lightwalletd: `None` while no server
+/// answers.
+pub(crate) type ChainTip = watch::Receiver<Option<BlockHeight>>;
+
+/// How long a tip poll or reconnect may take before it counts as failed.
+const TIP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The resolver's local registry replica as a seer-sync account.
 pub(crate) struct Registry {
@@ -21,33 +28,39 @@ pub(crate) struct Registry {
 /// The network path: observes the chain head live and publishes it to status
 /// readers. Separate from the indexer — the tip is an observation, never
 /// correctness state, so it is never persisted.
-pub(crate) async fn live_tip<P: Parameters + Send + Sync + 'static>(
-    tip_tx: watch::Sender<Option<u32>>,
-    params: P,
-) {
-    let mut client = LwdClient::connect_auto(&params).await.ok();
+pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<BlockHeight>>, network: Network) {
+    let mut client = None;
 
     loop {
         if client.is_none() {
-            client = LwdClient::connect_auto(&params).await.ok();
+            client = tokio::time::timeout(TIP_TIMEOUT, LwdClient::connect_auto(&network))
+                .await
+                .ok()
+                .and_then(Result::ok);
             if client.is_none() {
                 tracing::warn!("no lightwalletd server for the tip publisher; retrying");
+                let _ = tip_tx.send(None);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
         }
         let client_ref = client.as_mut().expect("checked above");
 
-        match client_ref.latest_block().await {
-            Ok((height, _)) => {
-                let _ = tip_tx.send(Some(u32::from(height)));
+        // A failed poll reconnects at once, so a blip never shows as unsynced.
+        match tokio::time::timeout(TIP_TIMEOUT, client_ref.latest_block()).await {
+            Ok(Ok((height, _))) => {
+                let _ = tip_tx.send(Some(height));
+                tokio::time::sleep(Duration::from_secs(30)).await;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!(%error, "tip poll failed; reconnecting");
-                client = LwdClient::connect_auto(&params).await.ok();
+                client = None;
+            }
+            Err(_) => {
+                tracing::warn!("tip poll timed out; reconnecting");
+                client = None;
             }
         }
-        tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 

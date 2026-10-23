@@ -1064,16 +1064,6 @@ pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8
     rows.collect()
 }
 
-/// The registry's UFVK. The account row is guaranteed at open; a missing row
-/// is a broken database and fails loudly.
-pub(crate) fn registry_ufvk(conn: &Connection) -> rusqlite::Result<String> {
-    conn.query_row(
-        "SELECT ufvk FROM registry_account WHERE id = 0",
-        [],
-        |row| row.get(0),
-    )
-}
-
 pub(crate) fn resolve_by_name(
     conn: &Connection,
     name: &str,

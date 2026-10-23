@@ -85,14 +85,15 @@ pub struct EventsPage {
 pub struct Status {
     /// Height up to which we have verified and indexed name bindings.
     pub synced_height: u64,
-    /// Whether indexing has reached the chain head (as of the last tip poll).
+    /// Whether indexing has reached the chain head as last reported by
+    /// lightwalletd; `false` while no server answers.
     pub synced: bool,
     /// The viewing key (as a string) used to observe name bindings.
     /// Exposed so clients can verify they are talking to the expected resolver.
-    pub viewing_key: String,
+    pub viewing_key: &'static str,
     /// Treasury payment address, published by the mint. Informational:
     /// displayed against claims; nothing verifies funds against it.
-    pub treasury_address: String,
+    pub treasury_address: &'static str,
 }
 
 // ── conversions: registry rows → API DTOs (total and context-free) ──────────
