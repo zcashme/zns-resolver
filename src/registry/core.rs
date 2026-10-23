@@ -2042,7 +2042,7 @@ mod admission {
     fn test_ua() -> String {
         let network = crate::NETWORK.network_type();
         unified::Address::try_from_items(
-            zcash_address::unified::Revision::R0,
+            unified::Revision::R0,
             vec![unified::Uitem::Data(unified::Receiver::Orchard([0x03; 43]))],
         )
         .expect("orchard-only UA")
