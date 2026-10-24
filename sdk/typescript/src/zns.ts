@@ -98,27 +98,6 @@ export interface OtpMemo {
 const MAX_TERM_YEARS = 99;
 const SIX_DIGITS_RE = /^\d{6}$/;
 
-function checkName(name: string): string {
-  if (!isValidName(name)) {
-    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
-  }
-  return name;
-}
-
-function checkUa(ua: string): string {
-  if (!isValidUnifiedAddress(ua)) {
-    throw new Error("ZNS: not a unified address the mint accepts.");
-  }
-  return ua;
-}
-
-function checkSixDigits(value: string, label: string): string {
-  if (!SIX_DIGITS_RE.test(value)) {
-    throw new Error(`ZNS: the ${label} is six digits.`);
-  }
-  return value;
-}
-
 function termField(term: ZnsTerm): string {
   if (term === "forever") return "forever";
   const { years } = term;
@@ -136,12 +115,20 @@ export function buildClaimMemo(input: {
   term: ZnsTerm;
   accessCode?: string;
 }): string {
-  const fields = ["ZNS", "claim"];
-  if (input.accessCode !== undefined) {
-    fields.push(checkSixDigits(input.accessCode, "access code"));
+  const { name, ua, accessCode } = input;
+  if (accessCode !== undefined && !SIX_DIGITS_RE.test(accessCode)) {
+    throw new Error("ZNS: the access code is six digits.");
   }
-  fields.push(termField(input.term), checkName(input.name), checkUa(input.ua));
-  return fields.join(":");
+  const term = termField(input.term);
+  if (!isValidName(name)) {
+    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  }
+  if (!isValidUnifiedAddress(ua)) {
+    throw new Error("ZNS: not a unified address the mint accepts.");
+  }
+  return accessCode === undefined
+    ? `ZNS:claim:${term}:${name}:${ua}`
+    : `ZNS:claim:${accessCode}:${term}:${name}:${ua}`;
 }
 
 /** Update request: `ZNS:update:<term or none>:<name>:<ua>`. Without a
@@ -151,29 +138,46 @@ export function buildUpdateMemo(input: {
   ua: string;
   term?: ZnsTerm;
 }): string {
+  const { name, ua } = input;
   const term = input.term === undefined ? "none" : termField(input.term);
-  return ["ZNS", "update", term, checkName(input.name), checkUa(input.ua)].join(":");
+  if (!isValidName(name)) {
+    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  }
+  if (!isValidUnifiedAddress(ua)) {
+    throw new Error("ZNS: not a unified address the mint accepts.");
+  }
+  return `ZNS:update:${term}:${name}:${ua}`;
 }
 
 /** Release request: `ZNS:release:<name>:<ua>`. */
 export function buildReleaseMemo(input: { name: string; ua: string }): string {
-  return ["ZNS", "release", checkName(input.name), checkUa(input.ua)].join(":");
+  const { name, ua } = input;
+  if (!isValidName(name)) {
+    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  }
+  if (!isValidUnifiedAddress(ua)) {
+    throw new Error("ZNS: not a unified address the mint accepts.");
+  }
+  return `ZNS:release:${name}:${ua}`;
 }
 
 /** OTP memo: `ZNS:otp:<otp code>:<name>:<update or release>:<ua>`. The mint sends
  *  it as the challenge; the wallet sends the same text back. */
 export function buildOtpMemo(input: OtpMemo): string {
-  if (input.action !== "update" && input.action !== "release") {
+  const { code, name, action, ua } = input;
+  if (action !== "update" && action !== "release") {
     throw new Error("ZNS: only updates and releases are challenged.");
   }
-  return [
-    "ZNS",
-    "otp",
-    checkSixDigits(input.code, "OTP code"),
-    checkName(input.name),
-    input.action,
-    checkUa(input.ua),
-  ].join(":");
+  if (!SIX_DIGITS_RE.test(code)) {
+    throw new Error("ZNS: the OTP code is six digits.");
+  }
+  if (!isValidName(name)) {
+    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  }
+  if (!isValidUnifiedAddress(ua)) {
+    throw new Error("ZNS: not a unified address the mint accepts.");
+  }
+  return `ZNS:otp:${code}:${name}:${action}:${ua}`;
 }
 
 /** Read a mint challenge. Returns null for anything that is not an OTP memo.
