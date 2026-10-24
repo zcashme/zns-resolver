@@ -63,6 +63,181 @@ function isValidUnifiedAddress(address: string): boolean {
   }
 }
 
+// ── Mint request memos ───────────────────────────────────────────────────────
+//
+// Mirrors zns-mint/src/mint.rs (`Request::decode`, `OtpMemo`). These build the
+// text a wallet sends to the mint's treasury address. They hold no keys and
+// send nothing: the wallet pays, the mint reads the memo. Every builder throws
+// on input the mint would refuse, so a payment never carries a memo the mint
+// ignores. The longest valid memo is 306 bytes, well inside the 512-byte field.
+//
+//   ZNS:claim:[<code>:]<term>:<name>:<ua>
+//   ZNS:update:<none|<N>y|forever>:<name>:<ua>
+//   ZNS:release:<name>:<ua>
+//   ZNS:otp:<code>:<name>:<update|release>:<ua>
+
+/** A registration term: 1–99 whole years, or forever. */
+export type ZnsTerm = { years: number } | "forever";
+
+/** Actions the mint challenges with an OTP. Claims are never challenged. */
+export type OtpAction = "update" | "release";
+
+export interface OtpMemo {
+  code: string;
+  name: string;
+  action: OtpAction;
+  ua: string;
+}
+
+const MAX_TERM_YEARS = 99;
+const SIX_DIGITS_RE = /^\d{6}$/;
+
+/** Bech32 data characters after the `u1` / `utest1` separator. */
+const UA_CHARS_RE = /^[qpzry9x8gf2tvdw0s3jn54khce6mua7l]+$/;
+
+/**
+ * Lengths of a mainnet UA the mint accepts: an Orchard receiver, optionally
+ * Sapling and/or transparent, nothing else. Testnet adds 4 (`utest` vs `u`).
+ */
+const MAINNET_UA_LENGTHS = [106, 141, 178, 213];
+const TESTNET_UA_LENGTHS = MAINNET_UA_LENGTHS.map((n) => n + 4);
+
+/**
+ * Character and length check for a controller UA. Rejects typos, truncation,
+ * other address types and any layout the mint refuses by size. It does not
+ * decode the address, so it cannot see whether an Orchard receiver is
+ * present — a Sapling-only UA has the same length as an Orchard-only one.
+ */
+function isMintableUa(ua: string): boolean {
+  const [prefix, lengths] = ua.startsWith("utest1")
+    ? ["utest1", TESTNET_UA_LENGTHS]
+    : ["u1", MAINNET_UA_LENGTHS];
+  return (
+    ua.startsWith(prefix) &&
+    lengths.includes(ua.length) &&
+    UA_CHARS_RE.test(ua.slice(prefix.length))
+  );
+}
+
+function checkName(name: string): string {
+  if (!isValidName(name)) {
+    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  }
+  return name;
+}
+
+function checkUa(ua: string): string {
+  if (!isMintableUa(ua)) {
+    throw new Error("ZNS: not a unified address the mint accepts.");
+  }
+  return ua;
+}
+
+function checkSixDigits(value: string, label: string): string {
+  if (!SIX_DIGITS_RE.test(value)) {
+    throw new Error(`ZNS: the ${label} is six digits.`);
+  }
+  return value;
+}
+
+function termField(term: ZnsTerm): string {
+  if (term === "forever") return "forever";
+  const { years } = term;
+  if (!Number.isInteger(years) || years < 1 || years > MAX_TERM_YEARS) {
+    throw new Error("ZNS: a term is 1-99 years, or forever.");
+  }
+  return `${years}y`;
+}
+
+/** Claim request: `ZNS:claim:[<code>:]<term>:<name>:<ua>`. `accessCode` is
+ *  the six-digit pre-sale code for a protected name. */
+export function buildClaimMemo(input: {
+  name: string;
+  ua: string;
+  term: ZnsTerm;
+  accessCode?: string;
+}): string {
+  const fields = ["ZNS", "claim"];
+  if (input.accessCode !== undefined) {
+    fields.push(checkSixDigits(input.accessCode, "access code"));
+  }
+  fields.push(termField(input.term), checkName(input.name), checkUa(input.ua));
+  return fields.join(":");
+}
+
+/** Update request: `ZNS:update:<none|<N>y|forever>:<name>:<ua>`. Without a
+ *  `term` the current expiry carries forward. */
+export function buildUpdateMemo(input: {
+  name: string;
+  ua: string;
+  term?: ZnsTerm;
+}): string {
+  const term = input.term === undefined ? "none" : termField(input.term);
+  return ["ZNS", "update", term, checkName(input.name), checkUa(input.ua)].join(":");
+}
+
+/** Release request: `ZNS:release:<name>:<ua>`. */
+export function buildReleaseMemo(input: { name: string; ua: string }): string {
+  return ["ZNS", "release", checkName(input.name), checkUa(input.ua)].join(":");
+}
+
+/** OTP memo: `ZNS:otp:<code>:<name>:<update|release>:<ua>`. The mint sends
+ *  it as the challenge; the wallet sends the same text back. */
+export function buildOtpMemo(input: OtpMemo): string {
+  if (input.action !== "update" && input.action !== "release") {
+    throw new Error("ZNS: only updates and releases are challenged.");
+  }
+  return [
+    "ZNS",
+    "otp",
+    checkSixDigits(input.code, "OTP code"),
+    checkName(input.name),
+    input.action,
+    checkUa(input.ua),
+  ].join(":");
+}
+
+/** Read a mint challenge. Returns null for anything that is not an OTP memo.
+ *  Trailing NUL padding from a 512-byte memo field is ignored. */
+export function parseOtpMemo(text: string): OtpMemo | null {
+  const parts = text.replace(/\0+$/, "").split(":");
+  if (parts.length !== 6 || parts[0] !== "ZNS" || parts[1] !== "otp") return null;
+  const [, , code, name, action, ua] = parts;
+  if (!SIX_DIGITS_RE.test(code) || !isValidName(name) || !isMintableUa(ua)) return null;
+  if (action !== "update" && action !== "release") return null;
+  return { code, name, action, ua };
+}
+
+function toBase64Url(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** ZIP-321 payment URI: `zcash:<address>[?amount=<ZEC>][&memo=<base64url>]`.
+ *  `amount` is a decimal ZEC string with at most 8 decimal places. */
+export function buildZip321Uri(input: {
+  address: string;
+  amount?: string;
+  memo?: string;
+}): string {
+  if (!input.address || /[?&:\s]/.test(input.address)) {
+    throw new Error("ZNS: a payment URI needs an address.");
+  }
+  const params: string[] = [];
+  if (input.amount !== undefined) {
+    if (!/^\d+(\.\d{1,8})?$/.test(input.amount)) {
+      throw new Error("ZNS: the amount is a decimal ZEC value with at most 8 decimal places.");
+    }
+    params.push(`amount=${input.amount}`);
+  }
+  if (input.memo) params.push(`memo=${toBase64Url(input.memo)}`);
+  return params.length
+    ? `zcash:${input.address}?${params.join("&")}`
+    : `zcash:${input.address}`;
+}
+
 /** The ZNS networks. */
 export type Network = "mainnet" | "testnet";
 
