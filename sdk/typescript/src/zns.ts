@@ -1,4 +1,3 @@
-import { bech32m } from "bech32";
 import type {
   Registration,
   Status,
@@ -50,17 +49,30 @@ function toRpcParams(obj: Record<string, unknown>): Record<string, unknown> {
   );
 }
 
-/** Validates a Zcash unified (u-) address. */
+/** Bech32 data characters after the `u1` / `utest1` separator. */
+const UA_CHARS_RE = /^[qpzry9x8gf2tvdw0s3jn54khce6mua7l]+$/;
+
+/**
+ * Lengths of a mainnet UA the mint accepts: an Orchard receiver, optionally
+ * Sapling and/or transparent, nothing else. Testnet adds 4 (`utest` vs `u`).
+ */
+const MAINNET_UA_LENGTHS = [106, 141, 178, 213];
+const TESTNET_UA_LENGTHS = MAINNET_UA_LENGTHS.map((n) => n + 4);
+
+/**
+ * Validates a Zcash unified address by prefix, characters and length. It does
+ * not decode the address, so it cannot see whether an Orchard receiver is
+ * present: a Sapling-only UA has the same length as an Orchard-only one.
+ */
 function isValidUnifiedAddress(address: string): boolean {
-  if (!address) return false;
-  if (address.startsWith("utest1")) return true;
-  if (address.startsWith("u1")) return true;
-  try {
-    const decoded = bech32m.decode(address);
-    return decoded.prefix === "u" || decoded.prefix === "utest";
-  } catch {
-    return false;
-  }
+  const [prefix, lengths] = address.startsWith("utest1")
+    ? ["utest1", TESTNET_UA_LENGTHS]
+    : ["u1", MAINNET_UA_LENGTHS];
+  return (
+    address.startsWith(prefix) &&
+    lengths.includes(address.length) &&
+    UA_CHARS_RE.test(address.slice(prefix.length))
+  );
 }
 
 // ── Mint request memos ───────────────────────────────────────────────────────
@@ -92,33 +104,6 @@ export interface OtpMemo {
 const MAX_TERM_YEARS = 99;
 const SIX_DIGITS_RE = /^\d{6}$/;
 
-/** Bech32 data characters after the `u1` / `utest1` separator. */
-const UA_CHARS_RE = /^[qpzry9x8gf2tvdw0s3jn54khce6mua7l]+$/;
-
-/**
- * Lengths of a mainnet UA the mint accepts: an Orchard receiver, optionally
- * Sapling and/or transparent, nothing else. Testnet adds 4 (`utest` vs `u`).
- */
-const MAINNET_UA_LENGTHS = [106, 141, 178, 213];
-const TESTNET_UA_LENGTHS = MAINNET_UA_LENGTHS.map((n) => n + 4);
-
-/**
- * Character and length check for a controller UA. Rejects typos, truncation,
- * other address types and any layout the mint refuses by size. It does not
- * decode the address, so it cannot see whether an Orchard receiver is
- * present — a Sapling-only UA has the same length as an Orchard-only one.
- */
-function isMintableUa(ua: string): boolean {
-  const [prefix, lengths] = ua.startsWith("utest1")
-    ? ["utest1", TESTNET_UA_LENGTHS]
-    : ["u1", MAINNET_UA_LENGTHS];
-  return (
-    ua.startsWith(prefix) &&
-    lengths.includes(ua.length) &&
-    UA_CHARS_RE.test(ua.slice(prefix.length))
-  );
-}
-
 function checkName(name: string): string {
   if (!isValidName(name)) {
     throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
@@ -127,7 +112,7 @@ function checkName(name: string): string {
 }
 
 function checkUa(ua: string): string {
-  if (!isMintableUa(ua)) {
+  if (!isValidUnifiedAddress(ua)) {
     throw new Error("ZNS: not a unified address the mint accepts.");
   }
   return ua;
@@ -203,7 +188,7 @@ export function parseOtpMemo(text: string): OtpMemo | null {
   const parts = text.replace(/\0+$/, "").split(":");
   if (parts.length !== 6 || parts[0] !== "ZNS" || parts[1] !== "otp") return null;
   const [, , code, name, action, ua] = parts;
-  if (!SIX_DIGITS_RE.test(code) || !isValidName(name) || !isMintableUa(ua)) return null;
+  if (!SIX_DIGITS_RE.test(code) || !isValidName(name) || !isValidUnifiedAddress(ua)) return null;
   if (action !== "update" && action !== "release") return null;
   return { code, name, action, ua };
 }
@@ -427,8 +412,8 @@ export class ZNS {
 
   /** Validate a Zcash Unified Address format.
    *  Accepts both mainnet ('u') and testnet ('utest') prefixes.
-   *  Performs basic format validation but NOT full bech32m checksum verification.
-   *  Returns true if the address looks like a unified address, false otherwise.
+   *  Checks the prefix, the bech32 characters and the length, but does NOT
+   *  decode the address or verify its checksum.
    *
    *  @todo(F4Jumble) Upgrade to full ZIP-316 decoding with F4Jumble to:
    *    - Parse actual typecodes from address items
