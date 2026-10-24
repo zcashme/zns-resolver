@@ -12,12 +12,15 @@ use zcash_protocol::consensus::{BlockHeight, Network};
 
 use crate::registry::{core, Db};
 
-/// The chain head as last reported by lightwalletd: `None` while no server
-/// answers.
+/// The chain head as last reported by lightwalletd. `None` when no server
+/// answers, when a tip read stalls, or after a second failed poll.
 pub(crate) type ChainTip = watch::Receiver<Option<BlockHeight>>;
 
 /// How long a tip poll or reconnect may take before it counts as failed.
 const TIP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Pause after an outage before the next reconnect.
+const TIP_RETRY: Duration = Duration::from_secs(5);
 
 /// The resolver's local registry replica as a seer-sync account.
 pub(crate) struct Registry {
@@ -30,6 +33,9 @@ pub(crate) struct Registry {
 /// correctness state, so it is never persisted.
 pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<BlockHeight>>, network: Network) {
     let mut client = None;
+    // One fast poll error is a blip: reconnect at once and keep the last tip.
+    // A second consecutive error, or a stalled read, clears it.
+    let mut poll_failed = false;
 
     loop {
         if client.is_none() {
@@ -40,24 +46,34 @@ pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<BlockHeight>>, network
             if client.is_none() {
                 tracing::warn!("no lightwalletd server for the tip publisher; retrying");
                 let _ = tip_tx.send(None);
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                poll_failed = false;
+                tokio::time::sleep(TIP_RETRY).await;
                 continue;
             }
         }
         let client_ref = client.as_mut().expect("checked above");
 
-        // A failed poll reconnects at once, so a blip never shows as unsynced.
         match tokio::time::timeout(TIP_TIMEOUT, client_ref.latest_block()).await {
             Ok(Ok((height, _))) => {
                 let _ = tip_tx.send(Some(height));
+                poll_failed = false;
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
             Ok(Err(error)) => {
                 tracing::warn!(%error, "tip poll failed; reconnecting");
                 client = None;
+                if poll_failed {
+                    let _ = tip_tx.send(None);
+                    poll_failed = false;
+                    tokio::time::sleep(TIP_RETRY).await;
+                } else {
+                    poll_failed = true;
+                }
             }
             Err(_) => {
                 tracing::warn!("tip poll timed out; reconnecting");
+                let _ = tip_tx.send(None);
+                poll_failed = false;
                 client = None;
             }
         }
