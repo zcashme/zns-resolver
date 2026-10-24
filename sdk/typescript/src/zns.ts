@@ -76,16 +76,11 @@ function isValidUnifiedAddress(address: string): boolean {
 
 // ── Mint request memos ───────────────────────────────────────────────────────
 //
-// Mirrors zns-mint/src/mint.rs (`Request::decode`, `OtpMemo`). These build the
-// text a wallet sends to the mint's treasury address. They hold no keys and
-// send nothing: the wallet pays, the mint reads the memo. Every builder throws
-// on input the mint would refuse, so a payment never carries a memo the mint
-// ignores. The longest valid memo is 306 bytes, well inside the 512-byte field.
-//
-//   ZNS:claim:[<code>:]<term>:<name>:<ua>
-//   ZNS:update:<none|<N>y|forever>:<name>:<ua>
-//   ZNS:release:<name>:<ua>
-//   ZNS:otp:<code>:<name>:<update|release>:<ua>
+//   Claim:                   ZNS:claim:<term>:<name>:<ua>
+//   Claim a protected name:  ZNS:claim:<access code>:<term>:<name>:<ua>
+//   Update:                  ZNS:update:<term or none>:<name>:<ua>
+//   Release:                 ZNS:release:<name>:<ua>
+//   OTP reply:               ZNS:otp:<otp code>:<name>:<update or release>:<ua>
 
 /** A registration term: 1–99 whole years, or forever. */
 export type ZnsTerm = { years: number } | "forever";
@@ -133,8 +128,8 @@ function termField(term: ZnsTerm): string {
   return `${years}y`;
 }
 
-/** Claim request: `ZNS:claim:[<code>:]<term>:<name>:<ua>`. `accessCode` is
- *  the six-digit pre-sale code for a protected name. */
+/** Claim request: `ZNS:claim:<term>:<name>:<ua>`. To claim a protected name,
+ *  set `accessCode`: `ZNS:claim:<access code>:<term>:<name>:<ua>`. */
 export function buildClaimMemo(input: {
   name: string;
   ua: string;
@@ -149,7 +144,7 @@ export function buildClaimMemo(input: {
   return fields.join(":");
 }
 
-/** Update request: `ZNS:update:<none|<N>y|forever>:<name>:<ua>`. Without a
+/** Update request: `ZNS:update:<term or none>:<name>:<ua>`. Without a
  *  `term` the current expiry carries forward. */
 export function buildUpdateMemo(input: {
   name: string;
@@ -165,7 +160,7 @@ export function buildReleaseMemo(input: { name: string; ua: string }): string {
   return ["ZNS", "release", checkName(input.name), checkUa(input.ua)].join(":");
 }
 
-/** OTP memo: `ZNS:otp:<code>:<name>:<update|release>:<ua>`. The mint sends
+/** OTP memo: `ZNS:otp:<otp code>:<name>:<update or release>:<ua>`. The mint sends
  *  it as the challenge; the wallet sends the same text back. */
 export function buildOtpMemo(input: OtpMemo): string {
   if (input.action !== "update" && input.action !== "release") {
