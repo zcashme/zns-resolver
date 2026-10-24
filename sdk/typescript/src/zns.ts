@@ -1,3 +1,4 @@
+import { bech32m } from "bech32";
 import type {
   Registration,
   Status,
@@ -49,9 +50,6 @@ function toRpcParams(obj: Record<string, unknown>): Record<string, unknown> {
   );
 }
 
-/** Bech32 data characters after the `u1` / `utest1` separator. */
-const UA_CHARS_RE = /^[qpzry9x8gf2tvdw0s3jn54khce6mua7l]+$/;
-
 /**
  * Lengths of a mainnet UA the mint accepts: an Orchard receiver, optionally
  * Sapling and/or transparent, nothing else. Testnet adds 4 (`utest` vs `u`).
@@ -60,19 +58,20 @@ const MAINNET_UA_LENGTHS = [106, 141, 178, 213];
 const TESTNET_UA_LENGTHS = MAINNET_UA_LENGTHS.map((n) => n + 4);
 
 /**
- * Validates a Zcash unified address by prefix, characters and length. It does
- * not decode the address, so it cannot see whether an Orchard receiver is
+ * Validates a Zcash unified address by length and bech32m checksum. It does
+ * not decode the receivers, so it cannot see whether an Orchard receiver is
  * present: a Sapling-only UA has the same length as an Orchard-only one.
  */
 function isValidUnifiedAddress(address: string): boolean {
-  const [prefix, lengths] = address.startsWith("utest1")
-    ? ["utest1", TESTNET_UA_LENGTHS]
-    : ["u1", MAINNET_UA_LENGTHS];
-  return (
-    address.startsWith(prefix) &&
-    lengths.includes(address.length) &&
-    UA_CHARS_RE.test(address.slice(prefix.length))
-  );
+  const lengths = address.startsWith("utest1") ? TESTNET_UA_LENGTHS : MAINNET_UA_LENGTHS;
+  if (!lengths.includes(address.length) || address !== address.toLowerCase()) return false;
+  try {
+    // A UA is longer than bech32's default 90-character limit.
+    const { prefix } = bech32m.decode(address, 1000);
+    return prefix === "u" || prefix === "utest";
+  } catch {
+    return false;
+  }
 }
 
 // ── Mint request memos ───────────────────────────────────────────────────────
@@ -412,8 +411,8 @@ export class ZNS {
 
   /** Validate a Zcash Unified Address format.
    *  Accepts both mainnet ('u') and testnet ('utest') prefixes.
-   *  Checks the prefix, the bech32 characters and the length, but does NOT
-   *  decode the address or verify its checksum.
+   *  Checks the length and the bech32m checksum, but does NOT decode the
+   *  receivers.
    *
    *  @todo(F4Jumble) Upgrade to full ZIP-316 decoding with F4Jumble to:
    *    - Parse actual typecodes from address items

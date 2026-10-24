@@ -49,6 +49,9 @@ describe("mint request memos", () => {
     for (const ua of [UA.slice(0, -1), `${UA}q`, UA.toUpperCase(), `${UA.slice(0, -1)}:`, "t1abc", "zs1abc", ""]) {
       expect(() => buildClaimMemo({ ...ok, ua })).toThrow(/unified address/);
     }
+    // One mistyped character, still in the bech32 alphabet: the checksum fails.
+    const typo = UA.slice(0, 50) + (UA[50] === "q" ? "p" : "q") + UA.slice(51);
+    expect(() => buildClaimMemo({ ...ok, ua: typo })).toThrow(/unified address/);
     expect(() =>
       buildOtpMemo({ code: "417293", name: "alice", action: "claim" as never, ua: UA }),
     ).toThrow(/updates and releases/);
