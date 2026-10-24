@@ -8,9 +8,19 @@ use seer_sync::sync::chain::LwdClient;
 use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Account, Cursor as SeerCursor, Resume};
 use tokio::sync::watch;
-use zcash_protocol::consensus::{BlockHeight, Parameters};
+use zcash_protocol::consensus::{BlockHeight, Network};
 
 use crate::registry::{core, Db};
+
+/// The chain head as last reported by lightwalletd. `None` when no server
+/// answers, when a tip read stalls, or after a second failed poll.
+pub(crate) type ChainTip = watch::Receiver<Option<BlockHeight>>;
+
+/// How long a tip poll or reconnect may take before it counts as failed.
+const TIP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Pause after an outage before the next reconnect.
+const TIP_RETRY: Duration = Duration::from_secs(5);
 
 /// The resolver's local registry replica as a seer-sync account.
 pub(crate) struct Registry {
@@ -21,33 +31,52 @@ pub(crate) struct Registry {
 /// The network path: observes the chain head live and publishes it to status
 /// readers. Separate from the indexer — the tip is an observation, never
 /// correctness state, so it is never persisted.
-pub(crate) async fn live_tip<P: Parameters + Send + Sync + 'static>(
-    tip_tx: watch::Sender<Option<u32>>,
-    params: P,
-) {
-    let mut client = LwdClient::connect_auto(&params).await.ok();
+pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<BlockHeight>>, network: Network) {
+    let mut client = None;
+    // One fast poll error is a blip: reconnect at once and keep the last tip.
+    // A second consecutive error, or a stalled read, clears it.
+    let mut poll_failed = false;
 
     loop {
         if client.is_none() {
-            client = LwdClient::connect_auto(&params).await.ok();
+            client = tokio::time::timeout(TIP_TIMEOUT, LwdClient::connect_auto(&network))
+                .await
+                .ok()
+                .and_then(Result::ok);
             if client.is_none() {
                 tracing::warn!("no lightwalletd server for the tip publisher; retrying");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = tip_tx.send(None);
+                poll_failed = false;
+                tokio::time::sleep(TIP_RETRY).await;
                 continue;
             }
         }
         let client_ref = client.as_mut().expect("checked above");
 
-        match client_ref.latest_block().await {
-            Ok((height, _)) => {
-                let _ = tip_tx.send(Some(u32::from(height)));
+        match tokio::time::timeout(TIP_TIMEOUT, client_ref.latest_block()).await {
+            Ok(Ok((height, _))) => {
+                let _ = tip_tx.send(Some(height));
+                poll_failed = false;
+                tokio::time::sleep(Duration::from_secs(30)).await;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!(%error, "tip poll failed; reconnecting");
-                client = LwdClient::connect_auto(&params).await.ok();
+                client = None;
+                if poll_failed {
+                    let _ = tip_tx.send(None);
+                    poll_failed = false;
+                    tokio::time::sleep(TIP_RETRY).await;
+                } else {
+                    poll_failed = true;
+                }
+            }
+            Err(_) => {
+                tracing::warn!("tip poll timed out; reconnecting");
+                let _ = tip_tx.send(None);
+                poll_failed = false;
+                client = None;
             }
         }
-        tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 
