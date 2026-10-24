@@ -93,4 +93,27 @@ describe("buildZip321Uri", () => {
       expect(() => buildZip321Uri({ address: TESTNET_UA, amount })).toThrow(/amount/);
     }
   });
+
+  it("rejects an amount above 21,000,000 ZEC", () => {
+    expect(buildZip321Uri({ address: TESTNET_UA, amount: "21000000" }))
+      .toBe(`zcash:${TESTNET_UA}?amount=21000000`);
+    expect(buildZip321Uri({ address: TESTNET_UA, amount: "21000000.00000000" }))
+      .toBe(`zcash:${TESTNET_UA}?amount=21000000.00000000`);
+    for (const amount of ["21000001", "21000000.00000001", "99999999999999999999"]) {
+      expect(() => buildZip321Uri({ address: TESTNET_UA, amount })).toThrow(/21000000 ZEC/);
+    }
+  });
+
+  it("rejects a memo longer than 512 UTF-8 bytes", () => {
+    expect(() => buildZip321Uri({ address: TESTNET_UA, memo: "a".repeat(512) })).not.toThrow();
+    expect(() => buildZip321Uri({ address: TESTNET_UA, memo: "a".repeat(513) })).toThrow(/512 bytes/);
+    // 257 two-byte characters: 257 characters, 514 bytes.
+    expect(() => buildZip321Uri({ address: TESTNET_UA, memo: "é".repeat(257) })).toThrow(/512 bytes/);
+  });
+
+  it("rejects a memo for a transparent address", () => {
+    const taddr = "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs";
+    expect(buildZip321Uri({ address: taddr, amount: "1" })).toBe(`zcash:${taddr}?amount=1`);
+    expect(() => buildZip321Uri({ address: taddr, memo: "hi" })).toThrow(/transparent/);
+  });
 });

@@ -98,6 +98,10 @@ export interface OtpMemo {
 const MAX_TERM_YEARS = 99;
 const SIX_DIGITS_RE = /^\d{6}$/;
 
+/** ZIP-321 limits: the largest payment amount in ZEC, and the memo size. */
+const MAX_MONEY = 21_000_000;
+const MAX_MEMO_BYTES = 512;
+
 function termField(term: ZnsTerm): string {
   if (term === "forever") return "forever";
   const { years } = term;
@@ -213,9 +217,22 @@ export function buildZip321Uri(input: {
     if (!/^\d+(\.\d{1,8})?$/.test(input.amount)) {
       throw new Error("ZNS: the amount is a decimal ZEC value with at most 8 decimal places.");
     }
+    // Compare the decimal string itself, not a floating-point conversion.
+    const [whole, fraction = ""] = input.amount.split(".");
+    if (Number(whole) > MAX_MONEY || (Number(whole) === MAX_MONEY && /[1-9]/.test(fraction))) {
+      throw new Error(`ZNS: the amount is more than ${MAX_MONEY} ZEC.`);
+    }
     params.push(`amount=${input.amount}`);
   }
-  if (input.memo) params.push(`memo=${toBase64Url(input.memo)}`);
+  if (input.memo) {
+    if (input.address.startsWith("t")) {
+      throw new Error("ZNS: a transparent address cannot receive a memo.");
+    }
+    if (new TextEncoder().encode(input.memo).length > MAX_MEMO_BYTES) {
+      throw new Error(`ZNS: the memo is more than ${MAX_MEMO_BYTES} bytes.`);
+    }
+    params.push(`memo=${toBase64Url(input.memo)}`);
+  }
   return params.length
     ? `zcash:${input.address}?${params.join("&")}`
     : `zcash:${input.address}`;
