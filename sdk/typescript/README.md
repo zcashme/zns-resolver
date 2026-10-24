@@ -1,8 +1,8 @@
 # Zcash Name Service TypeScript SDK
 
-Read-only TypeScript client for querying the ZNS resolver.
+TypeScript client for the ZNS resolver. It also makes the request memos that a wallet sends to the ZNS mint.
 
-This package is a read-only client for the current Name Note resolver JSON-RPC API. It does not accept, load, derive, or sign with private keys, and it does not build Name Note transactions.
+The SDK does not use private keys. It does not sign or send transactions. The wallet signs and sends each payment.
 
 ## Install
 
@@ -15,8 +15,6 @@ npm install zcashname-sdk
 ```ts
 import { ZNS } from "zcashname-sdk";
 
-// Pick a network preset (testnet is the default), or pass an explicit url
-// which always wins:
 const zns = new ZNS({ network: "mainnet" });
 const name = await zns.resolveName("alice");
 if (name) console.log(name.address);
@@ -25,61 +23,126 @@ const available = await zns.isAvailable("bob");
 console.log(available);
 ```
 
+The default network is testnet. Set `network` to `"mainnet"` for mainnet names.
+
 ## Networks and verification
 
-The client ships per-network endpoint presets, the registry viewing keys, and
-the mint's treasury addresses, as the live resolvers serve them today:
+`ZNS_NETWORKS` contains the data for each network:
+
+- `urls`: the resolver endpoints.
+- `viewingKey`: the registry viewing key.
+- `treasuryAddress`: the mint treasury address.
 
 ```ts
 import { ZNS, ZNS_NETWORKS } from "zcashname-sdk";
 
 const zns = new ZNS({ network: "testnet", timeout: 5_000 });
-await zns.verify(); // throws unless status().viewingKey matches the baked key
+await zns.verify();
 ```
 
-`verify()` fails closed: either the endpoint is not the ZNS resolver, or this
-SDK predates a registry rotation — upgrade the package.
+`verify()` compares the viewing key from the resolver with `ZNS_NETWORKS[network].viewingKey`. If the keys are different, `verify()` throws an error. There are two possible causes:
 
-`ZNS_NETWORKS[network].treasuryAddress` is the same address `status()` returns
-as `treasuryAddress`. `verify()` checks the viewing key only.
+- The endpoint is not the ZNS resolver.
+- The registry key changed after this SDK version. Upgrade the package.
 
-Each preset lists its endpoints in `ZNS_NETWORKS[network].urls`. Mainnet tries
-`main.zcashnames.com` first and falls back to `light.zcash.me/zns-mainnet` when
-it cannot be reached. A resolver's own error reply is returned as is, with no
-fallback. Passing `url` to the constructor uses that one endpoint only.
+`verify()` does not examine the treasury address.
+
+The client tries the endpoints in the order of `urls`. On mainnet, it tries `main.zcashnames.com` first and `light.zcash.me/zns-mainnet` second. The client tries the next endpoint if an endpoint does not reply, or if it replies with an HTTP 5xx error. The client does not try the next endpoint if a resolver replies with a JSON-RPC error or an HTTP 4xx error.
+
+If you set `url`, the client uses only that endpoint.
 
 ## Reverse lookup
 
 ```ts
-// All names bound to an address, with the total match count:
 const page = await zns.reverseLookup("u1...", 50, 0);
-console.log(page.total, page.items.map(r => r.name));
+console.log(page.total, page.items.map((r) => r.name));
 
-// All registered names, with the total:
 const all = await zns.listNames(50, 0);
 ```
 
-These use the resolver's typed `reverse_lookup` / `list_names` verbs and
-require the current (Name Note) resolver. The legacy mainnet indexer does
-not implement them yet.
+`reverseLookup` gives the names that point to an address. `listNames` gives all registered names. Each result also gives the total number of matches.
 
 ## Pricing
 
-The SDK carries the pricing law (mirrors the mint):
-
 ```ts
-import { ZNS_PRICING, annualUsd, foreverUsd } from "zcashname-sdk";
+import { annualUsd, foreverUsd } from "zcashname-sdk";
 
-annualUsd("alice"); // 100 — USD per year (5-char tier)
-foreverUsd("alice"); // 300 — one-time
+annualUsd("alice"); // 100: USD for each year
+foreverUsd("alice"); // 300: USD, one payment
 ```
 
-Tiers: 1-char $10,000/yr · 2-char $2,500 · 3-char $800 · 4-char $400 ·
-5-char $100 · 6+ chars $20. Forever costs 3× annual.
+The annual price depends on the length of the name:
 
-Prices are **USD**. The ZEC amount charged at payment is computed by the
-mint. `quoteZats(usd, zatsPerUsd)` converts for display when a rate is
-available; no exchange rate is baked into the SDK.
+| Length | USD for each year |
+|---|---:|
+| 1 character | 10,000 |
+| 2 characters | 2,500 |
+| 3 characters | 800 |
+| 4 characters | 400 |
+| 5 characters | 100 |
+| 6 or more characters | 20 |
+
+A forever registration costs 3 times the annual price.
+
+The prices are in USD. The mint calculates the ZEC amount at the time of payment. `quoteZats(usd, zatsPerUsd)` converts a USD price to zatoshis for display. The SDK does not contain an exchange rate.
+
+## Mint request memos
+
+Use these functions to make the memo for a claim, an update, a release, or an OTP reply. Send the memo with a payment to the mint treasury address, `ZNS_NETWORKS[network].treasuryAddress`.
+
+```ts
+import {
+  buildClaimMemo,
+  buildUpdateMemo,
+  buildReleaseMemo,
+} from "zcashname-sdk";
+
+buildClaimMemo({ name: "alice", ua, term: { years: 1 } }); // ZNS:claim:1y:alice:<ua>
+buildClaimMemo({ name: "alice", ua, term: "forever", accessCode: "123456" });
+buildUpdateMemo({ name: "alice", ua }); // ZNS:update:none:alice:<ua>
+buildReleaseMemo({ name: "alice", ua }); // ZNS:release:alice:<ua>
+```
+
+A name has 1 to 63 lowercase letters and digits. Remove a `.zcash` or `.zec` suffix before you call a function.
+
+A term is 1 to 99 years, or `"forever"`. An update without a term keeps the current expiry.
+
+An access code has 6 digits. Use it only to claim a protected name.
+
+Each function throws an error if the mint cannot accept the input.
+
+### OTP reply
+
+For an update or a release, the mint sends an OTP memo to the address of the name. Send the same memo back to the treasury address.
+
+```ts
+import { parseOtpMemo, buildOtpMemo } from "zcashname-sdk";
+
+const challenge = parseOtpMemo(memoText); // null if the memo is not an OTP memo
+if (challenge) {
+  const reply = buildOtpMemo(challenge);
+}
+```
+
+### Address check
+
+The `ua` must be a unified address with an Orchard receiver. The SDK examines the characters and the length of the address. It does not decode the address.
+
+Thus, the SDK cannot find an address that has no Orchard receiver. The mint does not accept a request with such an address.
+
+### Payment URI
+
+```ts
+import { buildZip321Uri, ZNS_NETWORKS } from "zcashname-sdk";
+
+const uri = buildZip321Uri({
+  address: ZNS_NETWORKS.mainnet.treasuryAddress,
+  amount: "0.01",
+  memo,
+});
+```
+
+The SDK does not calculate the payment amount.
 
 ## Query data
 
@@ -91,7 +154,7 @@ const history = await zns.events({ name: "alice", limit: 20 });
 const status = await zns.status();
 ```
 
-`resolveName` returns `null` when the name is not registered. List and event methods support pagination.
+`resolveName` gives `null` if the name is not registered. The list functions and `events` accept a limit and an offset.
 
 ## Configuration
 
@@ -101,11 +164,11 @@ const status = await zns.status();
 console.log(status.synced, status.syncedHeight);
 ```
 
-Pass the current resolver's JSON-RPC URL explicitly. The client reports the resolver's viewing key and sync state; it does not independently authenticate the server or verify name bindings against chain data.
+Use `url` to connect to a different resolver. The client shows the viewing key and the sync state of the resolver. It does not examine the server identity. It does not compare name records with chain data.
 
 ## CLI example
 
-The example CLI supports read-only queries: `resolve`, `available`, `status`, and `events`. It has no signing commands and accepts no private-key input.
+The example CLI has four commands: `resolve`, `available`, `status`, and `events`. It has no command that signs. It does not accept private keys.
 
 ## License
 

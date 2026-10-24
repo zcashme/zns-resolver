@@ -50,17 +50,192 @@ function toRpcParams(obj: Record<string, unknown>): Record<string, unknown> {
   );
 }
 
-/** Validates a Zcash unified (u-) address. */
+/**
+ * Lengths of a mainnet UA the mint accepts: an Orchard receiver, optionally
+ * Sapling and/or transparent, nothing else. Testnet adds 4 (`utest` vs `u`).
+ */
+const MAINNET_UA_LENGTHS = [106, 141, 178, 213];
+const TESTNET_UA_LENGTHS = MAINNET_UA_LENGTHS.map((n) => n + 4);
+
+/**
+ * Validates a Zcash unified address by length and bech32m checksum. It does
+ * not decode the receivers, so it cannot see whether an Orchard receiver is
+ * present: a Sapling-only UA has the same length as an Orchard-only one.
+ */
 function isValidUnifiedAddress(address: string): boolean {
-  if (!address) return false;
-  if (address.startsWith("utest1")) return true;
-  if (address.startsWith("u1")) return true;
+  const lengths = address.startsWith("utest1") ? TESTNET_UA_LENGTHS : MAINNET_UA_LENGTHS;
+  if (!lengths.includes(address.length) || address !== address.toLowerCase()) return false;
   try {
-    const decoded = bech32m.decode(address);
-    return decoded.prefix === "u" || decoded.prefix === "utest";
+    // A UA is longer than bech32's default 90-character limit.
+    const { prefix } = bech32m.decode(address, 1000);
+    return prefix === "u" || prefix === "utest";
   } catch {
     return false;
   }
+}
+
+// ── Mint request memos ───────────────────────────────────────────────────────
+//
+//   Claim:                   ZNS:claim:<term>:<name>:<ua>
+//   Claim a protected name:  ZNS:claim:<access code>:<term>:<name>:<ua>
+//   Update:                  ZNS:update:<term or none>:<name>:<ua>
+//   Release:                 ZNS:release:<name>:<ua>
+//   OTP reply:               ZNS:otp:<otp code>:<name>:<update or release>:<ua>
+
+/** A registration term: 1–99 whole years, or forever. */
+export type ZnsTerm = { years: number } | "forever";
+
+/** Actions the mint challenges with an OTP. Claims are never challenged. */
+export type OtpAction = "update" | "release";
+
+export interface OtpMemo {
+  code: string;
+  name: string;
+  action: OtpAction;
+  ua: string;
+}
+
+const MAX_TERM_YEARS = 99;
+const SIX_DIGITS_RE = /^\d{6}$/;
+
+/** ZIP-321 limits: the largest payment amount in ZEC, and the memo size. */
+const MAX_MONEY = 21_000_000;
+const MAX_MEMO_BYTES = 512;
+
+function termField(term: ZnsTerm): string {
+  if (term === "forever") return "forever";
+  const { years } = term;
+  if (!Number.isInteger(years) || years < 1 || years > MAX_TERM_YEARS) {
+    throw new Error("ZNS: a term is 1-99 years, or forever.");
+  }
+  return `${years}y`;
+}
+
+/** Claim request: `ZNS:claim:<term>:<name>:<ua>`. To claim a protected name,
+ *  set `accessCode`: `ZNS:claim:<access code>:<term>:<name>:<ua>`. */
+export function buildClaimMemo(input: {
+  name: string;
+  ua: string;
+  term: ZnsTerm;
+  accessCode?: string;
+}): string {
+  const { name, ua, accessCode } = input;
+  if (accessCode !== undefined && !SIX_DIGITS_RE.test(accessCode)) {
+    throw new Error("ZNS: the access code is six digits.");
+  }
+  const term = termField(input.term);
+  if (!isValidName(name)) {
+    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  }
+  if (!isValidUnifiedAddress(ua)) {
+    throw new Error("ZNS: not a unified address the mint accepts.");
+  }
+  return accessCode === undefined
+    ? `ZNS:claim:${term}:${name}:${ua}`
+    : `ZNS:claim:${accessCode}:${term}:${name}:${ua}`;
+}
+
+/** Update request: `ZNS:update:<term or none>:<name>:<ua>`. Without a
+ *  `term` the current expiry carries forward. */
+export function buildUpdateMemo(input: {
+  name: string;
+  ua: string;
+  term?: ZnsTerm;
+}): string {
+  const { name, ua } = input;
+  const term = input.term === undefined ? "none" : termField(input.term);
+  if (!isValidName(name)) {
+    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  }
+  if (!isValidUnifiedAddress(ua)) {
+    throw new Error("ZNS: not a unified address the mint accepts.");
+  }
+  return `ZNS:update:${term}:${name}:${ua}`;
+}
+
+/** Release request: `ZNS:release:<name>:<ua>`. */
+export function buildReleaseMemo(input: { name: string; ua: string }): string {
+  const { name, ua } = input;
+  if (!isValidName(name)) {
+    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  }
+  if (!isValidUnifiedAddress(ua)) {
+    throw new Error("ZNS: not a unified address the mint accepts.");
+  }
+  return `ZNS:release:${name}:${ua}`;
+}
+
+/** OTP memo: `ZNS:otp:<otp code>:<name>:<update or release>:<ua>`. The mint sends
+ *  it as the challenge; the wallet sends the same text back. */
+export function buildOtpMemo(input: OtpMemo): string {
+  const { code, name, action, ua } = input;
+  if (action !== "update" && action !== "release") {
+    throw new Error("ZNS: only updates and releases are challenged.");
+  }
+  if (!SIX_DIGITS_RE.test(code)) {
+    throw new Error("ZNS: the OTP code is six digits.");
+  }
+  if (!isValidName(name)) {
+    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  }
+  if (!isValidUnifiedAddress(ua)) {
+    throw new Error("ZNS: not a unified address the mint accepts.");
+  }
+  return `ZNS:otp:${code}:${name}:${action}:${ua}`;
+}
+
+/** Read a mint challenge. Returns null for anything that is not an OTP memo.
+ *  Trailing NUL padding from a 512-byte memo field is ignored. */
+export function parseOtpMemo(text: string): OtpMemo | null {
+  const parts = text.replace(/\0+$/, "").split(":");
+  if (parts.length !== 6 || parts[0] !== "ZNS" || parts[1] !== "otp") return null;
+  const [, , code, name, action, ua] = parts;
+  if (!SIX_DIGITS_RE.test(code) || !isValidName(name) || !isValidUnifiedAddress(ua)) return null;
+  if (action !== "update" && action !== "release") return null;
+  return { code, name, action, ua };
+}
+
+function toBase64Url(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** ZIP-321 payment URI: `zcash:<address>[?amount=<ZEC>][&memo=<base64url>]`.
+ *  `amount` is a decimal ZEC string with at most 8 decimal places. */
+export function buildZip321Uri(input: {
+  address: string;
+  amount?: string;
+  memo?: string;
+}): string {
+  if (!input.address || /[?&:\s]/.test(input.address)) {
+    throw new Error("ZNS: a payment URI needs an address.");
+  }
+  const params: string[] = [];
+  if (input.amount !== undefined) {
+    if (!/^\d+(\.\d{1,8})?$/.test(input.amount)) {
+      throw new Error("ZNS: the amount is a decimal ZEC value with at most 8 decimal places.");
+    }
+    // Compare the decimal string itself, not a floating-point conversion.
+    const [whole, fraction = ""] = input.amount.split(".");
+    if (Number(whole) > MAX_MONEY || (Number(whole) === MAX_MONEY && /[1-9]/.test(fraction))) {
+      throw new Error(`ZNS: the amount is more than ${MAX_MONEY} ZEC.`);
+    }
+    params.push(`amount=${input.amount}`);
+  }
+  if (input.memo) {
+    if (input.address.startsWith("t")) {
+      throw new Error("ZNS: a transparent address cannot receive a memo.");
+    }
+    if (new TextEncoder().encode(input.memo).length > MAX_MEMO_BYTES) {
+      throw new Error(`ZNS: the memo is more than ${MAX_MEMO_BYTES} bytes.`);
+    }
+    params.push(`memo=${toBase64Url(input.memo)}`);
+  }
+  return params.length
+    ? `zcash:${input.address}?${params.join("&")}`
+    : `zcash:${input.address}`;
 }
 
 /** The ZNS networks. */
@@ -252,8 +427,8 @@ export class ZNS {
 
   /** Validate a Zcash Unified Address format.
    *  Accepts both mainnet ('u') and testnet ('utest') prefixes.
-   *  Performs basic format validation but NOT full bech32m checksum verification.
-   *  Returns true if the address looks like a unified address, false otherwise.
+   *  Checks the length and the bech32m checksum, but does NOT decode the
+   *  receivers.
    *
    *  @todo(F4Jumble) Upgrade to full ZIP-316 decoding with F4Jumble to:
    *    - Parse actual typecodes from address items
