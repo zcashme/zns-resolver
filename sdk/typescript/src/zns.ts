@@ -19,10 +19,11 @@ function isValidName(name: string): boolean {
 }
 
 /**
- * Canonicalizes lookup input by trimming whitespace and lowercasing.
+ * Canonicalizes lookup input by trimming whitespace and lowercasing
+ * ASCII letters.
  */
 function normalizeName(name: string): string {
-  return name.trim().toLowerCase();
+  return name.trim().replace(/[A-Z]/g, (letter) => letter.toLowerCase());
 }
 
 /**

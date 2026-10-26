@@ -46,6 +46,11 @@ describe("ZNS", () => {
       expect(zns.normalizeName("alice.eth")).toBe("alice.eth");
       expect(zns.normalizeName("alice.")).toBe("alice.");
     });
+
+    it("lowercases ASCII letters only", () => {
+      expect(zns.normalizeName("\u212A")).toBe("\u212A");
+      expect(zns.isValidName(zns.normalizeName("\u212A"))).toBe(false);
+    });
   });
 
   describe("resolveName normalization", () => {
