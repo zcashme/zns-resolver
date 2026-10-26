@@ -27,7 +27,7 @@ pub enum Action {
     Release,
 }
 
-/// Trims whitespace and lowercases a lookup name, like the TypeScript client.
+/// Trims whitespace and lowercases ASCII letters.
 pub fn normalize_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
@@ -172,7 +172,13 @@ impl ResolverClient {
     }
 
     /// Checks whether a canonical name is available.
+    ///
+    /// A name that is not 1–63 lowercase letters or digits after trimming
+    /// and ASCII lowercasing is not available.
     pub async fn is_available(&self, name: &str) -> Result<bool, Error> {
+        if !is_valid_name(&normalize_name(name)) {
+            return Ok(false);
+        }
         Ok(self.resolve_name(name).await?.is_none())
     }
 
@@ -345,5 +351,8 @@ mod tests {
         assert!(!is_valid_name("a-name"));
         assert!(is_valid_name(&"a".repeat(63)));
         assert!(!is_valid_name(&"a".repeat(64)));
+        assert_eq!(normalize_name("\u{212A}"), "\u{212A}");
+        assert!(!is_valid_name(&normalize_name("alice.eth")));
+        assert!(!is_valid_name(&normalize_name("\u{212A}")));
     }
 }

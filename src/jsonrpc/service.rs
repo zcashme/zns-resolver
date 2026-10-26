@@ -44,6 +44,9 @@ pub trait ZnsApi {
     /// - exact name → the record, or `null` if unregistered/released;
     /// - empty query → all currently registered names, paginated;
     /// - an address → the names currently bound to it, paginated.
+    ///
+    /// A string of 1–63 lowercase letters or digits is a name, including
+    /// one that also parses as a TEX address.
     #[method(name = "resolve")]
     async fn resolve(
         &self,
@@ -132,6 +135,38 @@ fn clamp_pagination(limit: Option<u64>, offset: Option<u64>) -> (u32, u32) {
     (limit, offset)
 }
 
+/// How `resolve` reads a query.
+enum QueryClass {
+    /// The empty query lists registrations.
+    List,
+    /// Exact name lookup.
+    Name,
+    /// Names bound to this address.
+    Address,
+}
+
+/// 1–63 lowercase ASCII letters or digits, the shape the mint accepts.
+fn is_name(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9'))
+}
+
+fn classify_query(query: &str) -> QueryClass {
+    if query.is_empty() {
+        return QueryClass::List;
+    }
+    if is_name(query) {
+        return QueryClass::Name;
+    }
+    if query.parse::<ZcashAddress>().is_ok() {
+        return QueryClass::Address;
+    }
+    QueryClass::Name
+}
+
 #[async_trait]
 impl ZnsApiServer for JsonRpcApi {
     async fn resolve(
@@ -143,28 +178,30 @@ impl ZnsApiServer for JsonRpcApi {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
         let conn = self.db.lock();
 
-        // The empty query lists all registrations — the page-through form
-        // explorers and sitemaps build on.
-        if query.is_empty() {
-            let (regs, _) =
-                core::list_registrations(&conn, limit_u32, offset_u32).map_err(RpcError::from)?;
-            return Ok(ResolveResult::Many(
-                regs.into_iter().map(NameRecord::from).collect(),
-            ));
+        match classify_query(&query) {
+            // The empty query lists all registrations — the page-through form
+            // explorers and sitemaps build on.
+            QueryClass::List => {
+                let (regs, _) = core::list_registrations(&conn, limit_u32, offset_u32)
+                    .map_err(RpcError::from)?;
+                Ok(ResolveResult::Many(
+                    regs.into_iter().map(NameRecord::from).collect(),
+                ))
+            }
+            // 1–63 lowercase letters or digits, the shape the mint accepts.
+            QueryClass::Name => {
+                let reg = core::resolve_by_name(&conn, &query).map_err(RpcError::from)?;
+                Ok(ResolveResult::Exact(reg.map(NameRecord::from)))
+            }
+            // Any other Zcash address queries the names currently bound to it.
+            QueryClass::Address => {
+                let (regs, _) = core::registrations_by_ua(&conn, &query, limit_u32, offset_u32)
+                    .map_err(RpcError::from)?;
+                Ok(ResolveResult::Many(
+                    regs.into_iter().map(NameRecord::from).collect(),
+                ))
+            }
         }
-
-        // An address queries the names currently bound to it.
-        if query.parse::<ZcashAddress>().is_ok() {
-            let (regs, _) = core::registrations_by_ua(&conn, &query, limit_u32, offset_u32)
-                .map_err(RpcError::from)?;
-            return Ok(ResolveResult::Many(
-                regs.into_iter().map(NameRecord::from).collect(),
-            ));
-        }
-
-        // Otherwise the query is a name: exact lookup, record or `null`.
-        let reg = core::resolve_by_name(&conn, &query).map_err(RpcError::from)?;
-        Ok(ResolveResult::Exact(reg.map(NameRecord::from)))
     }
 
     /// List all currently registered names, paginated.
@@ -263,5 +300,27 @@ impl ZnsApiServer for JsonRpcApi {
             limit: limit_u32 as u64,
             offset: offset_u32 as u64,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_query, QueryClass};
+
+    const TEX: &str = "tex1s2rt77ggv6q989lr49rkgzmh5slsksa9khdgte";
+
+    #[test]
+    fn a_tex_shaped_name_is_a_name_query() {
+        assert!(TEX.parse::<zcash_address::ZcashAddress>().is_ok());
+        assert!(matches!(classify_query(TEX), QueryClass::Name));
+        assert!(matches!(classify_query("alice"), QueryClass::Name));
+        assert!(matches!(classify_query(""), QueryClass::List));
+    }
+
+    #[test]
+    fn a_unified_address_is_an_address_query() {
+        let ua = "u1f68wxdxsrswjl04kcc397a9ljedg88rl8dgazrk8l9v8jx6t3gqsktvqyvmc3ypgf4pum03q4ftvy5s0fe803nrxm8kw6dgzlvnv83nv";
+        assert!(ua.len() > 63);
+        assert!(matches!(classify_query(ua), QueryClass::Address));
     }
 }

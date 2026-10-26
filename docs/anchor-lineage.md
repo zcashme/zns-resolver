@@ -86,6 +86,10 @@ Updates and releases take the same accept path with the mint's
 name's live tip, no other live name, and no anchor. The predecessor spend
 is not the name note's own action; fee inputs sit between them, same as a claim.
 
+The mint owns the term and liveness clocks. The resolver does not
+re-evaluate them. An update the mint authorized, whose predecessor and
+spend gates clear, is the transition that is indexed.
+
 ## The canon contract
 
 `tests/fixtures/canon-vectors-v1.json` is vendored from zns-mint
@@ -103,9 +107,3 @@ records notes. Two implementations, one executable contract.
   Surfacing them through the API is PR #2's remainder.
 - The claim law lives in two repos by copy-paste (pinned by the fixture).
   The endgame is one law as a `zns-verify` kernel consumed by both.
-- A clock-due update ends the binding. Compact-block times are stored,
-  and each block is judged at the median of its trailing eleven (the
-  mint's MTP). The clocks are the predecessor's term and
-  `confirmed_mtp + LIVENESS_INTERVAL`. A release stays legal after
-  either clock. The first ten scanned blocks have no MTP, so an update
-  there follows the chain rule alone.
