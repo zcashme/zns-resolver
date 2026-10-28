@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
-use zcash_protocol::consensus::{NetworkType, Parameters};
+use zcash_protocol::consensus::Network;
 use zns_verify::Action;
 
 mod anchor_lineage;
@@ -23,10 +23,9 @@ impl Db {
     pub(crate) fn open(ufvk: &str, birthday: u32, db_path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
         storage::install_schema(&conn)?;
-        let net_str = match crate::NETWORK.network_type() {
-            NetworkType::Main => "main",
-            NetworkType::Test => "test",
-            NetworkType::Regtest => "regtest",
+        let net_str = match crate::NETWORK {
+            Network::MainNetwork => "main",
+            Network::TestNetwork => "test",
         };
         core::install_registry_config(&conn, ufvk, net_str, birthday)?;
         core::drop_payment_notes(&conn)?;

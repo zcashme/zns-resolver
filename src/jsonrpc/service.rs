@@ -5,30 +5,15 @@ use jsonrpsee::core::async_trait;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
-use tokio::sync::watch;
 use zns_verify::Action;
 
 use crate::registry::core;
 use crate::registry::Db;
+use crate::sync::ChainTip;
 
 use zcash_address::ZcashAddress;
 
 use super::records::{EventsPage, NameEvent, NameRecord, Paginated, ResolveResult, Status};
-
-/// The network head as published live by the tip publisher: `None` until the
-/// first poll lands.
-type ChainTip = watch::Receiver<Option<u32>>;
-
-/// Treasury payment address, published by the mint. Hardcoded on purpose:
-/// this is protocol-level identity, not deployment config. Claim payments
-/// are displayed against this address; nothing verifies funds against it.
-/// Mainnet and testnet treasuries are distinct, like the registry UFVK.
-#[cfg(feature = "mainnet")]
-const TREASURY_ADDRESS: &str =
-    "u1f68wxdxsrswjl04kcc397a9ljedg88rl8dgazrk8l9v8jx6t3gqsktvqyvmc3ypgf4pum03q4ftvy5s0fe803nrxm8kw6dgzlvnv83nv";
-#[cfg(feature = "testnet")]
-const TREASURY_ADDRESS: &str =
-    "utest1tquw9k9qlsphhf30tau2qh758vfvf7xkvjea3rlc5mj4cjscgzfzgjeafjnl7r8tvv0akq3v2ze5q0azf4lnd4vf7kusrfensdsrr7tsgruvuqk0dv0hepnrk0pzgz3fj0mxc0lr29yf65nkwvw74gzep4792rkqa769lxl0sua09s0r";
 
 /// Public JSON-RPC API for the ZNS resolver.
 ///
@@ -244,26 +229,21 @@ impl ZnsApiServer for JsonRpcApi {
     }
 
     async fn status(&self) -> RpcResult<Status> {
-        let conn = self.db.lock();
-        let position = core::checkpoint(&conn).map_err(RpcError::from)?;
-        let viewing_key = core::registry_ufvk(&conn).map_err(RpcError::from)?;
-        drop(conn);
-
-        // The network path's live observation: None until the first poll lands.
+        let position = core::checkpoint(&self.db.lock()).map_err(RpcError::from)?;
         let tip = *self.tip.borrow();
 
         // The verdict needs both facts: our durable position and the network's
         // live head. Either missing — not synced.
         let synced = match (position.as_ref(), tip) {
-            (Some(cursor), Some(tip)) => u32::from(cursor.height) >= tip,
+            (Some(cursor), Some(tip)) => cursor.height >= tip,
             _ => false,
         };
 
         Ok(Status {
             synced_height: position.map_or(0, |c| u64::from(u32::from(c.height))),
             synced,
-            viewing_key,
-            treasury_address: TREASURY_ADDRESS.to_string(),
+            viewing_key: crate::UFVK,
+            treasury_address: crate::TREASURY_ADDRESS,
         })
     }
 
