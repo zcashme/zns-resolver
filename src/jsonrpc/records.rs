@@ -85,9 +85,8 @@ pub struct EventsPage {
 pub struct Status {
     /// Height up to which we have verified and indexed name bindings.
     pub synced_height: u64,
-    /// Whether indexing has reached the chain head as last reported by
-    /// lightwalletd. `false` when that tip is missing: no server answered,
-    /// the tip read stalled, or the poll failed twice.
+    /// Whether indexing has reached lightwalletd's last reported tip;
+    /// `false` while no tip is known.
     pub synced: bool,
     /// The viewing key (as a string) used to observe name bindings.
     /// Exposed so clients can verify they are talking to the expected resolver.

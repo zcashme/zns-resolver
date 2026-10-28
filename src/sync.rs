@@ -12,13 +12,10 @@ use zcash_protocol::consensus::{BlockHeight, Network};
 
 use crate::registry::{core, Db};
 
-/// The chain head as last reported by lightwalletd. `None` when no server
-/// answers, when a tip read or reconnect stalls, or after a second failed poll.
+/// The chain head as last reported by lightwalletd; `None` while unknown.
 pub(crate) type ChainTip = watch::Receiver<Option<BlockHeight>>;
 
 /// How long a tip poll or reconnect may take before the tip counts as stale.
-/// A slow reconnect clears the tip but keeps going: `connect_auto` gives each
-/// bundled server its own 30 s, so cancelling it would skip the fallbacks.
 const TIP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Pause after an outage before the next reconnect.
@@ -47,6 +44,7 @@ pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<BlockHeight>>, network
                 Err(_) => {
                     tracing::warn!("reconnect is slow; clearing the tip while fallbacks are tried");
                     let _ = tip_tx.send(None);
+                    // Keep awaiting: cancelling would skip connect_auto's fallbacks.
                     connect.await.ok()
                 }
             };

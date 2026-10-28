@@ -938,8 +938,7 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
 
 pub(crate) fn rewind(conn: &Connection, to: Cursor) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
-    // `to` is the last block that survives the reorg; rows above it are the
-    // discarded chain, and sync resumes at the next block.
+    // `to` is the last surviving block; rows above it are the discarded chain.
     let kept = i64::from(u32::from(to.height));
 
     let mut stmt = tx.prepare(
@@ -969,8 +968,7 @@ pub(crate) fn rewind(conn: &Connection, to: Cursor) -> rusqlite::Result<()> {
         rebuild_name_tip(&tx, name)?;
     }
 
-    // `to` becomes the checkpoint, hash included, so a restart resumes after
-    // it instead of rescanning from the birthday.
+    // Keep the hash so a restart resumes after `to`, not at the birthday.
     tx.execute(
         "UPDATE registry_account SET sync_height = ?1, sync_hash = ?2 WHERE id = 0",
         params![kept, to.hash.0.as_slice()],
@@ -1573,7 +1571,7 @@ mod tests {
         .unwrap();
     }
 
-    /// The last block a rewind keeps, which becomes the checkpoint.
+    /// The last block a rewind keeps.
     fn kept(height: u32) -> Cursor {
         Cursor {
             height: BlockHeight::from_u32(height),
@@ -1614,7 +1612,6 @@ mod tests {
 
         rewind(&conn, kept(40)).unwrap();
 
-        // The hash is kept, so a restart resumes after block 40, not at the birthday.
         assert_eq!(checkpoint(&conn).unwrap(), Some(kept(40)));
         let watched: u64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| row.get(0))
