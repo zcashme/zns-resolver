@@ -13,11 +13,12 @@ use zcash_protocol::consensus::{BlockHeight, Network};
 use crate::registry::{core, Db};
 
 /// The chain head as last reported by lightwalletd. `None` when no server
-/// answers, when a tip read stalls, or after a second failed poll.
+/// answers, when a tip read or reconnect stalls, or after a second failed poll.
 pub(crate) type ChainTip = watch::Receiver<Option<BlockHeight>>;
 
-/// How long a tip poll may take before it counts as failed. Reconnects need
-/// no outer bound: `connect_auto` gives each bundled server its own 30 s.
+/// How long a tip poll or reconnect may take before the tip counts as stale.
+/// A slow reconnect clears the tip but keeps going: `connect_auto` gives each
+/// bundled server its own 30 s, so cancelling it would skip the fallbacks.
 const TIP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Pause after an outage before the next reconnect.
@@ -40,7 +41,15 @@ pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<BlockHeight>>, network
 
     loop {
         if client.is_none() {
-            client = chain::connect_auto(&network).await.ok();
+            let mut connect = std::pin::pin!(chain::connect_auto(&network));
+            client = match tokio::time::timeout(TIP_TIMEOUT, &mut connect).await {
+                Ok(connected) => connected.ok(),
+                Err(_) => {
+                    tracing::warn!("reconnect is slow; clearing the tip while fallbacks are tried");
+                    let _ = tip_tx.send(None);
+                    connect.await.ok()
+                }
+            };
             if client.is_none() {
                 tracing::warn!("no lightwalletd server for the tip publisher; retrying");
                 let _ = tip_tx.send(None);
