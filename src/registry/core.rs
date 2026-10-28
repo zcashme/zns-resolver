@@ -8,7 +8,7 @@ use orchard::note::Nullifier;
 use orchard::note::{NoteCommitTrapdoor, Psi};
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
 use seer_sync::sync::scan::WalletTx;
-use seer_sync::{Cursor, Nullifiers, Resume};
+use seer_sync::{Cursor, Nullifiers};
 use zcash_address::unified::Encoding as _;
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::{BlockHeight, Parameters as _};
@@ -936,45 +936,44 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
     Ok(true)
 }
 
-pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()> {
+pub(crate) fn rewind(conn: &Connection, to: Cursor) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
-    // seer-sync re-fetches the block before `fork_height`. That block stays;
-    // record_admission ignores the replay. Rows at `fork_height` and above
-    // are the discarded chain.
-    let fork = i64::from(fork_height);
+    // `to` is the last block that survives the reorg; rows above it are the
+    // discarded chain, and sync resumes at the next block.
+    let kept = i64::from(u32::from(to.height));
 
     let mut stmt = tx.prepare(
-        "SELECT name FROM name_events WHERE height >= ?1
+        "SELECT name FROM name_events WHERE height > ?1
          UNION
-         SELECT name FROM implicit_releases WHERE height >= ?1",
+         SELECT name FROM implicit_releases WHERE height > ?1",
     )?;
     let affected: Vec<String> = stmt
-        .query_map(params![fork], |r| r.get(0))?
+        .query_map(params![kept], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
 
-    tx.execute("DELETE FROM name_events WHERE height >= ?1", params![fork])?;
+    tx.execute("DELETE FROM name_events WHERE height > ?1", params![kept])?;
     tx.execute(
-        "DELETE FROM implicit_releases WHERE height >= ?1",
-        params![fork],
+        "DELETE FROM implicit_releases WHERE height > ?1",
+        params![kept],
     )?;
-    tx.execute("DELETE FROM anchor_facts WHERE height >= ?1", params![fork])?;
+    tx.execute("DELETE FROM anchor_facts WHERE height > ?1", params![kept])?;
     tx.execute(
         "UPDATE anchor_facts
          SET spent_height = NULL, spent_tx_index = NULL, spent_action_index = NULL
-         WHERE spent_height >= ?1",
-        params![fork],
+         WHERE spent_height > ?1",
+        params![kept],
     )?;
 
     for name in &affected {
         rebuild_name_tip(&tx, name)?;
     }
 
-    // The sync position falls back to the fork height; the hash is fixed by
-    // the next apply (seer-sync's rewind convention).
+    // `to` becomes the checkpoint, hash included, so a restart resumes after
+    // it instead of rescanning from the birthday.
     tx.execute(
-        "UPDATE registry_account SET sync_height = ?1, sync_hash = NULL WHERE id = 0",
-        params![fork_height as i64],
+        "UPDATE registry_account SET sync_height = ?1, sync_hash = ?2 WHERE id = 0",
+        params![kept, to.hash.0.as_slice()],
     )?;
 
     tx.commit()?;
@@ -983,8 +982,7 @@ pub(crate) fn rewind(conn: &Connection, fork_height: u32) -> rusqlite::Result<()
 
 // ── reads (free functions; called directly on a locked connection) ──────
 
-pub(crate) fn resume(conn: &Connection) -> rusqlite::Result<Resume> {
-    let checkpoint = checkpoint(conn)?;
+pub(crate) fn nullifiers(conn: &Connection) -> rusqlite::Result<Nullifiers> {
     let ironwood: Vec<Nullifier> = ironwood_nullifiers(conn)?
         .into_iter()
         .filter_map(|bytes| match Option::from(Nullifier::from_bytes(&bytes)) {
@@ -995,26 +993,21 @@ pub(crate) fn resume(conn: &Connection) -> rusqlite::Result<Resume> {
             }
         })
         .collect();
-    let birthday = birthday(conn)?;
 
-    Ok(Resume {
-        birthday: BlockHeight::from_u32(birthday),
-        checkpoint,
-        nullifiers: Nullifiers {
-            sapling: vec![],
-            orchard: vec![],
-            ironwood,
-        },
+    Ok(Nullifiers {
+        sapling: vec![],
+        orchard: vec![],
+        ironwood,
     })
 }
 
-fn birthday(conn: &Connection) -> rusqlite::Result<u32> {
+pub(crate) fn birthday(conn: &Connection) -> rusqlite::Result<BlockHeight> {
     let b: i64 = conn.query_row(
         "SELECT birthday FROM registry_account WHERE id = 0",
         [],
         |row| row.get(0),
     )?;
-    Ok(b as u32)
+    Ok(BlockHeight::from_u32(b as u32))
 }
 
 /// The sync position, decoded from the registry's account row. `None` = no
@@ -1460,7 +1453,7 @@ mod tests {
         conn.execute("DELETE FROM names WHERE name = 'z'", [])
             .unwrap();
 
-        rewind(&conn, 95).unwrap();
+        rewind(&conn, kept(94)).unwrap();
 
         let tip: Option<String> = conn
             .query_row("SELECT action FROM names WHERE name = 'z'", [], |r| {
@@ -1516,7 +1509,7 @@ mod tests {
         )
         .unwrap();
 
-        rewind(&conn, 97).unwrap();
+        rewind(&conn, kept(96)).unwrap();
 
         let z: i64 = conn
             .query_row("SELECT COUNT(*) FROM names WHERE name = 'z'", [], |r| {
@@ -1580,6 +1573,14 @@ mod tests {
         .unwrap();
     }
 
+    /// The last block a rewind keeps, which becomes the checkpoint.
+    fn kept(height: u32) -> Cursor {
+        Cursor {
+            height: BlockHeight::from_u32(height),
+            hash: BlockHash([7; 32]),
+        }
+    }
+
     #[test]
     fn checkpoint_persists_the_sync_position() {
         let conn = database();
@@ -1596,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn rewind_resets_the_sync_position_to_the_fork_height() {
+    fn rewind_makes_the_kept_block_the_checkpoint() {
         let conn = database();
         conn.execute(
             "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
@@ -1611,10 +1612,10 @@ mod tests {
         )
         .unwrap();
 
-        rewind(&conn, 41).unwrap();
+        rewind(&conn, kept(40)).unwrap();
 
-        let position = checkpoint(&conn).unwrap();
-        assert!(position.is_none()); // NULL hash: a restart replays from the birthday.
+        // The hash is kept, so a restart resumes after block 40, not at the birthday.
+        assert_eq!(checkpoint(&conn).unwrap(), Some(kept(40)));
         let watched: u64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| row.get(0))
             .unwrap();
@@ -1662,7 +1663,7 @@ mod tests {
         )
         .unwrap();
 
-        rewind(&conn, 41).unwrap();
+        rewind(&conn, kept(40)).unwrap();
 
         let heights: Vec<i64> = {
             let mut stmt = conn

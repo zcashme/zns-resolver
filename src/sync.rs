@@ -4,9 +4,9 @@ use std::error::Error;
 use std::time::Duration;
 
 use orchard::keys::FullViewingKey;
-use seer_sync::sync::chain::LwdClient;
+use seer_sync::sync::chain;
 use seer_sync::sync::scan::WalletTx;
-use seer_sync::{Account, Cursor as SeerCursor, Resume};
+use seer_sync::{Account, Cursor as SeerCursor, Nullifiers};
 use tokio::sync::watch;
 use zcash_protocol::consensus::{BlockHeight, Network};
 
@@ -16,7 +16,8 @@ use crate::registry::{core, Db};
 /// answers, when a tip read stalls, or after a second failed poll.
 pub(crate) type ChainTip = watch::Receiver<Option<BlockHeight>>;
 
-/// How long a tip poll or reconnect may take before it counts as failed.
+/// How long a tip poll may take before it counts as failed. Reconnects need
+/// no outer bound: `connect_auto` gives each bundled server its own 30 s.
 const TIP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Pause after an outage before the next reconnect.
@@ -39,10 +40,7 @@ pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<BlockHeight>>, network
 
     loop {
         if client.is_none() {
-            client = tokio::time::timeout(TIP_TIMEOUT, LwdClient::connect_auto(&network))
-                .await
-                .ok()
-                .and_then(Result::ok);
+            client = chain::connect_auto(&network).await.ok();
             if client.is_none() {
                 tracing::warn!("no lightwalletd server for the tip publisher; retrying");
                 let _ = tip_tx.send(None);
@@ -81,14 +79,24 @@ pub(crate) async fn live_tip(tip_tx: watch::Sender<Option<BlockHeight>>, network
 }
 
 impl Account for Registry {
-    fn resume(&self) -> Result<Resume, Box<dyn Error + Send + Sync>> {
+    fn checkpoint(&self) -> Result<Option<SeerCursor>, Box<dyn Error + Send + Sync>> {
         let conn = self.db.lock();
-        Ok(core::resume(&conn)?)
+        Ok(core::checkpoint(&conn)?)
     }
 
-    fn rewind(&self, to: BlockHeight) -> Result<(), Box<dyn Error + Send + Sync>> {
+    fn birthday(&self) -> Result<BlockHeight, Box<dyn Error + Send + Sync>> {
         let conn = self.db.lock();
-        core::rewind(&conn, u32::from(to))?;
+        Ok(core::birthday(&conn)?)
+    }
+
+    fn nullifiers(&self) -> Result<Nullifiers, Box<dyn Error + Send + Sync>> {
+        let conn = self.db.lock();
+        Ok(core::nullifiers(&conn)?)
+    }
+
+    fn rewind(&self, to: SeerCursor) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let conn = self.db.lock();
+        core::rewind(&conn, to)?;
         Ok(())
     }
 
