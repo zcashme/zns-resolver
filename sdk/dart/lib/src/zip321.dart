@@ -1,9 +1,13 @@
 import 'dart:convert';
 
-import 'package:meta/meta.dart';
+/// ZIP-321 limits: the largest payment amount in ZEC, and the memo size.
+const int _maxMoney = 21000000;
+const int _maxMemoBytes = 512;
+
+final RegExp _amountRegExp = RegExp(r'^\d+(\.\d{1,8})?$');
+final RegExp _addressStop = RegExp(r'[?&:\s]');
 
 /// Parsed components of a `zcash:` ZIP-321 payment URI.
-@immutable
 class Zip321Parts {
   final String address;
   final String amount;
@@ -35,55 +39,67 @@ class Zip321Parts {
 }
 
 /// Base64url-encode a UTF-8 string with no padding.
-String toBase64Url(String text) {
-  try {
-    return base64Url.encode(utf8.encode(text)).replaceAll('=', '');
-  } catch (_) {
-    return '';
-  }
-}
+String toBase64Url(String text) =>
+    base64Url.encode(utf8.encode(text)).replaceAll('=', '');
 
-/// Decode a base64url-encoded string (with or without padding) back to UTF-8.
+/// Decode a base64url string, with or without padding, back to UTF-8.
 /// Returns an empty string on any decode failure.
 String decodeBase64Url(String value) {
   try {
-    var normalized = value.replaceAll('-', '+').replaceAll('_', '/');
-    final padLen = normalized.length % 4 == 0 ? 0 : 4 - (normalized.length % 4);
-    normalized += '=' * padLen;
-    return utf8.decode(base64.decode(normalized));
-  } catch (_) {
+    return utf8.decode(base64Url.decode(base64Url.normalize(value)));
+  } on FormatException {
     return '';
   }
 }
 
-/// Format zatoshis as a ZEC decimal string with no trailing zeros, suitable
-/// for ZIP-321 `amount=` parameters. Uses integer arithmetic to avoid
-/// floating-point representation errors.
-String _zatsToZec(int zats) {
-  final whole = zats ~/ 100000000;
-  final frac = zats % 100000000;
-  if (frac == 0) return '$whole';
-  final fracStr =
-      frac.toString().padLeft(8, '0').replaceAll(RegExp(r'0+$'), '');
-  return '$whole.$fracStr';
-}
-
-/// Build a ZIP-321 URI for [address]. [amountZats] is in zatoshis (omitted if
-/// null or 0); [memo] is plain text and gets base64url-encoded.
-String buildZcashUri(String address, {int? amountZats, String? memo}) {
-  if (address.isEmpty) return '';
-  final base = 'zcash:$address';
+/// ZIP-321 payment URI: `zcash:<address>[?amount=<ZEC>][&memo=<base64url>]`.
+/// [amount] is a decimal ZEC string with at most 8 decimal places. Throws a
+/// [FormatException] for input a wallet would refuse.
+String buildZip321Uri({
+  required String address,
+  String? amount,
+  String? memo,
+}) {
+  if (address.isEmpty || _addressStop.hasMatch(address)) {
+    throw FormatException('ZNS: a payment URI needs an address.', address);
+  }
   final params = <String>[];
-  if (amountZats != null && amountZats > 0) {
-    params.add('amount=${_zatsToZec(amountZats)}');
+  if (amount != null) {
+    if (!_amountRegExp.hasMatch(amount)) {
+      throw FormatException(
+        'ZNS: the amount is a decimal ZEC value with at most 8 decimal places.',
+        amount,
+      );
+    }
+    // Compare the decimal string itself, not a floating-point conversion.
+    final [whole, ...rest] = amount.split('.');
+    final fraction = rest.isEmpty ? '' : rest.first;
+    final wholeZec = BigInt.parse(whole);
+    final max = BigInt.from(_maxMoney);
+    if (wholeZec > max ||
+        (wholeZec == max && fraction.contains(RegExp('[1-9]')))) {
+      throw FormatException(
+          'ZNS: the amount is more than $_maxMoney ZEC.', amount);
+    }
+    params.add('amount=$amount');
   }
   if (memo != null && memo.isNotEmpty) {
+    if (address.startsWith('t')) {
+      throw FormatException(
+          'ZNS: a transparent address cannot receive a memo.', address);
+    }
+    if (utf8.encode(memo).length > _maxMemoBytes) {
+      throw FormatException(
+          'ZNS: the memo is more than $_maxMemoBytes bytes.', memo);
+    }
     params.add('memo=${toBase64Url(memo)}');
   }
-  return params.isEmpty ? base : '$base?${params.join('&')}';
+  return params.isEmpty
+      ? 'zcash:$address'
+      : 'zcash:$address?${params.join('&')}';
 }
 
-/// Parse a `zcash:` URI into its constituent parts. Scheme match is
+/// Parse a `zcash:` URI into its parts. The scheme match is
 /// case-insensitive; missing fields yield empty strings.
 Zip321Parts parseZip321Uri(String uri) {
   var withoutScheme = uri;

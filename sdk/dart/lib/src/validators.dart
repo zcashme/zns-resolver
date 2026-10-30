@@ -1,49 +1,32 @@
-import 'package:bech32/bech32.dart';
+import 'bech32m.dart';
 
-final RegExp nameRegExp = RegExp(r'^[a-z0-9]{1,62}$');
+final RegExp _nameRegExp = RegExp(r'^[a-z0-9]{1,63}$');
 
-/// Validate a ZNS name format (1-62 lowercase alphanumeric chars).
-bool isValidName(String name) => nameRegExp.hasMatch(name);
+/// Validate a ZNS name: 1-63 lowercase letters and digits.
+bool isValidName(String name) => _nameRegExp.hasMatch(name);
 
-final RegExp _nameSuffixRegExp = RegExp(r'\.(zcash|zec)$');
+final RegExp _upperAscii = RegExp('[A-Z]');
 
-/// Normalize a ZNS name for lookups: trim whitespace, lowercase, and strip
-/// one trailing `.zcash` or `.zec` suffix (case-insensitive), so
-/// `Alice.zcash`, `aLice.Zec`, and `alice` all normalize to `alice`.
+/// Canonicalize lookup input: trim whitespace and lowercase ASCII letters.
+/// It does not strip a `.zcash` or `.zec` suffix.
 String normalizeName(String name) =>
-    name.trim().toLowerCase().replaceFirst(_nameSuffixRegExp, '');
+    name.trim().replaceAllMapped(_upperAscii, (m) => m[0]!.toLowerCase());
 
-/// Validate a Zcash Unified Address. Accepts both mainnet (`u1`) and
-/// testnet (`utest1`) prefixes via a cheap prefix check, falling back to
-/// a bech32m decode for anything else.
-///
-/// Performs basic format validation but NOT full ZIP-316 F4Jumble decoding —
-/// the bech32m fallback verifies only the bech32m checksum, not the
-/// F4Jumble outer checksum or typecode structure of the encoded receivers.
+/// Lengths of a mainnet UA the mint accepts: an Orchard receiver, optionally
+/// Sapling and/or transparent, nothing else. Testnet adds 4 (`utest` vs `u`).
+const List<int> _mainnetUaLengths = [106, 141, 178, 213];
+final List<int> _testnetUaLengths =
+    _mainnetUaLengths.map((n) => n + 4).toList(growable: false);
+
+/// Validate a Zcash unified address by length and bech32m checksum. It does
+/// not decode the receivers, so it cannot see whether an Orchard receiver is
+/// present: a Sapling-only UA has the same length as an Orchard-only one.
 bool isValidUnifiedAddress(String address) {
-  if (address.isEmpty) return false;
-  if (address.startsWith('utest1')) return true;
-  if (address.startsWith('u1')) return true;
-  try {
-    final decoded = const Bech32Codec().decode(address);
-    return decoded.hrp == 'u' || decoded.hrp == 'utest';
-  } catch (_) {
+  final lengths =
+      address.startsWith('utest1') ? _testnetUaLengths : _mainnetUaLengths;
+  if (!lengths.contains(address.length) || address != address.toLowerCase()) {
     return false;
   }
-}
-
-const _base58Alphabet =
-    '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-final _base58Set = _base58Alphabet.codeUnits.toSet();
-
-/// Validate a Zcash transparent (t-) address.
-bool isValidTransparentAddress(String address) {
-  if (address.isEmpty) return false;
-  const validPrefixes = ['t1', 't3', 'tm', 'tn'];
-  if (!validPrefixes.any(address.startsWith)) return false;
-  if (address.length < 26 || address.length > 36) return false;
-  for (final code in address.codeUnits) {
-    if (!_base58Set.contains(code)) return false;
-  }
-  return true;
+  final hrp = bech32mHrp(address);
+  return hrp == 'u' || hrp == 'utest';
 }

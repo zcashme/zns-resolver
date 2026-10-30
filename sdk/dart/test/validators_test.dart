@@ -1,11 +1,10 @@
 import 'package:test/test.dart';
 import 'package:zcashname_sdk/zcashname_sdk.dart';
 
-const _validTestnetUa =
+const _testnetUa =
     'utest100qlkeru5c3m5kfrwe2hsmcfzmusreaza2prdyelg2kd2tr2842nceq952vay3gpmgky09fgft4z57h4z2zqzz5rcwgd4q90u54ek5yyca4s6e6y2jja9sww27kzedzznjcupcu0svq2exvq995c0lhl5zm53g4ksnm2xuwt3snv4dgh';
-const _validMainnetUa =
-    'u1q8g0h9cn2x4eq8jd7k0d5y3zf6vhb5w4xj9tz3m5p6r2s1t0u7v8w9x0y1z';
-const _validTestnetTaddr = 'tmqY61Gp3B7Pz3ev12NRFzWxJz1yB28Gfkfi';
+const _mainnetUa =
+    'u1f68wxdxsrswjl04kcc397a9ljedg88rl8dgazrk8l9v8jx6t3gqsktvqyvmc3ypgf4pum03q4ftvy5s0fe803nrxm8kw6dgzlvnv83nv';
 
 void main() {
   group('isValidName', () {
@@ -13,66 +12,61 @@ void main() {
       expect(isValidName('alice'), isTrue);
       expect(isValidName('bob123'), isTrue);
       expect(isValidName('a'), isTrue);
-      expect(isValidName('a' * 62), isTrue);
+      expect(isValidName('a' * 63), isTrue);
     });
 
     test('rejects invalid names', () {
       expect(isValidName(''), isFalse);
       expect(isValidName('Alice'), isFalse);
       expect(isValidName('my-name'), isFalse);
-      expect(isValidName('a' * 63), isFalse);
+      expect(isValidName('a' * 64), isFalse);
     });
   });
 
   group('normalizeName', () {
-    test('lowercases and strips .zcash/.zec suffix in any case', () {
+    test('trims and lowercases lookup input', () {
       expect(normalizeName('alice'), 'alice');
-      expect(normalizeName('Alice.zcash'), 'alice');
-      expect(normalizeName('alice.zec'), 'alice');
-      expect(normalizeName('aLice.Zec'), 'alice');
-      expect(normalizeName('alice.ZCASH'), 'alice');
       expect(normalizeName('ALICE'), 'alice');
-      expect(normalizeName('  alice.Zec  '), 'alice');
+      expect(normalizeName('  Alice  '), 'alice');
     });
 
-    test('does not strip non-suffix lookalikes', () {
-      expect(normalizeName('zec'), 'zec');
-      expect(normalizeName('zcash'), 'zcash');
+    test('does not strip suffixes or alter punctuation', () {
+      expect(normalizeName('Alice.zcash'), 'alice.zcash');
       expect(normalizeName('alice.eth'), 'alice.eth');
       expect(normalizeName('alice.'), 'alice.');
     });
 
-    test('strips only one suffix', () {
-      expect(normalizeName('alice.zec.zec'), 'alice.zec');
-      expect(normalizeName('.zec'), '');
+    test('lowercases ASCII letters only', () {
+      // KELVIN SIGN lowercases to an ASCII k under full Unicode rules.
+      expect(normalizeName('K'), 'K');
+      expect(isValidName(normalizeName('K')), isFalse);
     });
   });
 
   group('isValidUnifiedAddress', () {
-    test('accepts testnet UA', () {
-      expect(isValidUnifiedAddress(_validTestnetUa), isTrue);
+    test('accepts a valid testnet UA', () {
+      expect(isValidUnifiedAddress(_testnetUa), isTrue);
+      expect(
+          isValidUnifiedAddress(znsNetworks[Network.testnet]!.treasuryAddress),
+          isTrue);
     });
 
-    test('accepts mainnet UA', () {
-      expect(isValidUnifiedAddress(_validMainnetUa), isTrue);
+    test('accepts a valid mainnet UA', () {
+      expect(isValidUnifiedAddress(_mainnetUa), isTrue);
     });
 
     test('rejects invalid addresses', () {
       expect(isValidUnifiedAddress(''), isFalse);
       expect(isValidUnifiedAddress('notanaddress'), isFalse);
-      expect(isValidUnifiedAddress('zs1abc'), isFalse);
-    });
-  });
-
-  group('isValidTransparentAddress', () {
-    test('accepts testnet tm address', () {
-      expect(isValidTransparentAddress(_validTestnetTaddr), isTrue);
+      expect(isValidUnifiedAddress('zs1abc...'), isFalse);
+      expect(isValidUnifiedAddress(_mainnetUa.toUpperCase()), isFalse);
+      expect(isValidUnifiedAddress('u1${'q' * 104}'), isFalse);
     });
 
-    test('rejects invalid addresses', () {
-      expect(isValidTransparentAddress(''), isFalse);
-      expect(isValidTransparentAddress('notanaddress'), isFalse);
-      expect(isValidTransparentAddress('u1abc'), isFalse);
+    test('rejects a mistyped character', () {
+      final c = _mainnetUa[50] == 'q' ? 'p' : 'q';
+      final typo = _mainnetUa.replaceRange(50, 51, c);
+      expect(isValidUnifiedAddress(typo), isFalse);
     });
   });
 }

@@ -1,32 +1,44 @@
-/// Target network for ZNS operations.
+/// The ZNS networks.
 enum Network { testnet, mainnet }
 
-/// Network-specific configuration for a ZNS indexer.
+/// Registry key, treasury address and endpoints of one ZNS network, as the
+/// live resolvers report them in `status`.
 class NetworkConfig {
-  final Uri url;
-  final String registryAddress;
-  final String uivk;
+  /// Resolver endpoints, tried in order: the first is primary, the rest are
+  /// fallbacks used only when an endpoint cannot be reached.
+  final List<Uri> urls;
+
+  /// The registry viewing key. [ZNS.verify] compares the server's key
+  /// against it: a mismatch means the endpoint is not this registry, or
+  /// this SDK predates a key rotation.
+  final String viewingKey;
+
+  /// The mint treasury address. Send mint request memos here.
+  final String treasuryAddress;
 
   const NetworkConfig({
-    required this.url,
-    required this.registryAddress,
-    required this.uivk,
+    required this.urls,
+    required this.viewingKey,
+    required this.treasuryAddress,
   });
 }
 
-final Map<Network, NetworkConfig> networks = {
+final Map<Network, NetworkConfig> znsNetworks = {
   Network.testnet: NetworkConfig(
-    url: Uri.parse('https://light.zcash.me/zns-testnet'),
-    registryAddress:
-        'utest1f32kn6c4zvn54xr8wfsnxmj9hzpu2mwgtxzpzwcw34906tdccdvzs0z2dx38lly7tpan77x6udt8pjczqm22ymsdhlz9j0tk5yq664nl',
-    uivk:
-        'uivktest1hzw7wyadutvzfgpna80yftsk5l7jeyu2p5me5quvp28tytxueta00cx4068wnlzcv7tx9n3t3gfhsy83pe4y6jrhxtzaq0hj6xtg5zrk2dn7zen3vns2a5pgs4fxdjlletmqrhfa42',
+    urls: [Uri.parse('https://light.zcash.me/zns-testnet')],
+    viewingKey:
+        'uviewtest1gkq78nsemsvs4qekadrv6qlqdmvcv2cct8k3c8cwycedpk90p8rtkx24qe8q73gg2ark8crqmmaavrerf7cxu0sp50an54crmeaalfxl72aetxnr89ksad4lvxzmnkyejhhwn65euzamt9wsukgfemeayhcesreasarmq600lfeju3qenh05e5e5cz6nhhsw3cfdcd3d08d0nxswxmkkxl2fq0hzv6t5dm3ftnz4y76236a49v3us4uq2tlsewf86tjtfwm6kue348me04rm7dw6uawv8myw7t5tyx2t453clhjz5f55lvh7hnvr8g8zt8lf4sy5rzq23ntp7g5ly6kyz2nkwfek06llhjtuz2fft9rg6cuuwg4n7299vajnmq6swg3sf563r0jjzuwuvfpjhmfmydar9dcu3fkuawt6u8qu08vhg5mthrcggrjuhht6f0perh0tqmdfrtgzvhjymay7h9ymvfxgd4r56uz6zrsf5gnvw5jy',
+    treasuryAddress:
+        'utest1tquw9k9qlsphhf30tau2qh758vfvf7xkvjea3rlc5mj4cjscgzfzgjeafjnl7r8tvv0akq3v2ze5q0azf4lnd4vf7kusrfensdsrr7tsgruvuqk0dv0hepnrk0pzgz3fj0mxc0lr29yf65nkwvw74gzep4792rkqa769lxl0sua09s0r',
   ),
   Network.mainnet: NetworkConfig(
-    url: Uri.parse('https://light.zcash.me/zns-mainnet'),
-    registryAddress:
-        'u1k0evt0ahj5qdt6y9ftsxndl8lrkm4ff6rp00u04cjpmqj6hxl9t8hfsxftmn3ht34e03lljh89czn2h8qn67rwrs8x0hm3lsxsucp9q9',
-    uivk:
-        'uivk1gl26qy0xjja7lqhyg3pf0x4j4j66kqwewrjkdcg28eqq4wgtzjmujpee7x9cs2ec9xhnlgrm8ptlw8z80j2aryw8nqtssser2ys778a0s00uvgkdjnfr58sndhfvc3f4zqjs6ywva6',
+    urls: [
+      Uri.parse('https://main.zcashnames.com'),
+      Uri.parse('https://light.zcash.me/zns-mainnet'),
+    ],
+    viewingKey:
+        'uview1209ld9y4fr2sel9q87kfjg7xm2sy53e3qf7dvcw3w8jwhhjpldl8z0vk0a6hveg4jk7xcn0rc9mr8yg77djfpc0uxrm5pqzt8q7ul4w0nvs3x5q9vmk9nm2crywtqaealek4mp47ur7ywu7g4g4xcdlwv6gnqzvu5panv5je2ps6rxmx4856unlt5wde8fpz8uhrqchmwhn2j252h3cyx5phad877xezerm6ex8l5kcfjw02ll7m0nspfufamh3ae9ea48395elptspnv6vvc70j2gcjrdze9syt8kpr2kc67flvg8687thdkpha7lpt9r4p9wjty90q2v2yjanqsr2zrecrqs7lfx9cpkmshf7jyh2vvwfqnyzwtpuy7p72hm2mjhperdafvm9u5rwa6s6urcy0uw30f687e3jnmas45qfqtwyz39kf6kxklfrdn7t4hkz56jegmlr8s8hwmt9wa8vz8zlmm76lrmzyj82nzpeqfu572njq',
+    treasuryAddress:
+        'u1f68wxdxsrswjl04kcc397a9ljedg88rl8dgazrk8l9v8jx6t3gqsktvqyvmc3ypgf4pum03q4ftvy5s0fe803nrxm8kw6dgzlvnv83nv',
   ),
 };

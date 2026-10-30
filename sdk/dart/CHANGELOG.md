@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.0
+
+- BREAKING: ported to the ZNS resolver API for the mainnet launch, matching
+  the TypeScript SDK 0.17.0. The package now lives in
+  `zcashme/zns-resolver`.
+- New: mint request memos (`buildClaimMemo`, `buildUpdateMemo`,
+  `buildReleaseMemo`, `buildOtpMemo`, `parseOtpMemo`), `buildZip321Uri`,
+  and USD pricing (`annualUsd`, `foreverUsd`, `quoteZats`).
+- New: `reverseLookup` and `listNames` return a `Paginated` page with the
+  total match count.
+- New: on mainnet the client falls back to the next endpoint when one does
+  not reply or replies with an HTTP 5xx error.
+- `verify()` compares the registry viewing key and throws
+  `ZnsVerificationException` on a mismatch. `networks` is now
+  `znsNetworks`, with `urls`, `viewingKey` and `treasuryAddress`.
+- `Registration` and `Event` match the resolver records: `expiresAt` is new;
+  `nonce`, `signature` and `listing` are gone. `ZnsAction` is `claim`,
+  `update` or `release`.
+- Names are 1-63 characters. `normalizeName` trims and lowercases ASCII
+  only; it no longer strips a `.zcash` or `.zec` suffix.
+- `isValidUnifiedAddress` checks the length and the bech32m checksum.
+- Removed: listings, buy, `prepare*` actions, Merkle proofs, signature
+  verification, `validatePayload`, `isValidTransparentAddress`,
+  `buildZcashUri` and the claim cost helpers. The `cryptography`, `bech32`
+  and `meta` dependencies are gone.
+
 ## 0.7.0
 
 - BREAKING: sovereign signatures removed, matching the indexer (all actions

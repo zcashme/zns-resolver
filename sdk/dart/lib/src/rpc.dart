@@ -3,16 +3,19 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
-/// Thrown when an RPC call fails — either a non-2xx HTTP status, or a
+/// Thrown when a resolver answers with an error: an HTTP error status, or a
 /// JSON-RPC envelope `error`.
 class ZnsRpcException implements Exception {
-  /// JSON-RPC error code when [isHttp] is false; the raw HTTP status code
-  /// (e.g. 404, 500) when [isHttp] is true.
+  /// JSON-RPC error code when [isHttp] is false; the HTTP status code (e.g.
+  /// 404, 500) when [isHttp] is true.
   final int code;
   final String message;
   final bool isHttp;
 
   ZnsRpcException(this.code, this.message, {this.isHttp = false});
+
+  /// A server error may be one node's alone, so the next endpoint is tried.
+  bool get _isRetryable => isHttp && code >= 500;
 
   @override
   String toString() => isHttp
@@ -22,7 +25,8 @@ class ZnsRpcException implements Exception {
 
 /// Internal JSON-RPC 2.0 client. Not exported in the public surface.
 class RpcClient {
-  final Uri url;
+  /// Endpoints, tried in order.
+  final List<Uri> urls;
   final http.Client httpClient;
   final Duration timeout;
   int _id = 0;
@@ -30,8 +34,9 @@ class RpcClient {
   /// Whether [httpClient] is owned (and therefore closed by [close]).
   final bool _ownsClient;
 
-  RpcClient(this.url, {http.Client? httpClient, Duration? timeout})
-      : httpClient = httpClient ?? http.Client(),
+  RpcClient(this.urls, {http.Client? httpClient, Duration? timeout})
+      : assert(urls.isNotEmpty),
+        httpClient = httpClient ?? http.Client(),
         _ownsClient = httpClient == null,
         timeout = timeout ?? const Duration(seconds: 10);
 
@@ -44,11 +49,33 @@ class RpcClient {
       'params': params ?? <String, dynamic>{},
     });
 
-    final response = await httpClient.post(
-      url,
-      headers: const {'Content-Type': 'application/json'},
-      body: body,
-    ).timeout(timeout);
+    // Endpoints are tried in order. Only a failure to get an answer moves on
+    // to the next one; a resolver's own reply, even an error, is final.
+    Object? lastError;
+    StackTrace? lastStack;
+    for (final url in urls) {
+      try {
+        return await _post<T>(url, body);
+      } on ZnsRpcException catch (e, st) {
+        if (!e._isRetryable) rethrow;
+        lastError = e;
+        lastStack = st;
+      } on Exception catch (e, st) {
+        lastError = e;
+        lastStack = st;
+      }
+    }
+    Error.throwWithStackTrace(lastError!, lastStack!);
+  }
+
+  Future<T> _post<T>(Uri url, String body) async {
+    final response = await httpClient
+        .post(
+          url,
+          headers: const {'Content-Type': 'application/json'},
+          body: body,
+        )
+        .timeout(timeout);
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw ZnsRpcException(

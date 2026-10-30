@@ -1,6 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
 
-import 'package:cryptography/cryptography.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:test/test.dart';
@@ -8,416 +8,300 @@ import 'package:zcashname_sdk/zcashname_sdk.dart';
 
 const _ua =
     'utest100qlkeru5c3m5kfrwe2hsmcfzmusreaza2prdyelg2kd2tr2842nceq952vay3gpmgky09fgft4z57h4z2zqzz5rcwgd4q90u54ek5yyca4s6e6y2jja9sww27kzedzznjcupcu0svq2exvq995c0lhl5zm53g4ksnm2xuwt3snv4dgh';
-const _taddr = 'tmqY61Gp3B7Pz3ev12NRFzWxJz1yB28Gfkfi';
+final _resolver = Uri.parse('https://resolver.example');
+
+final _record = {
+  'name': 'alice',
+  'address': _ua,
+  'txid': 'ab' * 32,
+  'height': 100,
+  'last_action': 'claim',
+  'expires_at': 'none',
+};
+
+/// A resolver that answers every request with [result] and records each
+/// request body.
+(ZNS, List<Map<String, dynamic>>) _client(Object? result,
+    {Network network = Network.testnet}) {
+  final requests = <Map<String, dynamic>>[];
+  final client = MockClient((request) async {
+    requests.add(jsonDecode(request.body) as Map<String, dynamic>);
+    return http.Response(jsonEncode({'jsonrpc': '2.0', 'result': result}), 200);
+  });
+  return (
+    ZNS(network: network, url: _resolver, httpClient: client),
+    requests,
+  );
+}
 
 void main() {
-  group('constructor', () {
-    test('defaults to testnet', () {
+  group('network presets', () {
+    test('defaults to the testnet preset (fail safe)', () {
       final z = ZNS();
       expect(z.network, Network.testnet);
-      expect(z.url, networks[Network.testnet]!.url);
+      expect(z.url, Uri.parse('https://light.zcash.me/zns-testnet'));
     });
 
-    test('accepts network option', () {
+    test('selects the mainnet preset by network', () {
       final z = ZNS(network: Network.mainnet);
       expect(z.network, Network.mainnet);
-      expect(z.url, networks[Network.mainnet]!.url);
+      expect(z.url, Uri.parse('https://main.zcashnames.com'));
     });
 
-    test('accepts custom url', () {
-      final custom = Uri.parse('https://custom.example.com');
-      final z = ZNS(url: custom);
-      expect(z.url, custom);
-    });
-
-    test('registryAddress matches network', () {
-      final z = ZNS(network: Network.mainnet);
-      expect(z.registryAddress, networks[Network.mainnet]!.registryAddress);
+    test('an explicit url always wins over the preset', () {
+      final z = ZNS(network: Network.mainnet, url: _resolver);
+      expect(z.network, Network.mainnet);
+      expect(z.url, _resolver);
     });
   });
 
   group('resolveName normalization', () {
-    /// Mock indexer that records each resolve query and answers with a
-    /// registration for "alice".
-    MockClient mockResolve(List<String?> queries) {
-      return MockClient((req) async {
-        final body = jsonDecode(req.body) as Map<String, dynamic>;
-        final params = body['params'] as Map<String, dynamic>?;
-        queries.add(params?['query'] as String?);
-        return http.Response(
-          jsonEncode({
-            'jsonrpc': '2.0',
-            'id': body['id'],
-            'result': {
-              'name': 'alice',
-              'address': _ua,
-              'txid': 'ab' * 32,
-              'height': 100,
-              'nonce': 0,
-              'last_action': 'CLAIM',
-            },
-          }),
-          200,
-          headers: {'content-type': 'application/json'},
-        );
-      });
-    }
-
     test('sends the normalized name as the query', () async {
-      final queries = <String?>[];
-      final z = ZNS(httpClient: mockResolve(queries));
-      for (final input in [
-        'Alice.zcash',
-        'alice.zec',
-        'aLice.Zec',
-        'alice.ZCASH',
-        '  ALICE  ',
-      ]) {
-        final reg = await z.resolveName(input);
+      final (zns, requests) = _client(_record);
+      for (final input in ['Alice', 'alice', 'aLiCe', '  ALICE  ']) {
+        final reg = await zns.resolveName(input);
         expect(reg?.name, 'alice');
+        expect(reg?.lastAction, ZnsAction.claim);
+        expect(reg?.expiresAt, 'none');
       }
-      expect(queries, ['alice', 'alice', 'alice', 'alice', 'alice']);
+      expect(requests.map((r) => r['params']['query']),
+          ['alice', 'alice', 'alice', 'alice']);
     });
 
-    test('returns null for invalid names without hitting the server',
-        () async {
-      var calls = 0;
-      final z = ZNS(httpClient: MockClient((req) async {
-        calls++;
-        return http.Response('{}', 200);
-      }));
-      expect(await z.resolveName('alice.eth'), isNull);
-      expect(await z.resolveName('alice.zec.zec'), isNull);
-      expect(await z.resolveName('.zec'), isNull);
-      expect(await z.resolveName(''), isNull);
-      expect(await z.resolveNameWithProof('alice.eth'), isNull);
-      expect(await z.isAvailable('alice.eth'), isFalse);
-      expect(calls, 0);
+    test('returns null for an unregistered name', () async {
+      final (zns, _) = _client(null);
+      expect(await zns.resolveName('bob'), isNull);
+      expect(await zns.isAvailable('bob'), isTrue);
+    });
+
+    test('returns null for invalid names without hitting the server', () async {
+      final (zns, requests) = _client(_record);
+      expect(await zns.resolveName('alice.eth'), isNull);
+      expect(await zns.resolveName('alice.zec'), isNull);
+      expect(await zns.resolveName(''), isNull);
+      expect(await zns.isAvailable('alice.eth'), isFalse);
+      expect(requests, isEmpty);
     });
 
     test('isAvailable checks the normalized name', () async {
-      final queries = <String?>[];
-      final z = ZNS(httpClient: mockResolve(queries));
-      expect(await z.isAvailable('Alice.zec'), isFalse);
-      expect(queries, ['alice']);
+      final (zns, requests) = _client(_record);
+      expect(await zns.isAvailable('Alice'), isFalse);
+      expect(requests.single['params']['query'], 'alice');
+    });
+
+    test('throws on an action the resolver does not send', () async {
+      final (zns, _) = _client({..._record, 'last_action': 'buy'});
+      expect(zns.resolveName('alice'), throwsFormatException);
     });
   });
 
-  group('claimCost', () {
-    test('returns correct tier per name length', () {
-      final z = ZNS();
-      final p = Pricing(nonce: 0, height: 0, tiers: [100, 200, 300, 500, 1000]);
-      expect(z.claimCost(1, p), 100);
-      expect(z.claimCost(2, p), 200);
-      expect(z.claimCost(3, p), 300);
-      expect(z.claimCost(4, p), 500);
-      expect(z.claimCost(62, p), 1000);
-    });
-
-    test('clamps to max tier for long names', () {
-      final z = ZNS();
-      final p = Pricing(nonce: 0, height: 0, tiers: [100, 200, 300]);
-      expect(z.claimCost(100, p), 300);
-    });
-
-    test('returns null for empty tiers', () {
-      final z = ZNS();
-      expect(z.claimCost(5, Pricing(nonce: 0, height: 0, tiers: [])), isNull);
-    });
-  });
-
-  group('listCommissionFor', () {
-    test('returns 10% of minimum tier', () {
-      final z = ZNS();
-      final p = Pricing(nonce: 0, height: 0, tiers: [100, 200, 300]);
-      expect(z.listCommissionFor(p), 10);
-    });
-
-    test('returns null for empty tiers', () {
-      final z = ZNS();
+  group('resolve list forms', () {
+    test('resolveAddress queries the address with pagination', () async {
+      final (zns, requests) = _client([_record]);
+      final regs = await zns.resolveAddress(_ua, limit: 10, offset: 5);
+      expect(regs.single.name, 'alice');
       expect(
-          z.listCommissionFor(Pricing(nonce: 0, height: 0, tiers: [])), isNull);
+          requests.single['params'], {'query': _ua, 'limit': 10, 'offset': 5});
+    });
+
+    test('listAllRegistrations sends the empty query', () async {
+      final (zns, requests) = _client(<Object>[]);
+      expect(await zns.listAllRegistrations(), isEmpty);
+      expect(requests.single['params'], {'query': ''});
     });
   });
 
-  group('prepareClaim', () {
-    test('builds valid claim payload', () {
-      final z = ZNS();
-      final c = z.prepareClaim('alice', _ua, 1000);
-      expect(c.payload, 'CLAIM:alice:$_ua');
-      expect(c.name, 'alice');
-      expect(c.address, _ua);
-      expect(c.cost, 1000);
+  group('reverseLookup and listNames', () {
+    test('calls the typed reverse_lookup verb and returns the total', () async {
+      final (zns, requests) = _client({
+        'items': [_record],
+        'total': 3,
+        'limit': 1,
+        'offset': 0,
+      });
+      final page = await zns.reverseLookup(_ua, limit: 1, offset: 0);
+      expect(requests.single['method'], 'reverse_lookup');
+      expect(
+          requests.single['params'], {'address': _ua, 'limit': 1, 'offset': 0});
+      expect(page.total, 3);
+      expect(page.items.single.name, 'alice');
+      expect(page.items.single.lastAction, ZnsAction.claim);
     });
 
-    test('complete() builds the memo', () {
-      final z = ZNS();
-      final c = z.prepareClaim('alice', _ua, 1000);
-      final result = c.complete('SIGB64');
-      expect(result.memo, 'ZNS:CLAIM:alice:$_ua:SIGB64');
-      expect(result.memo.contains(':null'), isFalse);
-      expect(result.uri.startsWith('zcash:'), isTrue);
-      expect(result.uri.contains('amount='), isTrue);
-    });
-
-    test('normalizes the name before building the payload', () {
-      final z = ZNS();
-      final c = z.prepareClaim('  ALICE.Zec ', _ua, 1000);
-      expect(c.name, 'alice');
-      expect(c.payload, 'CLAIM:alice:$_ua');
-      expect(c.complete('SIGB64').memo, 'ZNS:CLAIM:alice:$_ua:SIGB64');
-    });
-
-    test('throws on invalid name', () {
-      final z = ZNS();
-      expect(() => z.prepareClaim('alice.eth', _ua, 1000),
-          throwsA(isA<InvalidNameException>()));
-      expect(() => z.prepareClaim('my-name', _ua, 1000),
-          throwsA(isA<InvalidNameException>()));
-    });
-
-    test('throws on invalid address', () {
-      final z = ZNS();
-      expect(() => z.prepareClaim('alice', 'notvalid', 1000),
-          throwsA(isA<InvalidAddressException>()));
+    test('calls the typed list_names verb', () async {
+      final (zns, requests) =
+          _client({'items': <Object>[], 'total': 0, 'limit': 50, 'offset': 0});
+      final page = await zns.listNames(limit: 50, offset: 10);
+      expect(requests.single['method'], 'list_names');
+      expect(requests.single['params'], {'limit': 50, 'offset': 10});
+      expect(page.items, isEmpty);
     });
   });
 
-  group('prepareList', () {
-    test('builds valid list payload', () {
-      final z = ZNS();
-      final l = z.prepareList('alice', 100000000, _taddr, 1);
-      expect(l.payload, 'LIST:alice:100000000:$_taddr:1');
+  group('events', () {
+    test('sends lowercase event filters using resolver parameter names',
+        () async {
+      final (zns, requests) = _client({
+        'events': [
+          {
+            'id': 1,
+            'name': 'alice',
+            'action': 'update',
+            'txid': 'ab' * 32,
+            'height': 123,
+            'action_index': 2,
+            'address': _ua,
+            'expires_at': 'none',
+          }
+        ],
+        'total': 1,
+        'limit': 50,
+        'offset': 0,
+      });
+      final result = await zns.events(const EventsFilter(
+          name: 'alice', action: ZnsAction.update, sinceHeight: 100));
+      expect(requests.single['params'],
+          {'name': 'alice', 'action': 'update', 'since_height': 100});
+      final event = result.events.single;
+      expect(event.action, ZnsAction.update);
+      expect(event.actionIndex, 2);
+      expect(event.address, _ua);
+      expect(event.expiresAt, 'none');
+      expect((result.total, result.limit, result.offset), (1, 50, 0));
     });
 
-    test('complete() URI uses list commission amount', () {
-      final z = ZNS();
-      final l = z.prepareList('alice', 100000000, _taddr, 1);
-      final r = l.complete('SIG');
-      // listCommission = 1_000_000 zats = 0.01 ZEC
-      expect(r.uri, contains('amount=0.01'));
-    });
-
-    test('throws on invalid transparent address', () {
-      final z = ZNS();
-      expect(() => z.prepareList('alice', 100000000, 'notvalid', 1),
-          throwsA(isA<InvalidAddressException>()));
-    });
-  });
-
-  group('prepareUpdate', () {
-    test('builds valid update payload', () {
-      final z = ZNS();
-      final u = z.prepareUpdate('alice', _ua, 2);
-      expect(u.payload, 'UPDATE:alice:$_ua:2');
-    });
-
-    test('throws on invalid address', () {
-      final z = ZNS();
-      expect(() => z.prepareUpdate('alice', 'notvalid', 2),
-          throwsA(isA<InvalidAddressException>()));
-    });
-  });
-
-  group('prepareBuy', () {
-    test('builds valid buy payload + URI uses BUY commission', () {
-      final z = ZNS();
-      final b = z.prepareBuy('alice', _ua, 50000000);
-      expect(b.payload, 'BUY:alice:$_ua');
-      final r = b.complete('SIG');
-      expect(r.uri, contains('amount=0.0001'));
-      expect(r.memo, contains(':50000000:SIG'));
+    test('sends empty params without a filter', () async {
+      final (zns, requests) =
+          _client({'events': <Object>[], 'total': 0, 'limit': 50, 'offset': 0});
+      await zns.events();
+      expect(requests.single['params'], isEmpty);
     });
   });
 
-  group('prepareRelease / prepareDelist', () {
-    test('release payload', () {
-      expect(ZNS().prepareRelease('alice', 4).payload, 'RELEASE:alice:4');
-    });
-    test('delist payload', () {
-      expect(ZNS().prepareDelist('alice', 5).payload, 'DELIST:alice:5');
-    });
-  });
-
-  group('prepareSetPrice', () {
-    test('builds payload + memo', () {
-      final p = ZNS().prepareSetPrice([100, 200, 300], 1);
-      expect(p.payload, 'SETPRICE:3:100:200:300:1');
-      final r = p.complete('SIG');
-      expect(r.memo, 'ZNS:SETPRICE:3:100:200:300:1:SIG');
-    });
-
-  });
-
-  group('PreparedAction (sealed)', () {
-    test('exhaustive switch yields action enum', () {
-      final z = ZNS();
-      final actions = <PreparedAction>[
-        z.prepareClaim('alice', _ua, 100),
-        z.prepareList('alice', 100, _taddr, 1),
-        z.prepareDelist('alice', 1),
-        z.prepareUpdate('alice', _ua, 1),
-        z.prepareBuy('alice', _ua, 100),
-        z.prepareRelease('alice', 1),
-        z.prepareSetPrice([100], 1),
-      ];
-      final seen = <ZnsAction>{};
-      for (final a in actions) {
-        seen.add(switch (a) {
-          PreparedClaim() => ZnsAction.claim,
-          PreparedList() => ZnsAction.list,
-          PreparedDelist() => ZnsAction.delist,
-          PreparedUpdate() => ZnsAction.update,
-          PreparedBuy() => ZnsAction.buy,
-          PreparedRelease() => ZnsAction.release,
-          PreparedSetPrice() => ZnsAction.setprice,
-        });
+  group('status and verify', () {
+    test('passes when the server serves the baked viewing key', () async {
+      for (final network in Network.values) {
+        final (zns, requests) = _client({
+          'synced_height': 1,
+          'viewing_key': znsNetworks[network]!.viewingKey,
+        }, network: network);
+        await zns.verify();
+        expect(requests.single['method'], 'status');
       }
-      expect(seen, ZnsAction.values.toSet());
-    });
-  });
-
-  group('ZnsAction enum', () {
-    test('fromWire is case-insensitive', () {
-      expect(ZnsAction.fromWire('CLAIM'), ZnsAction.claim);
-      expect(ZnsAction.fromWire('claim'), ZnsAction.claim);
-      expect(ZnsAction.fromWire('Setprice'), ZnsAction.setprice);
-      expect(ZnsAction.fromWire('NOPE'), isNull);
     });
 
-    test('isUserSignable excludes SETPRICE only', () {
-      expect(ZnsAction.setprice.isUserSignable, isFalse);
-      expect(ZnsAction.claim.isUserSignable, isTrue);
-      expect(ZnsAction.list.isUserSignable, isTrue);
-    });
-
-    test('isOwnershipChanging excludes LIST and SETPRICE', () {
-      expect(ZnsAction.list.isOwnershipChanging, isFalse);
-      expect(ZnsAction.setprice.isOwnershipChanging, isFalse);
-      expect(ZnsAction.claim.isOwnershipChanging, isTrue);
-      expect(ZnsAction.delist.isOwnershipChanging, isTrue);
-    });
-  });
-
-  group('verifySignature', () {
-    test('verifies a real Ed25519 signature', () async {
-      final algo = Ed25519();
-      final pair = await algo.newKeyPair();
-      final pubkey = await pair.extractPublicKey();
-
-      const payload = 'CLAIM:alice:utest1';
-      final sig = await algo.sign(utf8.encode(payload), keyPair: pair);
-      final sigB64 = base64.encode(sig.bytes);
-      final pkB64 = base64.encode(pubkey.bytes);
-
-      final z = ZNS();
-      expect(await z.verifySignature(payload, sigB64, pkB64), isTrue);
-    });
-
-    test('rejects tampered payload', () async {
-      final algo = Ed25519();
-      final pair = await algo.newKeyPair();
-      final pubkey = await pair.extractPublicKey();
-
-      const payload = 'CLAIM:alice:utest1';
-      const tampered = 'CLAIM:bob:utest1';
-      final sig = await algo.sign(utf8.encode(payload), keyPair: pair);
-      final sigB64 = base64.encode(sig.bytes);
-      final pkB64 = base64.encode(pubkey.bytes);
-
-      final z = ZNS();
-      expect(
-          await z.verifySignature(tampered, sigB64, pkB64), isFalse);
-    });
-
-    test('returns false on malformed base64', () async {
-      final z = ZNS();
-      expect(await z.verifySignature('CLAIM:a:b', '!!!', '!!!'),
-          isFalse);
-    });
-
-    test('returns false on wrong-length pubkey', () async {
-      final z = ZNS();
-      // 32-byte signature, 16-byte "pubkey" — both decodable but wrong length.
-      final sig = base64.encode(List<int>.filled(64, 0));
-      final pk = base64.encode(List<int>.filled(16, 0));
-      expect(
-          await z.verifySignature('CLAIM:a:b', sig, pk), isFalse);
-    });
-  });
-
-  group('models', () {
-    test('Registration.fromJson decodes snake_case', () {
-      final reg = Registration.fromJson({
-        'name': 'alice',
-        'address': _ua,
-        'txid': 'abc',
-        'height': 100,
-        'nonce': 1,
-        'signature': 'SIG',
-        'last_action': 'CLAIM',
+    test('reads every status field', () async {
+      final testnet = znsNetworks[Network.testnet]!;
+      final (zns, _) = _client({
+        'synced_height': 4529119,
+        'synced': true,
+        'viewing_key': testnet.viewingKey,
+        'treasury_address': testnet.treasuryAddress,
       });
-      expect(reg.name, 'alice');
-      expect(reg.lastAction, ZnsAction.claim);
-      expect(reg.listing, isNull);
+      final status = await zns.status();
+      expect(status.syncedHeight, 4529119);
+      expect(status.synced, isTrue);
+      expect(status.viewingKey, testnet.viewingKey);
+      expect(status.treasuryAddress, testnet.treasuryAddress);
     });
 
-    test('Registration.fromJson throws on non-ownership last_action', () {
+    test('throws with upgrade guidance on a key mismatch', () async {
+      final (zns, _) =
+          _client({'synced_height': 1, 'viewing_key': 'uviewtest1rotated'});
       expect(
-        () => Registration.fromJson({
-          'name': 'alice',
-          'address': _ua,
-          'txid': 'abc',
-          'height': 100,
-          'nonce': 1,
-          'signature': 'SIG',
-          'last_action': 'LIST',
-        }),
-        throwsA(isA<FormatException>()),
+        zns.verify(),
+        throwsA(isA<ZnsVerificationException>().having((e) => e.message,
+            'message', contains('registry rotation. Upgrade zcashname_sdk'))),
       );
     });
+  });
 
-    test('Registration value equality', () {
-      final a = Registration(
-        name: 'alice',
-        address: _ua,
-        txid: 'abc',
-        height: 100,
-        nonce: 1,
-        lastAction: ZnsAction.claim,
-      );
-      final b = Registration(
-        name: 'alice',
-        address: _ua,
-        txid: 'abc',
-        height: 100,
-        nonce: 1,
-        lastAction: ZnsAction.claim,
-      );
-      expect(a, equals(b));
-      expect(a.hashCode, b.hashCode);
+  group('timeout', () {
+    test('fails a request that outlasts the timeout', () async {
+      final client = MockClient((_) => Completer<http.Response>().future);
+      final zns = ZNS(
+          url: _resolver,
+          httpClient: client,
+          timeout: const Duration(milliseconds: 20));
+      expect(zns.status(), throwsA(isA<TimeoutException>()));
     });
+  });
 
-    test('Listing.fromJson handles pending_buy', () {
-      final l = Listing.fromJson({
-        'name': 'alice',
-        'price': 10,
-        'pay_taddr': _taddr,
-        'nonce': 1,
-        'txid': 'abc',
-        'height': 100,
-        'signature': 'SIG',
-        'pending_buy': {
-          'buyer': 'utest1xxx',
-          'price': 10,
-          'claim_height': 101,
-          'expires_at': 200,
-          'txid': 'def',
-        },
+  group('endpoint fallback', () {
+    const okStatus = {
+      'result': {'synced_height': 1, 'viewing_key': 'uview-x'}
+    };
+    final primary = Uri.parse('https://main.zcashnames.com');
+
+    /// A mainnet client whose endpoints answer with [respond], recording the
+    /// URL of each request.
+    (ZNS, List<Uri>) mainnet(Future<http.Response> Function(Uri) respond) {
+      final urls = <Uri>[];
+      final client = MockClient((request) {
+        urls.add(request.url);
+        return respond(request.url);
       });
-      expect(l.payTaddr, _taddr);
-      expect(l.pendingBuy?.claimHeight, 101);
-      expect(l.pendingBuy?.expiresAt, 200);
+      return (ZNS(network: Network.mainnet, httpClient: client), urls);
+    }
+
+    test('falls back to the next endpoint when one is unreachable', () async {
+      final (zns, urls) = mainnet((url) async => url == primary
+          ? throw http.ClientException('connection refused', url)
+          : http.Response(jsonEncode(okStatus), 200));
+      expect((await zns.status()).syncedHeight, 1);
+      expect(urls, znsNetworks[Network.mainnet]!.urls);
+    });
+
+    test('falls back on a server error', () async {
+      final (zns, urls) = mainnet((url) async => url == primary
+          ? http.Response('', 503, reasonPhrase: 'Unavailable')
+          : http.Response(jsonEncode(okStatus), 200));
+      expect((await zns.status()).syncedHeight, 1);
+      expect(urls, hasLength(2));
+    });
+
+    test('does not fall back when the resolver answers with an RPC error',
+        () async {
+      final (zns, urls) = mainnet((_) async => http.Response(
+          jsonEncode({
+            'error': {'code': -1, 'message': 'nope'}
+          }),
+          200));
+      await expectLater(
+          zns.status(),
+          throwsA(isA<ZnsRpcException>()
+              .having((e) => e.message, 'message', 'nope')));
+      expect(urls, hasLength(1));
+    });
+
+    test('does not fall back on a client error', () async {
+      final (zns, urls) = mainnet(
+          (_) async => http.Response('', 404, reasonPhrase: 'Not Found'));
+      await expectLater(
+          zns.status(),
+          throwsA(isA<ZnsRpcException>()
+              .having((e) => (e.code, e.isHttp), 'code', (404, true))));
+      expect(urls, hasLength(1));
+    });
+
+    test('throws the last failure when every endpoint is unreachable',
+        () async {
+      final (zns, urls) = mainnet(
+          (url) async => throw http.ClientException('connection refused', url));
+      await expectLater(zns.status(), throwsA(isA<http.ClientException>()));
+      expect(urls, hasLength(2));
+    });
+
+    test('does not fall back when an explicit url is set', () async {
+      final urls = <Uri>[];
+      final client = MockClient((request) async {
+        urls.add(request.url);
+        throw http.ClientException('connection refused', request.url);
+      });
+      final zns =
+          ZNS(network: Network.mainnet, url: _resolver, httpClient: client);
+      await expectLater(zns.status(), throwsA(isA<http.ClientException>()));
+      expect(urls, [_resolver]);
     });
   });
 }
