@@ -91,8 +91,8 @@ class ZNS {
     String address, {
     int? limit,
     int? offset,
-  }) =>
-      _resolveMany(address, limit, offset);
+  }) async =>
+      (await reverseLookup(address, limit: limit, offset: offset)).items;
 
   /// Reverse lookup: all names currently bound to [address], with the total
   /// match count.
@@ -110,8 +110,9 @@ class ZNS {
   }
 
   /// List all registered names. Same pagination as [resolveAddress].
-  Future<List<Registration>> listAllRegistrations({int? limit, int? offset}) =>
-      _resolveMany('', limit, offset);
+  Future<List<Registration>> listAllRegistrations(
+          {int? limit, int? offset}) async =>
+      (await listNames(limit: limit, offset: offset)).items;
 
   /// List all registered names, with the total match count.
   Future<Paginated<Registration>> listNames({int? limit, int? offset}) async {
@@ -148,18 +149,4 @@ class ZNS {
 
   /// Parse a ZIP-321 URI into its parts.
   zip321.Zip321Parts parseZip321Uri(String uri) => zip321.parseZip321Uri(uri);
-
-  // ── Private ──────────────────────────────────────────────────────────────
-
-  Future<List<Registration>> _resolveMany(
-      String query, int? limit, int? offset) async {
-    final raw = await _rpc.call<List<dynamic>>('resolve', {
-      'query': query,
-      if (limit != null) 'limit': limit,
-      if (offset != null) 'offset': offset,
-    });
-    return raw
-        .map((e) => Registration.fromJson(e as Map<String, dynamic>))
-        .toList(growable: false);
-  }
 }

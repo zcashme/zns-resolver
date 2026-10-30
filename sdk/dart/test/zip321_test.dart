@@ -97,6 +97,13 @@ void main() {
       expect(parseZip321Uri('ZCASH:u1abc').address, 'u1abc');
     });
 
+    test('reads bad percent-encoding as a URI without fields', () {
+      final result = parseZip321Uri('zcash:u1abc?amount=1&memo=%zz');
+      expect(result.address, 'u1abc');
+      expect(result.amount, '');
+      expect(result.memoRaw, '');
+    });
+
     test('decodes an undecodable memo to an empty string', () {
       expect(parseZip321Uri('zcash:u1abc?memo=*').memoDecoded, '');
     });

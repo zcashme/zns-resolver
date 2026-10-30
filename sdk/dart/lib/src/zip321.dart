@@ -112,7 +112,13 @@ Zip321Parts parseZip321Uri(String uri) {
       qIdx == -1 ? withoutScheme : withoutScheme.substring(0, qIdx);
   final query = qIdx == -1 ? '' : withoutScheme.substring(qIdx + 1);
 
-  final params = Uri.splitQueryString(query);
+  Map<String, String> params;
+  try {
+    params = Uri.splitQueryString(query);
+  } on ArgumentError {
+    // Bad percent-encoding: read it as a URI without fields.
+    params = const {};
+  }
   final amount = (params['amount'] ?? '').trim();
   final memoRaw = (params['memo'] ?? '').trim();
   final memoDecoded = memoRaw.isEmpty ? '' : decodeBase64Url(memoRaw);

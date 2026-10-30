@@ -3,6 +3,7 @@
 library;
 
 import 'actions.dart';
+import 'validators.dart';
 
 ZnsAction _action(Object? wire) {
   final action = wire is String ? ZnsAction.fromWire(wire) : null;
@@ -231,9 +232,10 @@ class EventsFilter {
     this.offset,
   });
 
-  /// The `events` params, with the resolver's parameter names.
+  /// The `events` params, with the resolver's parameter names. [name] is
+  /// normalized like [ZNS.resolveName].
   Map<String, dynamic> toJson() => {
-        if (name != null) 'name': name,
+        if (name != null) 'name': normalizeName(name!),
         if (action != null) 'action': action!.wire,
         if (sinceHeight != null) 'since_height': sinceHeight,
         if (limit != null) 'limit': limit,

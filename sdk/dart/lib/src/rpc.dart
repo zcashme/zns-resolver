@@ -34,8 +34,8 @@ class RpcClient {
   /// Whether [httpClient] is owned (and therefore closed by [close]).
   final bool _ownsClient;
 
-  RpcClient(this.urls, {http.Client? httpClient, Duration? timeout})
-      : assert(urls.isNotEmpty),
+  RpcClient(List<Uri> urls, {http.Client? httpClient, Duration? timeout})
+      : urls = List.unmodifiable(urls),
         httpClient = httpClient ?? http.Client(),
         _ownsClient = httpClient == null,
         timeout = timeout ?? const Duration(seconds: 10);
@@ -85,16 +85,21 @@ class RpcClient {
       );
     }
 
-    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
-    final error = decoded['error'];
-    if (error != null) {
-      final m = error as Map<String, dynamic>;
-      throw ZnsRpcException(
-        (m['code'] as int?) ?? -32603,
-        (m['message'] as String?) ?? 'Unknown error',
-      );
+    // A reply of the wrong shape is no answer, so the next endpoint is tried.
+    try {
+      final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+      final error = decoded['error'];
+      if (error != null) {
+        final m = error as Map<String, dynamic>;
+        throw ZnsRpcException(
+          (m['code'] as int?) ?? -32603,
+          (m['message'] as String?) ?? 'Unknown error',
+        );
+      }
+      return decoded['result'] as T;
+    } on TypeError {
+      throw FormatException('ZNS: malformed JSON-RPC reply', response.body);
     }
-    return decoded['result'] as T;
   }
 
   void close() {

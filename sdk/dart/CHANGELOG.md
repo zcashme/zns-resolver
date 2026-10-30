@@ -9,7 +9,9 @@
   `buildReleaseMemo`, `buildOtpMemo`, `parseOtpMemo`), `buildZip321Uri`,
   and USD pricing (`annualUsd`, `foreverUsd`, `quoteZats`).
 - New: `reverseLookup` and `listNames` return a `Paginated` page with the
-  total match count.
+  total match count. `resolveAddress` and `listAllRegistrations` use them
+  too, so an empty or name-shaped address gives an empty list.
+- `EventsFilter.name` is normalized like `resolveName`.
 - New: on mainnet the client falls back to the next endpoint when one does
   not reply or replies with an HTTP 5xx error.
 - `verify()` compares the registry viewing key and throws

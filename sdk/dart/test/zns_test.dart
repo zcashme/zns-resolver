@@ -55,6 +55,12 @@ void main() {
     });
   });
 
+  test('the built-in network data is read-only', () {
+    final mainnet = znsNetworks[Network.mainnet]!;
+    expect(() => znsNetworks.remove(Network.mainnet), throwsUnsupportedError);
+    expect(() => mainnet.urls.insert(0, _resolver), throwsUnsupportedError);
+  });
+
   group('resolveName normalization', () {
     test('sends the normalized name as the query', () async {
       final (zns, requests) = _client(_record);
@@ -95,19 +101,39 @@ void main() {
     });
   });
 
-  group('resolve list forms', () {
-    test('resolveAddress queries the address with pagination', () async {
-      final (zns, requests) = _client([_record]);
+  group('list shorthands', () {
+    final emptyPage = {
+      'items': <Object>[],
+      'total': 0,
+      'limit': 50,
+      'offset': 0
+    };
+
+    test('resolveAddress uses reverse_lookup', () async {
+      final (zns, requests) = _client({
+        'items': [_record],
+        'total': 1,
+        'limit': 10,
+        'offset': 5
+      });
       final regs = await zns.resolveAddress(_ua, limit: 10, offset: 5);
       expect(regs.single.name, 'alice');
-      expect(
-          requests.single['params'], {'query': _ua, 'limit': 10, 'offset': 5});
+      expect(requests.single['method'], 'reverse_lookup');
+      expect(requests.single['params'],
+          {'address': _ua, 'limit': 10, 'offset': 5});
     });
 
-    test('listAllRegistrations sends the empty query', () async {
-      final (zns, requests) = _client(<Object>[]);
+    test('resolveAddress never lists every name for an empty address',
+        () async {
+      final (zns, requests) = _client(emptyPage);
+      expect(await zns.resolveAddress(''), isEmpty);
+      expect(requests.single['method'], 'reverse_lookup');
+    });
+
+    test('listAllRegistrations uses list_names', () async {
+      final (zns, requests) = _client(emptyPage);
       expect(await zns.listAllRegistrations(), isEmpty);
-      expect(requests.single['params'], {'query': ''});
+      expect(requests.single['method'], 'list_names');
     });
   });
 
@@ -168,6 +194,13 @@ void main() {
       expect(event.address, _ua);
       expect(event.expiresAt, 'none');
       expect((result.total, result.limit, result.offset), (1, 50, 0));
+    });
+
+    test('normalizes the name filter like resolveName', () async {
+      final (zns, requests) =
+          _client({'events': <Object>[], 'total': 0, 'limit': 50, 'offset': 0});
+      await zns.events(const EventsFilter(name: '  Alice '));
+      expect(requests.single['params'], {'name': 'alice'});
     });
 
     test('sends empty params without a filter', () async {
@@ -250,6 +283,16 @@ void main() {
           : http.Response(jsonEncode(okStatus), 200));
       expect((await zns.status()).syncedHeight, 1);
       expect(urls, znsNetworks[Network.mainnet]!.urls);
+    });
+
+    test('falls back on a reply of the wrong shape', () async {
+      for (final reply in ['[]', '"ok"', '{"error":"bad"}', '<html>']) {
+        final (zns, urls) = mainnet((url) async => url == primary
+            ? http.Response(reply, 200)
+            : http.Response(jsonEncode(okStatus), 200));
+        expect((await zns.status()).syncedHeight, 1, reason: reply);
+        expect(urls, hasLength(2));
+      }
     });
 
     test('falls back on a server error', () async {
