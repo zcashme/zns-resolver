@@ -1709,10 +1709,11 @@ dependencies = [
 
 [[package]]
 name = "seer-sync"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6d3710acff3c48d5a4bba85738fb2dcdea6d18ca30387ea3e55ad9a467d53a3"
+checksum = "98d6718c5c985e0a52c8d87045dbc1bb070852e2056574fe239b161aeaced583"
 dependencies = [
+ "futures-util",
  "http",
  "orchard",
  "prost",
@@ -1720,7 +1721,6 @@ dependencies = [
  "sapling-crypto",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

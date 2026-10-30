@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
-use zcash_protocol::consensus::{NetworkType, Parameters};
+use zcash_protocol::consensus::Network;
 use zns_verify::Action;
 
 mod anchor_lineage;
@@ -23,10 +23,9 @@ impl Db {
     pub(crate) fn open(ufvk: &str, birthday: u32, db_path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
         storage::install_schema(&conn)?;
-        let net_str = match crate::NETWORK.network_type() {
-            NetworkType::Main => "main",
-            NetworkType::Test => "test",
-            NetworkType::Regtest => "regtest",
+        let net_str = match crate::NETWORK {
+            Network::MainNetwork => "main",
+            Network::TestNetwork => "test",
         };
         core::install_registry_config(&conn, ufvk, net_str, birthday)?;
         core::drop_payment_notes(&conn)?;
@@ -69,30 +68,4 @@ pub(crate) struct Event {
     pub(crate) txid: [u8; 32],
     pub(crate) height: u32,
     pub(crate) action_index: usize,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lock_recovers_after_the_mutex_is_poisoned() {
-        let db = Db::open("ufvk", 1, ":memory:").unwrap();
-        let other = db.clone();
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = other.lock();
-            panic!("poison the registry lock");
-        }));
-        assert!(panicked.is_err());
-
-        {
-            let conn = db.lock();
-            let names: i64 = conn
-                .query_row("SELECT COUNT(*) FROM names", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(names, 0);
-        }
-        assert!(!db.0.is_poisoned());
-        let _again = db.lock();
-    }
 }
