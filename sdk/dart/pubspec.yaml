@@ -1,0 +1,14 @@
+name: zcashname_sdk
+description: Dart SDK for the Zcash Name System (ZNS) resolver and mint request memos.
+version: 0.8.0
+repository: https://github.com/zcashme/zns-resolver/tree/master/sdk/dart
+license: MIT
+
+environment:
+  sdk: ^3.4.0
+
+dependencies:
+  http: ^1.2.0
+
+dev_dependencies:
+  test: ^1.25.0
