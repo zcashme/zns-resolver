@@ -1,6 +1,20 @@
-//! A typed, read-only client for the ZNS resolver JSON-RPC API.
+//! ZNS resolver client, mint request memos, ZIP-321 URIs and display pricing.
+#![doc = include_str!("../README.md")]
+
+mod memo;
+mod networks;
+mod pricing;
+mod validators;
+mod zip321;
+
+pub use memo::*;
+pub use networks::*;
+pub use pricing::*;
+pub use validators::*;
+pub use zip321::*;
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use reqwest::Client as HttpClient;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -25,6 +39,25 @@ pub enum Action {
     Claim,
     Update,
     Release,
+}
+
+impl Action {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claim => "claim",
+            Self::Update => "update",
+            Self::Release => "release",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "claim" => Some(Self::Claim),
+            "update" => Some(Self::Update),
+            "release" => Some(Self::Release),
+            _ => None,
+        }
+    }
 }
 
 /// Trims whitespace and lowercases ASCII letters.
@@ -100,15 +133,21 @@ pub struct EventsFilter {
 /// Current resolver sync state and metadata.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Status {
+    #[serde(default)]
     pub synced_height: u64,
-    pub synced: bool,
+    /// Absent on older resolvers.
+    pub synced: Option<bool>,
     pub viewing_key: String,
-    pub registered: u64,
+    pub treasury_address: Option<String>,
 }
 
 /// Errors returned by the resolver client.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("invalid SDK input: {0}")]
+    InvalidInput(&'static str),
+    #[error("resolver viewing key does not match the ZNS {network:?} registry; check the endpoint or upgrade zcashname-sdk after a registry rotation")]
+    Verification { network: Network },
     #[error("resolver HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("resolver response JSON is invalid: {0}")]
@@ -121,19 +160,101 @@ pub enum Error {
 
 /// An async client for the resolver's read-only JSON-RPC API.
 pub struct ResolverClient {
-    endpoint: String,
+    network: Network,
+    endpoints: Vec<String>,
+    timeout: Duration,
     http: HttpClient,
     next_id: AtomicU64,
+}
+
+impl Default for ResolverClient {
+    fn default() -> Self {
+        Self::for_network(Network::Testnet)
+    }
 }
 
 impl ResolverClient {
     /// Creates a client for a resolver JSON-RPC endpoint.
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
-            endpoint: endpoint.into(),
+            network: Network::Testnet,
+            endpoints: vec![endpoint.into()],
+            timeout: Duration::from_secs(10),
             http: HttpClient::new(),
             next_id: AtomicU64::new(1),
         }
+    }
+
+    /// Use a network's built-in endpoints, in order, with a 10-second
+    /// per-endpoint timeout. Defaults to testnet via `ResolverClient::default()`.
+    pub fn for_network(network: Network) -> Self {
+        Self {
+            network,
+            endpoints: network
+                .config()
+                .urls
+                .iter()
+                .map(|url| (*url).into())
+                .collect(),
+            ..Self::new(network.config().urls[0])
+        }
+    }
+
+    /// Supply a client, network and optional endpoint override. An override
+    /// replaces the preset list completely. Timeout covers each HTTP request
+    /// including its response body; the supplied client is cheaply cloned by
+    /// reqwest and can be shared by the caller.
+    pub fn with_options(
+        network: Network,
+        endpoints: Option<Vec<String>>,
+        http: HttpClient,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
+        let endpoints = endpoints.unwrap_or_else(|| {
+            network
+                .config()
+                .urls
+                .iter()
+                .map(|url| (*url).into())
+                .collect()
+        });
+        if endpoints.is_empty() || timeout.is_zero() {
+            return Err(Error::InvalidInput(
+                "at least one endpoint and a positive timeout are required",
+            ));
+        }
+        for endpoint in &endpoints {
+            let url = reqwest::Url::parse(endpoint)
+                .map_err(|_| Error::InvalidInput("invalid resolver URL"))?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err(Error::InvalidInput("resolver URL must be HTTP or HTTPS"));
+            }
+        }
+        Ok(Self {
+            network,
+            endpoints,
+            http,
+            timeout,
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    pub fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
+
+    /// Verify the endpoint's viewing key against the built-in registry identity.
+    pub async fn verify(&self) -> Result<(), Error> {
+        if self.status().await?.viewing_key != self.network.config().viewing_key {
+            return Err(Error::Verification {
+                network: self.network,
+            });
+        }
+        Ok(())
     }
 
     /// Queries a name, address, or the empty string for all names.
@@ -214,8 +335,28 @@ impl ResolverClient {
         self.call("status", EmptyParams {}).await
     }
 
+    /// Return this page's items from the typed reverse lookup endpoint.
+    pub async fn resolve_address(
+        &self,
+        address: &str,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> Result<Vec<NameRecord>, Error> {
+        Ok(self.reverse_lookup(address, limit, offset).await?.items)
+    }
+
+    /// Return this page's items, not an unbounded traversal of all pages.
+    pub async fn list_all_registrations(
+        &self,
+        limit: Option<u64>,
+        offset: Option<u64>,
+    ) -> Result<Vec<NameRecord>, Error> {
+        Ok(self.list_names(limit, offset).await?.items)
+    }
+
     /// Reads a filtered page of lifecycle events.
-    pub async fn events(&self, filter: EventsFilter) -> Result<EventsPage, Error> {
+    pub async fn events(&self, mut filter: EventsFilter) -> Result<EventsPage, Error> {
+        filter.name = filter.name.map(|name| normalize_name(&name));
         self.call("events", filter).await
     }
 
@@ -231,9 +372,40 @@ impl ResolverClient {
             method,
             params,
         };
+        let mut last_error = None;
+        for endpoint in &self.endpoints {
+            match self.post(endpoint, &request, id).await {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    // A resolver's RPC error or HTTP 4xx is final. Transport,
+                    // HTTP 5xx and malformed replies can be node-specific.
+                    let retryable = match &error {
+                        Error::Http(error) => {
+                            error.status().is_none_or(|status| status.is_server_error())
+                        }
+                        Error::Json(_) | Error::ResponseIdMismatch { .. } => true,
+                        _ => false,
+                    };
+                    if !retryable {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or(Error::InvalidInput("no resolver endpoints")))
+    }
+
+    async fn post<P: Serialize, R: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        request: &RpcRequest<'_, P>,
+        id: u64,
+    ) -> Result<R, Error> {
         let response: RpcResponse = self
             .http
-            .post(&self.endpoint)
+            .post(endpoint)
+            .timeout(self.timeout)
             .json(&request)
             .send()
             .await?
