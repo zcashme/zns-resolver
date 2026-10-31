@@ -13,6 +13,10 @@
 - Normalize event name filters like name lookups.
 - Match TypeScript payment URI parsing: keep the first duplicate amount or
   memo and preserve payment fields when another parameter has malformed encoding.
+- `build_zip321_uri` accepts only ASCII letters and digits in the address, so a
+  `#` or other URI delimiter cannot move the amount or memo out of the query.
+- `parse_zip321_uri` reads the ZIP 321 `address` query field when the URI has
+  no address before `?`.
 - Breaking: remove the nonexistent `Status.registered` field, change `synced`
   to `Option<bool>`, default a missing `synced_height` to zero, and add optional
   `treasury_address`, matching current resolver responses and Dart behavior.

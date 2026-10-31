@@ -58,13 +58,11 @@ pub fn build_zip321_uri(
     amount: Option<&str>,
     memo: Option<&str>,
 ) -> Result<String, Error> {
-    if address.is_empty()
-        || address
-            .chars()
-            .any(|c| c.is_whitespace() || matches!(c, '?' | '&' | ':'))
-    {
+    // Zcash addresses (Bech32, Bech32m, Base58Check) are ASCII letters and
+    // digits only, so no URI delimiter (`?`, `&`, `#`, ...) can slip through.
+    if address.is_empty() || !address.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return Err(Error::InvalidInput(
-            "a payment URI needs an address without whitespace, ?, & or :",
+            "a payment URI needs an address of ASCII letters and digits",
         ));
     }
     let mut params = Vec::new();
@@ -123,7 +121,8 @@ fn decode_component(component: &str) -> String {
 /// Parse one payment URI, tolerating a missing or case-insensitive scheme.
 /// Missing fields and undecodable memos are empty. Like TypeScript's
 /// URLSearchParams, keeps the first duplicate field and tolerates malformed
-/// query encoding without discarding other payment fields.
+/// query encoding without discarding other payment fields. When the URI has no
+/// address before `?`, the `address` query field is used, as ZIP 321 allows.
 pub fn parse_zip321_uri(uri: &str) -> Zip321Parts {
     let uri = if uri
         .get(..6)
@@ -134,6 +133,7 @@ pub fn parse_zip321_uri(uri: &str) -> Zip321Parts {
         uri
     };
     let (address, query) = uri.split_once('?').unwrap_or((uri, ""));
+    let mut address_field = None;
     let mut amount = None;
     let mut memo_raw = None;
     for param in query.split('&').filter(|p| !p.is_empty()) {
@@ -141,14 +141,19 @@ pub fn parse_zip321_uri(uri: &str) -> Zip321Parts {
         let key = decode_component(key);
         let value = decode_component(value);
         match key.as_str() {
+            "address" if address_field.is_none() => address_field = Some(value.trim().to_owned()),
             "amount" if amount.is_none() => amount = Some(value.trim().to_owned()),
             "memo" if memo_raw.is_none() => memo_raw = Some(value.trim().to_owned()),
             _ => {}
         }
     }
     let memo_raw = memo_raw.unwrap_or_default();
+    let address = match address.trim() {
+        "" => address_field.unwrap_or_default(),
+        address => address.into(),
+    };
     Zip321Parts {
-        address: address.trim().into(),
+        address,
         amount: amount.unwrap_or_default(),
         memo_decoded: decode_base64_url(&memo_raw),
         memo_raw,

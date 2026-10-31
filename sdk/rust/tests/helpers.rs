@@ -215,9 +215,32 @@ fn payment_uri_rejects_memo_and_address_errors() {
         "zcash:u1abc",
         "u1 abc",
         "u1abc&memo=hi",
+        "u1abc#note",
+        "u1abc/x",
+        "u1abc%3F",
+        "é",
     ] {
-        assert!(build_zip321_uri(address, None, None).is_err());
+        assert!(
+            build_zip321_uri(address, Some("1"), None).is_err(),
+            "{address}"
+        );
     }
+}
+
+#[test]
+fn uri_parser_reads_the_address_query_field() {
+    let parts = parse_zip321_uri("zcash:?address=u1abc&amount=1");
+    assert_eq!(parts.address, "u1abc");
+    assert_eq!(parts.amount, "1");
+    assert_eq!(
+        parse_zip321_uri("zcash:?address=u1abc&address=u1def").address,
+        "u1abc"
+    );
+    // An address before `?` wins over the query field.
+    assert_eq!(
+        parse_zip321_uri("zcash:u1abc?address=u1def").address,
+        "u1abc"
+    );
 }
 
 #[test]
