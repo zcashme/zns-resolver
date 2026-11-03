@@ -5,6 +5,7 @@ on:
     branches: [master]
     tags: ['v[0-9]*']
     paths:
+      - .dockerignore
       - Cargo.toml
       - Cargo.lock
       - src/**
@@ -12,6 +13,7 @@ on:
       - .github/workflows/release.yml
   pull_request:
     paths:
+      - .dockerignore
       - Cargo.toml
       - Cargo.lock
       - src/**
@@ -115,7 +117,8 @@ jobs:
           cd dist
           sha256sum --check SHA256SUMS
           release_args=()
-          if [[ "$RELEASE_TAG" == *-* ]]; then
+          version_without_metadata="${RELEASE_TAG%%+*}"
+          if [[ "$version_without_metadata" == *-* ]]; then
             release_args+=(--prerelease)
           fi
           gh release create "$RELEASE_TAG" \
