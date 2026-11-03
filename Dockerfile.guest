@@ -1,4 +1,46 @@
-# Runtime-only StageX components. No container engine runs inside the guest.
+# Build the kernel with StageX; required drivers are built in.
+FROM stagex/user-elfutils@sha256:b5fc481f468dbab1d39bc3a2f2b256153cdcaf33e135abf41a2c5b5bea539151 AS elfutils
+FROM stagex/core-openssl@sha256:f97827b11a98c010113e0d6acc464c77cbf6ea47a67867cfd1baff093bc5399a AS openssl
+FROM stagex/core-ncurses@sha256:a5875ef06637624ead593724c43ab27be5fc7dbec5d292022bfe234896f584c1 AS ncurses
+FROM stagex/pallet-gcc-gnu-gnu@sha256:7c3726b921c4478d6eb95ab73edca3e185bc710e61005f4cf661267816fda0da AS kernel
+COPY --from=elfutils / /
+COPY --from=openssl / /
+COPY --from=ncurses / /
+ADD --checksum=sha256:f9fef3d14c0df53819026f4be74459835c2a0b0dcbf5b5bbd9ea19f0829402b3 https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.tar.xz /tmp/linux.tar.xz
+ENV KBUILD_BUILD_USER=stagex KBUILD_BUILD_HOST=stagex KBUILD_BUILD_TIMESTAMP="Thu Jan 1 00:00:00 UTC 1970" KBUILD_BUILD_VERSION=1 SOURCE_DATE_EPOCH=0
+WORKDIR /build
+RUN --network=none <<'EOF'
+set -eu
+ln -s /bin/sh /bin/bash
+tar -xJf /tmp/linux.tar.xz --strip-components=1
+make ARCH=x86_64 tinyconfig
+scripts/config \
+ --enable 64BIT --enable EXPERT --enable PRINTK --enable BUG \
+ --enable MULTIUSER --enable FUTEX --enable EPOLL --enable SIGNALFD --enable TIMERFD --enable EVENTFD \
+ --enable FILE_LOCKING --enable POSIX_TIMERS --enable ADVISE_SYSCALLS --enable MEMBARRIER \
+ --enable BINFMT_ELF --enable BINFMT_SCRIPT --disable COREDUMP \
+ --enable BLOCK --enable BLK_DEV --enable PCI --enable PCI_MSI --enable ACPI \
+ --enable CPU_SUP_AMD --enable SMP --enable HYPERVISOR_GUEST --enable PARAVIRT --enable KVM_GUEST \
+ --enable AMD_MEM_ENCRYPT --enable VIRT_DRIVERS --enable SEV_GUEST \
+ --enable EFI --enable EFI_STUB --enable RELOCATABLE --enable RANDOMIZE_BASE \
+ --enable CPU_MITIGATIONS --enable STACKPROTECTOR --enable STACKPROTECTOR_STRONG --enable STRICT_KERNEL_RWX \
+ --enable BLK_DEV_INITRD --enable RD_GZIP \
+ --enable DEVTMPFS --enable DEVTMPFS_MOUNT --enable PROC_FS --enable SYSFS --enable TMPFS \
+ --enable EXT4_FS --enable VIRTIO_MENU --enable VIRTIO --enable VIRTIO_PCI --enable VIRTIO_BLK \
+ --enable NET --enable NETDEVICES --enable NET_CORE --enable INET --enable UNIX --enable PACKET --enable VIRTIO_NET \
+ --enable TTY --enable SERIAL_8250 --enable SERIAL_8250_CONSOLE \
+ --enable UNWINDER_FRAME_POINTER --disable UNWINDER_ORC --disable MODULES --disable DEBUG_INFO \
+ --disable LOCALVERSION_AUTO --set-str LOCALVERSION ''
+make ARCH=x86_64 olddefconfig
+for option in AMD_MEM_ENCRYPT SEV_GUEST TSM_REPORTS EFI_STUB BINFMT_SCRIPT BLK_DEV_INITRD RD_GZIP DEVTMPFS EXT4_FS VIRTIO_PCI VIRTIO_BLK VIRTIO_NET INET SERIAL_8250_CONSOLE CPU_MITIGATIONS STACKPROTECTOR_STRONG STRICT_KERNEL_RWX; do
+ grep -qx "CONFIG_${option}=y" .config || { echo "Required built-in missing: ${option}"; exit 1; }
+done
+grep -qx '# CONFIG_MODULES is not set' .config
+grep -qx '# CONFIG_COREDUMP is not set' .config
+make ARCH=x86_64 -j"$(nproc)" bzImage
+EOF
+
+# Runtime-only files. No container engine runs inside the guest.
 FROM stagex/core-busybox@sha256:a094d1b5ad06943713e75849248d7f89546d15a3e74f42ec5b8f02375fd3706d AS busybox
 FROM stagex/user-caddy@sha256:f2ee0153fc2cb7c8fa017e982e1c48f9660bd76a1b650c8b4c710a1168bfc900 AS caddy
 FROM stagex/core-ca-certificates@sha256:2e5d0da04413dfbc739f3009fe6616e90e733c463f8495ce6997b02c0832735c AS certificates
@@ -6,3 +48,5 @@ FROM scratch AS userspace
 COPY --from=busybox /usr/bin/busybox /usr/bin/busybox
 COPY --from=caddy /usr/bin/caddy /usr/bin/caddy
 COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=kernel /build/arch/x86/boot/bzImage /boot/vmlinuz
+COPY --from=kernel /build/.config /boot/kernel.config

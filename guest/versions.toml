@@ -1,11 +1,6 @@
-# Kernel/firmware are pinned Ubuntu packages; guest userspace is StageX.
+# Kernel source and StageX toolchain are pinned in Dockerfile.guest.
+# SNP firmware remains a pinned Ubuntu OVMF build.
 archive = "https://archive.ubuntu.com/ubuntu/"
-kernel_version = "7.0.0-15-generic"
-kernel_package = "pool/main/l/linux-signed/linux-image-7.0.0-15-generic_7.0.0-15.15_amd64.deb"
-kernel_package_sha256 = "5f9ee6a8900717b2110b8de9cf12e4f04c9593e212488847105c484adf2c2531"
-kernel_sha256 = "8600a313d5d686f4b1a70e1cfb2e7606660a1f7b9a1a252e2ef2ae9cdfaa2b89"
-modules_package = "pool/main/l/linux/linux-modules-7.0.0-15-generic_7.0.0-15.15_amd64.deb"
-modules_package_sha256 = "e2994923c51d81fb0e4f48d56b8527cc5f86e3b3fbf9d210f11d6da6c71f93f5"
 firmware_package = "pool/main/e/edk2-hwe/ovmf-amdsev-hwe_2025.11-3ubuntu8.2_all.deb"
 firmware_package_sha256 = "c38af8c8836ff73108ee449df9972381e9fcf47ab5e124ade836865f143691d6"
 firmware_sha256 = "a90ff0c9335690c8a82c89c71c71f082f7c8ed41bb6a4f017fbc90498092949b"

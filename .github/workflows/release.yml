@@ -104,8 +104,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  guest:
-    name: Build HTTPS guest
+  package:
+    name: Package resolver image
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -123,7 +123,7 @@ jobs:
           sha256sum --check SHA256SUMS
           chmod +x zns-resolver-*-x86_64-linux-musl
       - uses: docker/setup-buildx-action@v4
-      - name: Export guest userspace
+      - name: Build kernel and runtime
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -132,14 +132,16 @@ jobs:
           target: userspace
           outputs: type=local,dest=userspace
           provenance: false
+          cache-from: type=gha,scope=stagex-kernel-amd64
+          cache-to: type=gha,scope=stagex-kernel-amd64,mode=max
       - uses: actions/cache@v4
         with:
           path: guest-cache
           key: guest-inputs-${{ hashFiles('guest/versions.toml') }}
-      - name: Install measurement tool
+      - name: Prepare firmware and measurement tool
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends zstd python3-venv
+          sudo apt-get install -y --no-install-recommends python3-venv
           python3 - <<'PY'
           from pathlib import Path
           import sys
@@ -151,7 +153,10 @@ jobs:
           cache.mkdir(exist_ok=True)
           wheel = fetch(pins['measure_url'], pins['measure_sha256'], cache)
           Path('/tmp/sev_snp_measure-0.0.13-py3-none-any.whl').write_bytes(wheel)
+          firmware = fetch(pins['archive'] + pins['firmware_package'], pins['firmware_package_sha256'], cache)
+          Path('/tmp/ovmf-amdsev.deb').write_bytes(firmware)
           PY
+          dpkg-deb --fsys-tarfile /tmp/ovmf-amdsev.deb | tar -xOf - ./usr/share/ovmf/OVMF.amdsev.fd > userspace/boot/OVMF.amdsev.fd
           python3 -m venv .guest-measure
           .guest-measure/bin/pip install --disable-pip-version-check /tmp/sev_snp_measure-0.0.13-py3-none-any.whl
       - name: Assemble guest
@@ -176,7 +181,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [build, guest]
+    needs: [build, package]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     timeout-minutes: 10

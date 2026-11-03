@@ -20,8 +20,6 @@ mount -t devtmpfs devtmpfs /dev || die devtmpfs
 mount -t tmpfs -o mode=0700,size=512m tmpfs /run || die run
 mount -t tmpfs -o mode=1777,size=128m tmpfs /tmp || die tmp
 dmesg | grep -q 'Memory Encryption Features active:.*SEV-SNP' || die snp-inactive
-insmod /modules/tsm_report.ko || die tsm-report-driver
-insmod /modules/sev-guest.ko || die sev-guest-driver
 test -c /dev/sev-guest || die sev-guest-device
 ip link set lo up || die loopback
 ip link set eth0 up || die ethernet

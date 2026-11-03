@@ -40,36 +40,6 @@ def fetch(url, digest, cache):
     return path.read_bytes()
 
 
-def zstd(data):
-    return subprocess.run(['zstd', '-dq', '-c'], input=data, capture_output=True, check=True).stdout
-
-
-def deb_members(data, names):
-    # Read just the requested regular files; never extract archive paths to disk.
-    if not data.startswith(b'!<arch>\n'):
-        raise ValueError('Not a Debian ar archive')
-    offset = 8
-    while offset + 60 <= len(data):
-        header = data[offset:offset + 60]
-        size = int(header[48:58])
-        member = header[:16].decode().strip().rstrip('/')
-        body = data[offset + 60:offset + 60 + size]
-        offset += 60 + size + size % 2
-        if member.startswith('data.tar'):
-            if member.endswith('.zst'):
-                body = zstd(body)
-            with tarfile.open(fileobj=io.BytesIO(body), mode='r:*') as archive:
-                available = {item.name.removeprefix('./'): item for item in archive.getmembers()}
-                result = {}
-                for name in names:
-                    item = available[name]
-                    if not item.isfile():
-                        raise ValueError(f'Not a regular package file: {name}')
-                    result[name] = archive.extractfile(item).read()
-                return result
-    raise ValueError('Missing Debian data archive')
-
-
 def static_amd64(data, name):
     if data[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<H', data, 18)[0] != 62:
         raise ValueError(f'Not a Linux x86-64 ELF: {name}')
@@ -133,21 +103,11 @@ def main():
         config = config.replace('https://acme-v02.api.letsencrypt.org/directory',
                                 'https://acme-staging-v02.api.letsencrypt.org/directory')
     files['etc/caddy/Caddyfile'] = (stat.S_IFREG | 0o644, config.encode())
-    kernel_path = f'boot/vmlinuz-{pins["kernel_version"]}'
-    firmware_path = 'usr/share/ovmf/OVMF.amdsev.fd'
-    for kind, source, target in (('kernel', kernel_path, 'vmlinuz'),
-                                 ('firmware', firmware_path, 'OVMF.amdsev.fd')):
-        package = fetch(pins['archive'] + pins[f'{kind}_package'], pins[f'{kind}_package_sha256'], args.cache)
-        data = deb_members(package, [source])[source]
-        if sha256(data) != pins[f'{kind}_sha256']:
-            raise ValueError(f'Boot-file checksum mismatch: {target}')
-        (args.output / target).write_bytes(data)
-    module_names = ['kernel/drivers/virt/coco/guest/tsm_report.ko.zst',
-                    'kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst']
-    names = [f'usr/lib/modules/{pins["kernel_version"]}/{name}' for name in module_names]
-    package = fetch(pins['archive'] + pins['modules_package'], pins['modules_package_sha256'], args.cache)
-    for name, data in deb_members(package, names).items():
-        files['modules/' + Path(name).name.removesuffix('.zst')] = (stat.S_IFREG | 0o644, zstd(data))
+    for name in ('vmlinuz', 'kernel.config', 'OVMF.amdsev.fd'):
+        data = (args.userspace / 'boot' / name).read_bytes()
+        if name == 'OVMF.amdsev.fd' and sha256(data) != pins['firmware_sha256']:
+            raise ValueError('Firmware checksum mismatch')
+        (args.output / name).write_bytes(data)
     (args.output / 'resolver-initrd.img').write_bytes(initramfs(files))
     service = (HERE / 'zns-resolver-guest.service.in').read_text()
     for key, value in {'VCPUS': pins['vcpus'], 'MEMORY': pins['memory'],
@@ -168,9 +128,11 @@ def main():
                     expected_snp_measurement=measurement, attestation_verifier=False,
                     stagex_images=[line for line in (HERE.parent / 'Dockerfile.guest').read_text().splitlines()
                                    if line.startswith('FROM stagex/')],
+                    kernel_source=[line for line in (HERE.parent / 'Dockerfile.guest').read_text().splitlines()
+                                   if line.startswith('ADD --checksum=')],
                     measured_files={name: sha256(data) for name, (_, data) in files.items()})
     (args.output / 'guest-manifest.json').write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
-    names = ['vmlinuz', 'OVMF.amdsev.fd', 'resolver-initrd.img', 'zns-resolver-guest.service',
+    names = ['vmlinuz', 'kernel.config', 'OVMF.amdsev.fd', 'resolver-initrd.img', 'zns-resolver-guest.service',
              'expected-snp-measurement.txt', 'guest-manifest.json']
     checksums = ''.join(f'{sha256((args.output / name).read_bytes())}  {name}\n' for name in names)
     (args.output / 'SHA256SUMS').write_text(checksums)

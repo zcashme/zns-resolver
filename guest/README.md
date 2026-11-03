@@ -8,8 +8,11 @@ endpoint or external verifier in this version; status output is not attestation.
 
 Both resolvers share one guest with 2 vCPUs and 4 GiB RAM. The published
 measurement targets `znstwo`'s CPU signature: family 25, model 160, stepping 2.
-Kernel and firmware are pinned Ubuntu packages. BusyBox, Caddy and the CA bundle
-come from pinned StageX images. The initramfs includes only the runtime files.
+Linux is compiled from hash-pinned source using the StageX toolchain. SNP and
+virtio drivers and ext4 are built in; loadable modules and core dumps are disabled.
+The archive includes the kernel configuration. BusyBox, Caddy and the CA bundle
+come from pinned StageX images. SNP firmware remains a pinned Ubuntu OVMF build.
+The initramfs includes only the runtime files.
 
 Caddy generates fresh TLS/ACME keys each boot. All gateway state and process
 logs stay in guest RAM under `/run`; the public registry databases alone are
