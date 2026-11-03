@@ -1,0 +1,70 @@
+{
+    admin off
+    persist_config off
+    storage file_system {
+        root /run/caddy/storage
+    }
+    cert_issuer acme {
+        dir https://acme-v02.api.letsencrypt.org/directory
+        disable_tlsalpn_challenge
+    }
+    servers {
+        protocols h1 h2
+    }
+}
+
+http://main.zcashnames.com, http://light.zcash.me {
+    redir https://{host}{uri} 301
+}
+
+main.zcashnames.com {
+    header {
+        Access-Control-Allow-Origin *
+        Access-Control-Allow-Methods "POST, OPTIONS"
+        Access-Control-Allow-Headers Content-Type
+    }
+    @preflight method OPTIONS
+    respond @preflight "" 204
+    request_body {
+        max_size 1048576
+    }
+    reverse_proxy 127.0.0.1:3031 {
+        header_up X-Real-IP {remote_host}
+    }
+}
+
+light.zcash.me {
+    @rpc path /zns-mainnet /zns-mainnet-test /zns-testnet
+    @preflight {
+        path /zns-mainnet /zns-mainnet-test /zns-testnet
+        method OPTIONS
+    }
+    @mainnet path /zns-mainnet /zns-mainnet-test
+    # Keep preflight handling before the terminal proxy handlers.
+    route {
+        header @rpc {
+            Access-Control-Allow-Origin *
+            Access-Control-Allow-Methods "POST, OPTIONS"
+            Access-Control-Allow-Headers Content-Type
+        }
+        respond @preflight "" 204
+        request_body @rpc {
+            max_size 1048576
+        }
+        handle @mainnet {
+            rewrite * /
+            reverse_proxy 127.0.0.1:3031 {
+                header_up X-Real-IP {remote_host}
+            }
+        }
+        handle /zns-testnet {
+            rewrite * /
+            reverse_proxy 127.0.0.1:8080 {
+                header_up X-Real-IP {remote_host}
+            }
+        }
+        handle {
+            respond "Not found" 404
+        }
+    }
+}

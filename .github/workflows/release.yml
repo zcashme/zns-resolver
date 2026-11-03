@@ -10,6 +10,8 @@ on:
       - Cargo.lock
       - src/**
       - Dockerfile.stagex
+      - Dockerfile.guest
+      - guest/**
       - .github/workflows/release.yml
   pull_request:
     paths:
@@ -18,8 +20,15 @@ on:
       - Cargo.lock
       - src/**
       - Dockerfile.stagex
+      - Dockerfile.guest
+      - guest/**
       - .github/workflows/release.yml
   workflow_dispatch:
+    inputs:
+      staging:
+        description: Use Let's Encrypt staging in the guest image (untrusted test certificates)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -95,9 +104,98 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  guest:
+    name: Build HTTPS guest
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: zns-resolver-linux-amd64
+          path: binaries
+      - name: Verify resolver artifacts
+        working-directory: binaries
+        run: |
+          sha256sum --check SHA256SUMS
+          chmod +x zns-resolver-*-x86_64-linux-musl
+      - uses: docker/setup-buildx-action@v4
+      - name: Export guest userspace
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.guest
+          platforms: linux/amd64
+          target: userspace
+          outputs: type=local,dest=userspace
+          provenance: false
+      - name: Check gateway behavior with an isolated test CA
+        run: |
+          sh -n guest/init
+          python3 guest/test_gateway.py --caddy userspace/usr/bin/caddy --binaries binaries
+      - name: Build local ACME test environment
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.guest
+          platforms: linux/amd64
+          target: acme-test
+          build-contexts: resolver-binaries=./binaries
+          load: true
+          tags: zns-resolver-acme-test:ci
+      - name: Check HTTP-01 issuance, renewal, and restart with Pebble
+        run: docker run --rm --network none --tmpfs /tmp:rw,size=1g zns-resolver-acme-test:ci
+      - uses: actions/cache@v4
+        with:
+          path: guest-cache
+          key: guest-inputs-${{ hashFiles('guest/versions.toml') }}
+      - name: Install measurement tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd python3-venv
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          import tomllib
+          sys.path.insert(0, 'guest')
+          from build import fetch
+          pins = tomllib.loads(Path('guest/versions.toml').read_text())
+          cache = Path('guest-cache')
+          cache.mkdir(exist_ok=True)
+          wheel = fetch(pins['measure_url'], pins['measure_sha256'], cache)
+          Path('/tmp/sev_snp_measure-0.0.13-py3-none-any.whl').write_bytes(wheel)
+          PY
+          python3 -m venv .guest-measure
+          .guest-measure/bin/pip install --disable-pip-version-check /tmp/sev_snp_measure-0.0.13-py3-none-any.whl
+      - name: Assemble guest and verify repeatability
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          STAGING: ${{ github.event_name == 'workflow_dispatch' && inputs.staging }}
+        run: |
+          args=()
+          if [[ "$STAGING" == true ]]; then args+=(--staging); fi
+          for output in guest-release guest-rebuild; do
+            python3 guest/build.py --userspace userspace --binaries binaries \
+              --cache guest-cache --output "$output" \
+              --measure-tool "$PWD/.guest-measure/bin/sev-snp-measure" \
+              --source-commit "$SOURCE_COMMIT" "${args[@]}"
+          done
+          cmp guest-release/zns-resolver-guest-x86_64.tar.gz guest-rebuild/zns-resolver-guest-x86_64.tar.gz
+          cd guest-release
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zns-resolver-guest-amd64
+          path: guest-release/zns-resolver-guest-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, guest]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -106,8 +204,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: zns-resolver-linux-amd64
+          pattern: zns-resolver-*
           path: dist
+          merge-multiple: true
       - name: Publish binaries and checksums
         env:
           GH_TOKEN: ${{ github.token }}
@@ -116,6 +215,7 @@ jobs:
         run: |
           cd dist
           sha256sum --check SHA256SUMS
+          sha256sum zns-resolver-guest-x86_64.tar.gz >> SHA256SUMS
           release_args=()
           version_without_metadata="${RELEASE_TAG%%+*}"
           if [[ "$version_without_metadata" == *-* ]]; then
@@ -127,4 +227,5 @@ jobs:
             "${release_args[@]}" \
             zns-resolver-mainnet-x86_64-linux-musl \
             zns-resolver-testnet-x86_64-linux-musl \
+            zns-resolver-guest-x86_64.tar.gz \
             SHA256SUMS BUILD-INFO.txt

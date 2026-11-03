@@ -1,0 +1,19 @@
+# Runtime-only StageX components. No container engine runs inside the guest.
+FROM stagex/core-busybox@sha256:a094d1b5ad06943713e75849248d7f89546d15a3e74f42ec5b8f02375fd3706d AS busybox
+FROM stagex/user-caddy@sha256:f2ee0153fc2cb7c8fa017e982e1c48f9660bd76a1b650c8b4c710a1168bfc900 AS caddy
+FROM stagex/core-ca-certificates@sha256:2e5d0da04413dfbc739f3009fe6616e90e733c463f8495ce6997b02c0832735c AS certificates
+FROM scratch AS userspace
+COPY --from=busybox /usr/bin/busybox /usr/bin/busybox
+COPY --from=caddy /usr/bin/caddy /usr/bin/caddy
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Test-only CA and Python runtime. Neither is included in the userspace export.
+FROM ghcr.io/letsencrypt/pebble@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199 AS pebble
+FROM python:3.12-slim@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30 AS acme-test
+COPY --from=pebble /app /usr/local/bin/pebble
+COPY --from=pebble /test/certs/ /pebble-certs/
+COPY --from=userspace / /userspace/
+# Named build context supplied by CI or --build-context resolver-binaries=DIR.
+COPY --from=resolver-binaries --chmod=0755 /zns-resolver-mainnet-x86_64-linux-musl /zns-resolver-testnet-x86_64-linux-musl /binaries/
+COPY guest/Caddyfile guest/test_gateway.py guest/test_acme.py /tests/
+CMD ["python3", "/tests/test_acme.py"]
