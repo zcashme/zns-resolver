@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v[0-9]*']
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - Dockerfile.stagex
+      - .github/workflows/release.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - Dockerfile.stagex
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and smoke-test both networks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check release version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          expected = f'v{version}'
+          actual = os.environ['RELEASE_TAG']
+          if actual != expected:
+              raise SystemExit(f'Tag {actual!r} must match Cargo.toml version: {expected}')
+          PY
+      - uses: docker/setup-buildx-action@v4
+      - name: Build static binaries and run offline smoke checks
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.stagex
+          platforms: linux/amd64
+          target: binaries
+          outputs: type=local,dest=dist
+          provenance: false
+          cache-from: type=gha,scope=stagex-amd64
+          cache-to: type=gha,scope=stagex-amd64,mode=max
+      - name: Record build inputs and checksums
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          images = [line for line in Path('Dockerfile.stagex').read_text().splitlines()
+                    if line.startswith('FROM stagex/')]
+          Path('dist/BUILD-INFO.txt').write_text('\n'.join([
+              f'version={version}',
+              f'commit={os.environ["SOURCE_COMMIT"]}',
+              f'ref={os.environ["SOURCE_REF"]}',
+              'target=x86_64-unknown-linux-musl',
+              *images,
+              '',
+          ]))
+          PY
+          cd dist
+          sha256sum zns-resolver-*-x86_64-linux-musl BUILD-INFO.txt > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zns-resolver-linux-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zns-resolver-linux-amd64
+          path: dist
+      - name: Publish binaries and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          release_args=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" \
+            --verify-tag --generate-notes \
+            --title "zns-resolver $RELEASE_TAG" \
+            "${release_args[@]}" \
+            zns-resolver-mainnet-x86_64-linux-musl \
+            zns-resolver-testnet-x86_64-linux-musl \
+            SHA256SUMS BUILD-INFO.txt

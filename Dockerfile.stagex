@@ -1,0 +1,83 @@
+# Static Linux x86-64 binaries for both networks. Export with Buildx's local exporter.
+# The StageX Rust pallet supplies its own compiler; do not copy rust-toolchain.toml.
+FROM stagex/user-protobuf@sha256:7339a98ff6b4633b41ed6c005561c9cbc2c638564993219bcdea0adb3e642a58 AS protobuf
+FROM stagex/user-abseil-cpp@sha256:88aae99c1083d207d3e2ae723006c83590bf4f4f1fa851838fcf6f1bd0999405 AS abseil
+FROM stagex/pallet-rust@sha256:4f12174acd7ccab9506e20a986c556cd5837dbd0ce616abf3031bcaaaa365590 AS build
+COPY --from=protobuf / /
+COPY --from=abseil / /
+WORKDIR /build
+ENV CARGO_INCREMENTAL=0 \
+    SOURCE_DATE_EPOCH=1 \
+    RUSTFLAGS="-C target-feature=+crt-static --remap-path-prefix=/build=."
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+RUN rustc --version && cargo --version && protoc --version
+RUN cargo fetch --locked --target x86_64-unknown-linux-musl
+RUN --network=none cargo build --frozen --release --target x86_64-unknown-linux-musl --no-default-features --features mainnet \
+    && mkdir -p /out \
+    && cp target/x86_64-unknown-linux-musl/release/zns-resolver /out/zns-resolver-mainnet
+RUN --network=none cargo build --frozen --release --target x86_64-unknown-linux-musl --no-default-features --features testnet \
+    && cp target/x86_64-unknown-linux-musl/release/zns-resolver /out/zns-resolver-testnet
+
+# Check the exported executables without chain access or external networking.
+FROM build AS smoke
+RUN --network=none <<'EOF'
+set -eu
+for network in mainnet testnet; do
+    binary="/out/zns-resolver-$network"
+    llvm-readelf --file-header "$binary" | grep -q 'Advanced Micro Devices X86-64'
+    if llvm-readelf --program-headers "$binary" | grep -q INTERP; then
+        echo "Unexpected ELF interpreter: $binary" >&2
+        exit 1
+    fi
+    if llvm-readelf --dynamic "$binary" | grep -q '(NEEDED)'; then
+        echo "Unexpected shared library dependency: $binary" >&2
+        exit 1
+    fi
+done
+mkdir -p /smoke
+cd /smoke
+/out/zns-resolver-mainnet > mainnet.log 2>&1 &
+mainnet_pid=$!
+/out/zns-resolver-testnet > testnet.log 2>&1 &
+testnet_pid=$!
+trap 'kill "$mainnet_pid" "$testnet_pid" 2>/dev/null || true' EXIT
+for network in mainnet testnet; do
+    if [ "$network" = mainnet ]; then
+        port=3031
+        key_prefix=uview1
+        database=zns.sqlite
+    else
+        port=8080
+        key_prefix=uviewtest1
+        database=zns-testnet.sqlite
+    fi
+    ready=0
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if curl --fail --silent --show-error --max-time 2 \
+            -H 'Content-Type: application/json' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"status","params":[]}' \
+            "http://127.0.0.1:$port" > "$network.json" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$ready" != 1 ]; then
+        cat mainnet.log testnet.log
+        exit 1
+    fi
+    grep -q '"result":' "$network.json"
+    grep -q '"synced":false' "$network.json"
+    grep -q "\"viewing_key\":\"$key_prefix" "$network.json"
+    test -s "$database"
+    curl --fail --silent --show-error --max-time 2 \
+        -H 'Content-Type: application/json' \
+        --data '{"jsonrpc":"2.0","id":2,"method":"resolve","params":{"query":"alice"}}' \
+        "http://127.0.0.1:$port" > "$network-resolve.json"
+    grep -q '"result":null' "$network-resolve.json"
+    mv "/out/zns-resolver-$network" "/out/zns-resolver-$network-x86_64-linux-musl"
+done
+EOF
+FROM scratch AS binaries
+COPY --from=smoke /out/ /
