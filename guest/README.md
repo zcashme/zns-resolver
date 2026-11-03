@@ -44,11 +44,6 @@ resolver prototype before replacing it. Unrelated guests can keep running.
 Remove stale AAAA records unless equivalent IPv6 forwarding is set
 up. Complete HTTPS validation on the new IP before adding it to DNS.
 
-The workflow checks HTTPS with a local test CA, routing, redirects, CORS, database
-persistence, fresh certificates between boots, and repeated image assembly. A
-network-disabled container also exercises ACME HTTP-01 through a simulated
-old-host challenge relay, renewal, and reissuance against Let's Encrypt's Pebble
-test server. Test CA keys and certificates are excluded from the guest image.
 Public ACME issuance/renewal and an SNP boot of each new release must be checked
 on the real host before traffic cutover. This PR does not change DNS, nginx, or
 the running prototype. Ordinary HTTPS clients do not verify SNP evidence and

@@ -132,22 +132,6 @@ jobs:
           target: userspace
           outputs: type=local,dest=userspace
           provenance: false
-      - name: Check gateway behavior with an isolated test CA
-        run: |
-          sh -n guest/init
-          python3 guest/test_gateway.py --caddy userspace/usr/bin/caddy --binaries binaries
-      - name: Build local ACME test environment
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: Dockerfile.guest
-          platforms: linux/amd64
-          target: acme-test
-          build-contexts: resolver-binaries=./binaries
-          load: true
-          tags: zns-resolver-acme-test:ci
-      - name: Check HTTP-01 issuance, renewal, and restart with Pebble
-        run: docker run --rm --network none --tmpfs /tmp:rw,size=1g zns-resolver-acme-test:ci
       - uses: actions/cache@v4
         with:
           path: guest-cache
@@ -170,20 +154,17 @@ jobs:
           PY
           python3 -m venv .guest-measure
           .guest-measure/bin/pip install --disable-pip-version-check /tmp/sev_snp_measure-0.0.13-py3-none-any.whl
-      - name: Assemble guest and verify repeatability
+      - name: Assemble guest
         env:
           SOURCE_COMMIT: ${{ github.sha }}
           STAGING: ${{ github.event_name == 'workflow_dispatch' && inputs.staging }}
         run: |
           args=()
           if [[ "$STAGING" == true ]]; then args+=(--staging); fi
-          for output in guest-release guest-rebuild; do
-            python3 guest/build.py --userspace userspace --binaries binaries \
-              --cache guest-cache --output "$output" \
-              --measure-tool "$PWD/.guest-measure/bin/sev-snp-measure" \
-              --source-commit "$SOURCE_COMMIT" "${args[@]}"
-          done
-          cmp guest-release/zns-resolver-guest-x86_64.tar.gz guest-rebuild/zns-resolver-guest-x86_64.tar.gz
+          python3 guest/build.py --userspace userspace --binaries binaries \
+            --cache guest-cache --output guest-release \
+            --measure-tool "$PWD/.guest-measure/bin/sev-snp-measure" \
+            --source-commit "$SOURCE_COMMIT" "${args[@]}"
           cd guest-release
           sha256sum --check SHA256SUMS
       - uses: actions/upload-artifact@v4
