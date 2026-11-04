@@ -1,66 +1,21 @@
 #!/bin/sh
-export PATH=/bin:/usr/bin
-export HOME=/run/caddy
-export XDG_DATA_HOME=/run/caddy/data XDG_CONFIG_HOME=/run/caddy/config
-export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-export LANG=C
-umask 077
-BB=/usr/bin/busybox
-$BB --install -s /bin
-die() {
-    echo "RESOLVER_GUEST_FAILED: $1"
-    sync
-    $BB poweroff -f
-    while :; do $BB sleep 3600; done
-}
-mkdir -p /proc /sys /dev /run /tmp /data
-mount -t proc proc /proc || die proc
-mount -t sysfs sysfs /sys || die sysfs
-mount -t devtmpfs devtmpfs /dev || die devtmpfs
-mount -t tmpfs -o mode=0700,size=512m tmpfs /run || die run
-mount -t tmpfs -o mode=1777,size=128m tmpfs /tmp || die tmp
-dmesg | grep -q 'Memory Encryption Features active:.*SEV-SNP' || die snp-inactive
-test -c /dev/sev-guest || die sev-guest-device
-ip link set lo up || die loopback
-ip link set eth0 up || die ethernet
-ip addr add 10.0.2.15/24 dev eth0 || die ip-address
-ip route add default via 10.0.2.2 dev eth0 || die default-route
-printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf
-# The registry databases live in guest RAM and are rebuilt from the chain on each
-# boot. Any disk would be host-readable and host-writable storage.
-mount -t tmpfs -o mode=0700,size=1g tmpfs /data || die data
-mkdir -p /data/mainnet /data/testnet /run/status /run/caddy
-(cd /data/mainnet && exec /usr/bin/zns-resolver-mainnet-x86_64-linux-musl) > /run/mainnet.log 2>&1 &
-mainnet_pid=$!
-(cd /data/testnet && exec /usr/bin/zns-resolver-testnet-x86_64-linux-musl) > /run/testnet.log 2>&1 &
-testnet_pid=$!
-# Access logging is absent from the measured Caddyfile. Runtime logs stay in RAM.
-caddy run --config /etc/caddy/Caddyfile --adapter caddyfile > /run/caddy.log 2>&1 &
-caddy_pid=$!
-# A host-loopback forward may expose this fixed status file, never lookup RPC.
-httpd -f -p 10.0.2.15:9090 -h /run/status > /run/httpd.log 2>&1 &
-httpd_pid=$!
-echo 'RESOLVER_GUEST_STARTED: SNP active; mainnet+testnet; TLS keys in RAM'
-fetch_status() {
-    if response=$(wget -q -T 3 -O - --header 'Content-Type: application/json' \
-        --post-data '{"jsonrpc":"2.0","id":1,"method":"status","params":[]}' \
-        "http://127.0.0.1:$1" 2>/dev/null); then
-        printf '%s' "$response"
-    else
-        printf 'null'
-    fi
-}
-while :; do
-    kill -0 "$mainnet_pid" || die mainnet-exited
-    kill -0 "$testnet_pid" || die testnet-exited
-    kill -0 "$caddy_pid" || die gateway-exited
-    kill -0 "$httpd_pid" || die status-server-exited
-    mainnet=$(fetch_status 3031)
-    testnet=$(fetch_status 8080)
-    available_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
-    printf '{"snp_active":true,"memory_available_kib":%s,"mainnet":%s,"testnet":%s}\n' \
-        "$available_kib" "$mainnet" "$testnet" > /run/status/status.json.new
-    mv /run/status/status.json.new /run/status/status.json
-    echo "RESOLVER_GUEST_ALIVE: memory_available_kib=$available_kib"
-    sleep 15
-done
+# Guest PID 1. All state, including the registry databases, stays in encrypted
+# guest RAM; the databases are rebuilt from the chain on each boot.
+set -e
+trap 'poweroff -f' EXIT
+/usr/bin/busybox --install -s /bin
+export PATH=/bin:/usr/bin HOME=/run SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+dmesg | grep -q 'Memory Encryption Features active:.*SEV-SNP'
+ip link set lo up
+ip link set eth0 up
+ip addr add 10.0.2.15/24 dev eth0
+ip route add default via 10.0.2.2
+echo 'nameserver 10.0.2.3' > /etc/resolv.conf
+(cd /data/mainnet && exec zns-resolver-mainnet-x86_64-linux-musl) & mainnet=$!
+(cd /data/testnet && exec zns-resolver-testnet-x86_64-linux-musl) & testnet=$!
+caddy run --config /etc/caddy/Caddyfile & caddy=$!
+# Power off if any service exits; the host decides whether to restart.
+while kill -0 $mainnet $testnet $caddy 2>/dev/null; do sleep 5; done
