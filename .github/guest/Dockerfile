@@ -23,7 +23,9 @@ RUN --network=none <<'EOF'
 set -eu
 ln -s /bin/sh /bin/bash
 tar -xJf /tmp/linux.tar.xz --strip-components=1
-make ARCH=x86_64 tinyconfig
+# tinyconfig leaves out early-boot support SEV-SNP needs; start from the KVM guest defaults.
+make ARCH=x86_64 x86_64_defconfig
+make ARCH=x86_64 kvm_guest.config
 required="64BIT EXPERT PRINTK BUG MULTIUSER FUTEX EPOLL SIGNALFD TIMERFD EVENTFD FILE_LOCKING POSIX_TIMERS
  ADVISE_SYSCALLS MEMBARRIER BINFMT_ELF BINFMT_SCRIPT PCI PCI_MSI ACPI CPU_SUP_AMD SMP HYPERVISOR_GUEST PARAVIRT
  KVM_GUEST AMD_MEM_ENCRYPT VIRT_DRIVERS SEV_GUEST EFI EFI_STUB RELOCATABLE RANDOMIZE_BASE CPU_MITIGATIONS
@@ -32,9 +34,10 @@ required="64BIT EXPERT PRINTK BUG MULTIUSER FUTEX EPOLL SIGNALFD TIMERFD EVENTFD
  SERIAL_8250_CONSOLE"
 for option in $required; do scripts/config --enable "$option"; done
 scripts/config --disable UNWINDER_ORC --disable MODULES --disable COREDUMP --disable DEBUG_INFO \
- --disable LOCALVERSION_AUTO --set-str LOCALVERSION ''
+ --disable EXT4_FS --disable VIRTIO_BLK --disable LOCALVERSION_AUTO --set-str LOCALVERSION ''
 make ARCH=x86_64 olddefconfig
 for option in $required TSM_REPORTS; do grep -qx "CONFIG_$option=y" .config || { echo "Missing: $option"; exit 1; }; done
+grep -E '^CONFIG_(MODULES|COREDUMP|EXT4_FS|VIRTIO_BLK)=y' .config && exit 1
 make ARCH=x86_64 -j"$(nproc)" bzImage
 gcc -O2 -o /usr/bin/gen_init_cpio usr/gen_init_cpio.c
 EOF
