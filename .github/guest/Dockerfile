@@ -1,5 +1,5 @@
 # SEV-SNP guest for both resolvers, built entirely from pinned StageX images:
-#   docker buildx build -f Dockerfile.guest --platform linux/amd64 --target guest \
+#   docker buildx build -f .github/guest/Dockerfile --platform linux/amd64 --target guest \
 #     --build-context resolvers=<dir with zns-resolver-*-x86_64-linux-musl> \
 #     --output type=local,dest=guest-release .
 FROM stagex/user-elfutils@sha256:b5fc481f468dbab1d39bc3a2f2b256153cdcaf33e135abf41a2c5b5bea539151 AS elfutils
@@ -52,7 +52,7 @@ COPY --from=busybox /usr/bin/busybox /r/
 COPY --from=caddy /usr/bin/caddy /r/
 COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /r/
 COPY --from=resolvers zns-resolver-mainnet-x86_64-linux-musl zns-resolver-testnet-x86_64-linux-musl /r/
-COPY guest/init guest/Caddyfile /r/
+COPY .github/guest/init .github/guest/Caddyfile /r/
 RUN --network=none <<'EOF'
 set -eu
 {
@@ -79,7 +79,7 @@ COPY --from=kernel /build/arch/x86/boot/bzImage /out/vmlinuz
 COPY --from=kernel /build/.config /out/kernel.config
 COPY --from=firmware /OVMF.amdsev.fd /out/
 COPY --from=initramfs /resolver-initrd.img /out/
-COPY guest/zns-resolver-guest.service.in /tmp/
+COPY .github/guest/zns-resolver-guest.service.in /tmp/
 WORKDIR /out
 RUN --network=none <<'EOF'
 set -eu

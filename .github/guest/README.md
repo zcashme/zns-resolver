@@ -1,6 +1,6 @@
 # SEV-SNP resolver guest
 
-`Dockerfile.guest` builds a minimal SEV-SNP guest from pinned StageX images. The
+`Dockerfile` builds a minimal SEV-SNP guest from pinned StageX images. The
 guest runs both resolvers behind Caddy, which terminates TLS inside the guest. The
 build outputs the kernel, firmware, initramfs, systemd unit, expected SNP launch
 measurement and `SHA256SUMS`. Releases ship it as `zns-resolver-guest-x86_64.tar.gz`.

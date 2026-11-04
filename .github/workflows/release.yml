@@ -10,8 +10,7 @@ on:
       - Cargo.lock
       - src/**
       - Dockerfile.stagex
-      - Dockerfile.guest
-      - guest/**
+      - .github/guest/**
       - .github/workflows/release.yml
   pull_request:
     paths:
@@ -20,8 +19,7 @@ on:
       - Cargo.lock
       - src/**
       - Dockerfile.stagex
-      - Dockerfile.guest
-      - guest/**
+      - .github/guest/**
       - .github/workflows/release.yml
   workflow_dispatch:
 
@@ -116,7 +114,7 @@ jobs:
       - uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile.guest
+          file: .github/guest/Dockerfile
           platforms: linux/amd64
           target: guest
           build-contexts: resolvers=binaries
