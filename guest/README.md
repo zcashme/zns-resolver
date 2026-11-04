@@ -9,16 +9,18 @@ endpoint or external verifier in this version; status output is not attestation.
 Both resolvers share one guest with 2 vCPUs and 4 GiB RAM. The published
 measurement targets `znstwo`'s CPU signature: family 25, model 160, stepping 2.
 Linux is compiled from hash-pinned source using the StageX toolchain. SNP and
-virtio drivers and ext4 are built in; loadable modules and core dumps are disabled.
+virtio network drivers are built in; loadable modules and core dumps are disabled.
 The archive includes the kernel configuration. BusyBox, Caddy and the CA bundle
 come from pinned StageX images. SNP firmware remains a pinned Ubuntu OVMF build.
 The initramfs includes only the runtime files.
 
-Caddy generates fresh TLS/ACME keys each boot. All gateway state and process
-logs stay in guest RAM under `/run`; the public registry databases alone are
-stored on `/data`. No host directory is shared into the guest. Restarting the
-guest loses its certificates and requires successful issuance before HTTPS
-works again. Frequent restarts may hit CA rate limits, so the unit deliberately
+The guest has no disk. A VM has no private storage: any attached disk is a host
+file the host can read and rewrite. All state therefore stays in encrypted guest
+RAM. TLS/ACME keys and logs live under `/run`. The registry databases live under
+`/data`, and each boot rebuilds them by scanning the chain from the mint
+birthday. No host directory is shared into the guest. Restarting the guest loses
+its certificates and requires successful issuance before HTTPS works again.
+Resolvers report `synced: false` until each rescan reaches the chain tip. Frequent restarts may hit CA rate limits, so the unit deliberately
 does not restart itself automatically. Use manual workflow runs with `staging`
 enabled for issuance testing; staging certificates are not publicly trusted.
 
@@ -34,9 +36,6 @@ not terminate TLS or receive the guest's private keys.
 Download a specific release and verify its outer `SHA256SUMS`, then extract the
 guest archive under `/opt`. Verify its inner `SHA256SUMS` in
 `/opt/zns-resolver-guest`. Keep the boot files and launch configuration together.
-Create a new sparse raw ext4 disk at `/opt/zns-resolver-guest/state.img` before
-the first launch (8 GiB is the initial allocation); never reformat an existing
-disk. It will hold separate mainnet and testnet database directories.
 
 Install the included systemd unit in `/etc/systemd/system`, reload systemd, and
 start it. The unit verifies the packaged checksums on each start. It binds host

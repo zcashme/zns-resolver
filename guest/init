@@ -26,13 +26,9 @@ ip link set eth0 up || die ethernet
 ip addr add 10.0.2.15/24 dev eth0 || die ip-address
 ip route add default via 10.0.2.2 dev eth0 || die default-route
 printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf
-for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    test -b /dev/vda && break
-    sleep 1
-done
-test -b /dev/vda || die missing-data-disk
-# Only public registry databases go on this disk. Never put TLS state here.
-mount -t ext4 -o noatime /dev/vda /data || die data-disk
+# The registry databases live in guest RAM and are rebuilt from the chain on each
+# boot. Any disk would be host-readable and host-writable storage.
+mount -t tmpfs -o mode=0700,size=1g tmpfs /data || die data
 mkdir -p /data/mainnet /data/testnet /run/status /run/caddy
 (cd /data/mainnet && exec /usr/bin/zns-resolver-mainnet-x86_64-linux-musl) > /run/mainnet.log 2>&1 &
 mainnet_pid=$!
