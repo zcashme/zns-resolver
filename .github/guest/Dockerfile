@@ -9,8 +9,7 @@ FROM stagex/core-libzstd@sha256:84c78c0000a4134df8a45661ab7e8ecb91dead720ff6b46c
 FROM stagex/core-busybox@sha256:a094d1b5ad06943713e75849248d7f89546d15a3e74f42ec5b8f02375fd3706d AS busybox
 FROM stagex/user-caddy@sha256:f2ee0153fc2cb7c8fa017e982e1c48f9660bd76a1b650c8b4c710a1168bfc900 AS caddy
 FROM stagex/core-ca-certificates@sha256:2e5d0da04413dfbc739f3009fe6616e90e733c463f8495ce6997b02c0832735c AS certificates
-FROM stagex/user-snpguest@sha256:19069309be7c3cabeb87301535c913391359367cf68592a71ec8b2b88a5f2602 AS snpguest
-FROM stagex/pallet-rust@sha256:4f12174acd7ccab9506e20a986c556cd5837dbd0ce616abf3031bcaaaa365590 AS rust
+FROM stagex/pallet-python@sha256:9463c00f462325a7b0a46a5460b241c09a41f62e5968b1b3dea3796451caea55 AS python
 FROM stagex/pallet-gcc-gnu-gnu@sha256:7c3726b921c4478d6eb95ab73edca3e185bc710e61005f4cf661267816fda0da AS tools
 COPY --from=elfutils / /
 COPY --from=openssl / /
@@ -59,6 +58,7 @@ set -eu
  for dir in bin dev etc etc/caddy etc/ssl etc/ssl/certs proc sys run tmp data data/mainnet data/testnet usr usr/bin; do
   echo "dir /$dir 755 0 0"
  done
+ echo "nod /dev/console 600 0 0 c 5 1"
  echo "slink /bin/sh ../usr/bin/busybox 777 0 0"
  echo "file /init /r/init 755 0 0"
  for binary in busybox caddy zns-resolver-mainnet-x86_64-linux-musl zns-resolver-testnet-x86_64-linux-musl; do
@@ -70,11 +70,12 @@ set -eu
 gen_init_cpio -t 0 /r/list > /resolver-initrd.img
 EOF
 
-# Launch measurement and host unit share these values. snpguest measures named
-# QEMU CPU models only, so the unit launches the same model.
-FROM rust AS release
-ARG VCPUS=2 MEMORY=4G POLICY=0x30000 CPU_TYPE=EPYC-Genoa CMDLINE="console=ttyS0 rdinit=/init"
-COPY --from=snpguest /usr/bin/snpguest /usr/bin/
+# Launch measurement and host unit share these values. The unit runs -cpu host,
+# so the measurement uses the host CPU signature (AMD EPYC 8024P), as zns-deployment does.
+FROM python AS release
+ARG VCPUS=2 MEMORY=4G POLICY=0x30000 CPU_FAMILY=25 CPU_MODEL=160 CPU_STEPPING=2 CMDLINE="console=ttyS0 rdinit=/init"
+# The measurement CLI needs only the standard library, so it runs from the wheel.
+ADD --checksum=sha256:feda1aebe69dcbf38e9c636ed1d082bb7dc741fc6969f197d39faddb72b2762d https://files.pythonhosted.org/packages/12/96/5b673738d1f973700369d9e80c1c32937d230acef721141e532891441213/sev_snp_measure-0.0.13-py3-none-any.whl /tmp/
 COPY --from=kernel /build/arch/x86/boot/bzImage /out/vmlinuz
 COPY --from=kernel /build/.config /out/kernel.config
 COPY --from=firmware /OVMF.amdsev.fd /out/
@@ -84,10 +85,12 @@ WORKDIR /out
 RUN --network=none <<'EOF'
 set -eu
 echo 'a90ff0c9335690c8a82c89c71c71f082f7c8ed41bb6a4f017fbc90498092949b  OVMF.amdsev.fd' | sha256sum -c -
-sed -e "s#@VCPUS@#$VCPUS#" -e "s#@MEMORY@#$MEMORY#" -e "s#@POLICY@#$POLICY#" -e "s#@CPU_TYPE@#$CPU_TYPE#" \
+sed -e "s#@VCPUS@#$VCPUS#" -e "s#@MEMORY@#$MEMORY#" -e "s#@POLICY@#$POLICY#" \
  -e "s#@CMDLINE@#$CMDLINE#" /tmp/zns-resolver-guest.service.in > zns-resolver-guest.service
-snpguest generate measurement --vmm-type QEMU --vcpus "$VCPUS" --vcpu-type "$CPU_TYPE" --ovmf OVMF.amdsev.fd \
- --kernel vmlinuz --initrd resolver-initrd.img --append "$CMDLINE" | sed 's/^0x//' > expected-snp-measurement.txt
+PYTHONPATH=/tmp/sev_snp_measure-0.0.13-py3-none-any.whl python3 -m sevsnpmeasure.cli --mode snp --vmm-type QEMU \
+ --vcpus "$VCPUS" --vcpu-family "$CPU_FAMILY" --vcpu-model "$CPU_MODEL" --vcpu-stepping "$CPU_STEPPING" \
+ --guest-features 0x1 --ovmf OVMF.amdsev.fd --kernel vmlinuz --initrd resolver-initrd.img --append "$CMDLINE" \
+ > expected-snp-measurement.txt
 grep -qxE '[0-9a-f]{96}' expected-snp-measurement.txt
 sha256sum vmlinuz kernel.config OVMF.amdsev.fd resolver-initrd.img zns-resolver-guest.service \
  expected-snp-measurement.txt > SHA256SUMS

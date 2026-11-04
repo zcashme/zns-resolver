@@ -10,7 +10,9 @@ and the registry databases stay in encrypted guest RAM. Each boot rescans the ch
 and requests new certificates. Restarts are therefore manual, which avoids
 Let's Encrypt rate limits.
 
-To install, extract the release to `/opt/zns-resolver-guest` and verify `SHA256SUMS`.
-Copy the unit to `/etc/systemd/system`, then start it. The host needs SEV-SNP and
-QEMU 8.1 or newer. Host ports 80 and 443 are forwarded to the guest. The guest
-publishes no attestation endpoint yet.
+To install, run `tar -xzf zns-resolver-guest-x86_64.tar.gz -C /opt`, which creates
+`/opt/zns-resolver-guest`, and verify `SHA256SUMS` there. Copy the unit to
+`/etc/systemd/system`, then start it. The host needs SEV-SNP, QEMU 9.1 or newer, and
+the CPU the measurement names: AMD family 25, model 160, stepping 2 (EPYC 8024P).
+Host ports 80 and 443 are forwarded to the guest. The guest publishes no
+attestation endpoint yet.
