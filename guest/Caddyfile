@@ -1,6 +1,9 @@
 {
 	admin off
 	persist_config off
+	servers {
+		protocols h1 h2
+	}
 }
 
 (rpc) {
