@@ -51,16 +51,11 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          python3 - <<'PY'
-          import os
-          import tomllib
-          from pathlib import Path
-          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
-          expected = f'v{version}'
-          actual = os.environ['RELEASE_TAG']
-          if actual != expected:
-              raise SystemExit(f'Tag {actual!r} must match Cargo.toml version: {expected}')
-          PY
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            echo "Tag $RELEASE_TAG must match Cargo.toml version: v$version" >&2
+            exit 1
+          fi
       - uses: docker/setup-buildx-action@v4
       - name: Build static binaries and run offline smoke checks
         uses: docker/build-push-action@v7
@@ -78,22 +73,13 @@ jobs:
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_REF: ${{ github.ref }}
         run: |
-          python3 - <<'PY'
-          import os
-          import tomllib
-          from pathlib import Path
-          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
-          images = [line for line in Path('Dockerfile.stagex').read_text().splitlines()
-                    if line.startswith('FROM stagex/')]
-          Path('dist/BUILD-INFO.txt').write_text('\n'.join([
-              f'version={version}',
-              f'commit={os.environ["SOURCE_COMMIT"]}',
-              f'ref={os.environ["SOURCE_REF"]}',
-              'target=x86_64-unknown-linux-musl',
-              *images,
-              '',
-          ]))
-          PY
+          {
+            echo "version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+            echo "commit=$SOURCE_COMMIT"
+            echo "ref=$SOURCE_REF"
+            echo "target=x86_64-unknown-linux-musl"
+            grep '^FROM stagex/' Dockerfile.stagex
+          } > dist/BUILD-INFO.txt
           cd dist
           sha256sum zns-resolver-*-x86_64-linux-musl BUILD-INFO.txt > SHA256SUMS
           sha256sum --check SHA256SUMS
@@ -123,55 +109,26 @@ jobs:
           sha256sum --check SHA256SUMS
           chmod +x zns-resolver-*-x86_64-linux-musl
       - uses: docker/setup-buildx-action@v4
-      - name: Build kernel and runtime
+      - name: Build guest
         uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.guest
           platforms: linux/amd64
-          target: userspace
-          outputs: type=local,dest=userspace
+          target: guest
+          build-contexts: resolvers=binaries
+          build-args: |
+            ACME_DIRECTORY=${{ (github.event_name == 'workflow_dispatch' && inputs.staging) && 'https://acme-staging-v02.api.letsencrypt.org/directory' || 'https://acme-v02.api.letsencrypt.org/directory' }}
+          outputs: type=local,dest=guest-release/zns-resolver-guest
           provenance: false
-          cache-from: type=gha,scope=stagex-kernel-amd64
-          cache-to: type=gha,scope=stagex-kernel-amd64,mode=max
-      - uses: actions/cache@v4
-        with:
-          path: guest-cache
-          key: guest-inputs-${{ hashFiles('guest/versions.toml') }}
-      - name: Prepare firmware and measurement tool
+          cache-from: type=gha,scope=stagex-guest-amd64
+          cache-to: type=gha,scope=stagex-guest-amd64,mode=max
+      - name: Archive guest
+        working-directory: guest-release
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-venv
-          python3 - <<'PY'
-          from pathlib import Path
-          import sys
-          import tomllib
-          sys.path.insert(0, 'guest')
-          from build import fetch
-          pins = tomllib.loads(Path('guest/versions.toml').read_text())
-          cache = Path('guest-cache')
-          cache.mkdir(exist_ok=True)
-          wheel = fetch(pins['measure_url'], pins['measure_sha256'], cache)
-          Path('/tmp/sev_snp_measure-0.0.13-py3-none-any.whl').write_bytes(wheel)
-          firmware = fetch(pins['archive'] + pins['firmware_package'], pins['firmware_package_sha256'], cache)
-          Path('/tmp/ovmf-amdsev.deb').write_bytes(firmware)
-          PY
-          dpkg-deb --fsys-tarfile /tmp/ovmf-amdsev.deb | tar -xOf - ./usr/share/ovmf/OVMF.amdsev.fd > userspace/boot/OVMF.amdsev.fd
-          python3 -m venv .guest-measure
-          .guest-measure/bin/pip install --disable-pip-version-check /tmp/sev_snp_measure-0.0.13-py3-none-any.whl
-      - name: Assemble guest
-        env:
-          SOURCE_COMMIT: ${{ github.sha }}
-          STAGING: ${{ github.event_name == 'workflow_dispatch' && inputs.staging }}
-        run: |
-          args=()
-          if [[ "$STAGING" == true ]]; then args+=(--staging); fi
-          python3 guest/build.py --userspace userspace --binaries binaries \
-            --cache guest-cache --output guest-release \
-            --measure-tool "$PWD/.guest-measure/bin/sev-snp-measure" \
-            --source-commit "$SOURCE_COMMIT" "${args[@]}"
-          cd guest-release
-          sha256sum --check SHA256SUMS
+          (cd zns-resolver-guest && sha256sum --check SHA256SUMS)
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --mode=a=r,u+w \
+            -cf - zns-resolver-guest | gzip -n > zns-resolver-guest-x86_64.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: zns-resolver-guest-amd64

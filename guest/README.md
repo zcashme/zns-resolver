@@ -6,13 +6,26 @@ systemd unit, checksums, launch inputs, and expected SNP launch measurement.
 Resolver logic and the JSON-RPC API are unchanged. There is no attestation
 endpoint or external verifier in this version; status output is not attestation.
 
-Both resolvers share one guest with 2 vCPUs and 4 GiB RAM. The published
-measurement targets `znstwo`'s CPU signature: family 25, model 160, stepping 2.
+Both resolvers share one guest with 2 vCPUs and 4 GiB RAM. The guest runs QEMU's
+`EPYC-Genoa` CPU model rather than `-cpu host`, so the published measurement does
+not depend on the host's exact CPU stepping. The host needs QEMU 8.1 or newer.
 Linux is compiled from hash-pinned source using the StageX toolchain. SNP and
 virtio network drivers are built in; loadable modules and core dumps are disabled.
 The archive includes the kernel configuration. BusyBox, Caddy and the CA bundle
 come from pinned StageX images. SNP firmware remains a pinned Ubuntu OVMF build.
 The initramfs includes only the runtime files.
+
+`Dockerfile.guest` builds the whole guest with StageX: kernel, firmware,
+initramfs (the kernel's `gen_init_cpio`), host unit and launch measurement
+(`snpguest`). Launch settings are build arguments; measurement and launch share
+them. To build locally from release binaries:
+
+    docker buildx build -f Dockerfile.guest --platform linux/amd64 --target guest \
+      --build-context resolvers=<directory with zns-resolver-*-x86_64-linux-musl> \
+      --output type=local,dest=guest-release .
+
+Add `--build-arg ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory`
+for an issuance-testing image with untrusted staging certificates.
 
 The guest has no disk. A VM has no private storage: any attached disk is a host
 file the host can read and rewrite. All state therefore stays in encrypted guest

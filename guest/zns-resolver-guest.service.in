@@ -8,7 +8,7 @@ ConditionPathExists=/dev/sev
 Type=simple
 WorkingDirectory=/opt/zns-resolver-guest
 ExecStartPre=/usr/bin/sha256sum --check SHA256SUMS
-ExecStart=/usr/bin/qemu-system-x86_64 -enable-kvm -machine q35,confidential-guest-support=sev0,vmport=off -cpu host -smp @VCPUS@ -m @MEMORY@ -object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1,policy=@POLICY@,kernel-hashes=on -bios /opt/zns-resolver-guest/OVMF.amdsev.fd -kernel /opt/zns-resolver-guest/vmlinuz -initrd /opt/zns-resolver-guest/resolver-initrd.img -append "@CMDLINE@" -netdev user,id=net0,hostfwd=tcp:0.0.0.0:80-10.0.2.15:80,hostfwd=tcp:0.0.0.0:443-10.0.2.15:443,hostfwd=tcp:127.0.0.1:13080-10.0.2.15:9090 -device virtio-net-pci,netdev=net0 -name zns-resolver -display none -serial stdio -monitor none -no-reboot
+ExecStart=/usr/bin/qemu-system-x86_64 -enable-kvm -machine q35,confidential-guest-support=sev0,vmport=off -cpu @CPU_TYPE@ -smp @VCPUS@ -m @MEMORY@ -object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1,policy=@POLICY@,kernel-hashes=on -bios /opt/zns-resolver-guest/OVMF.amdsev.fd -kernel /opt/zns-resolver-guest/vmlinuz -initrd /opt/zns-resolver-guest/resolver-initrd.img -append "@CMDLINE@" -netdev user,id=net0,hostfwd=tcp:0.0.0.0:80-10.0.2.15:80,hostfwd=tcp:0.0.0.0:443-10.0.2.15:443,hostfwd=tcp:127.0.0.1:13080-10.0.2.15:9090 -device virtio-net-pci,netdev=net0 -name zns-resolver -display none -serial stdio -monitor none -no-reboot
 # Do not loop on boot errors: each successful boot can request new certificates.
 Restart=no
 TimeoutStopSec=45
