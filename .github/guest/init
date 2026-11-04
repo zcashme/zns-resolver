@@ -1,0 +1,21 @@
+#!/bin/sh
+# Guest PID 1. All state, including the registry databases, stays in encrypted
+# guest RAM; the databases are rebuilt from the chain on each boot.
+set -e
+trap 'poweroff -f' EXIT
+/usr/bin/busybox --install -s /bin
+export PATH=/bin:/usr/bin HOME=/run SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+dmesg | grep -q 'Memory Encryption Features active:.*SEV-SNP'
+ip link set lo up
+ip link set eth0 up
+ip addr add 10.0.2.15/24 dev eth0
+ip route add default via 10.0.2.2
+echo 'nameserver 10.0.2.3' > /etc/resolv.conf
+(cd /data/mainnet && exec zns-resolver-mainnet-x86_64-linux-musl) & mainnet=$!
+(cd /data/testnet && exec zns-resolver-testnet-x86_64-linux-musl) & testnet=$!
+caddy run --config /etc/caddy/Caddyfile & caddy=$!
+# Power off if any service exits; the host decides whether to restart.
+while kill -0 $mainnet $testnet $caddy 2>/dev/null; do sleep 5; done

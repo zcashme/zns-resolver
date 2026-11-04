@@ -10,6 +10,7 @@ on:
       - Cargo.lock
       - src/**
       - Dockerfile.stagex
+      - .github/guest/**
       - .github/workflows/release.yml
   pull_request:
     paths:
@@ -18,6 +19,7 @@ on:
       - Cargo.lock
       - src/**
       - Dockerfile.stagex
+      - .github/guest/**
       - .github/workflows/release.yml
   workflow_dispatch:
 
@@ -95,9 +97,42 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  guest:
+    name: Build SEV-SNP guest
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: zns-resolver-linux-amd64
+          path: binaries
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .github/guest/Dockerfile
+          platforms: linux/amd64
+          target: guest
+          build-contexts: resolvers=binaries
+          outputs: type=local,dest=zns-resolver-guest
+          provenance: false
+          cache-from: type=gha,scope=stagex-guest-amd64
+          cache-to: type=gha,scope=stagex-guest-amd64,mode=max
+      - run: tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - zns-resolver-guest | gzip -n > zns-resolver-guest-x86_64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zns-resolver-guest-amd64
+          path: zns-resolver-guest-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, guest]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -106,8 +141,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: zns-resolver-linux-amd64
+          pattern: zns-resolver-*
           path: dist
+          merge-multiple: true
       - name: Publish binaries and checksums
         env:
           GH_TOKEN: ${{ github.token }}
@@ -116,6 +152,7 @@ jobs:
         run: |
           cd dist
           sha256sum --check SHA256SUMS
+          sha256sum zns-resolver-guest-x86_64.tar.gz >> SHA256SUMS
           release_args=()
           version_without_metadata="${RELEASE_TAG%%+*}"
           if [[ "$version_without_metadata" == *-* ]]; then
@@ -127,4 +164,5 @@ jobs:
             "${release_args[@]}" \
             zns-resolver-mainnet-x86_64-linux-musl \
             zns-resolver-testnet-x86_64-linux-musl \
+            zns-resolver-guest-x86_64.tar.gz \
             SHA256SUMS BUILD-INFO.txt

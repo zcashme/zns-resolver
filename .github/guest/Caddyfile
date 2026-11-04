@@ -1,0 +1,39 @@
+{
+	admin off
+	persist_config off
+	servers {
+		protocols h1 h2
+	}
+}
+
+(rpc) {
+	header Access-Control-Allow-Origin *
+	header Access-Control-Allow-Methods "POST, OPTIONS"
+	header Access-Control-Allow-Headers Content-Type
+	@preflight method OPTIONS
+	respond @preflight 204
+	request_body {
+		max_size 1MB
+	}
+	rewrite * /
+}
+
+main.zcashnames.com {
+	import rpc
+	reverse_proxy 127.0.0.1:3031
+}
+
+light.zcash.me {
+	@mainnet path /zns-mainnet /zns-mainnet-test
+	handle @mainnet {
+		import rpc
+		reverse_proxy 127.0.0.1:3031
+	}
+	handle /zns-testnet {
+		import rpc
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle {
+		respond 404
+	}
+}
