@@ -33,9 +33,7 @@ CREATE TABLE IF NOT EXISTS name_events (
     action       TEXT    NOT NULL CHECK (action IN ('claim', 'update', 'release')),
     ua           TEXT    NOT NULL,
     expires_at   TEXT    NOT NULL,
-    prev_rcm     BLOB    NOT NULL,
-    rcm          BLOB    NOT NULL,
-    psi          BLOB    NOT NULL,
+    prev         BLOB    NOT NULL,
     cmx          BLOB    NOT NULL,
     nullifier    BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
@@ -53,9 +51,7 @@ CREATE TABLE IF NOT EXISTS names (
     action       TEXT    NOT NULL CHECK (action IN ('claim', 'update', 'release')),
     ua           TEXT    NOT NULL,
     expires_at   TEXT    NOT NULL,
-    prev_rcm     BLOB    NOT NULL,
-    rcm          BLOB    NOT NULL,
-    psi          BLOB    NOT NULL,
+    prev         BLOB    NOT NULL,
     cmx          BLOB    NOT NULL,
     nullifier    BLOB    NOT NULL,
     txid         BLOB    NOT NULL,
@@ -93,7 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 -- term and liveness clocks alone (issue #61). Mark the schema only
 -- after all tables have been created.
 PRAGMA application_id = 1515082545; -- ZNS1
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 "#;
 
 /// Opens only this schema. An older database must be removed by the operator
@@ -110,7 +106,7 @@ pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
     if objects == 0 && version == 0 && application_id == 0 {
         return conn.execute_batch(SCHEMA_SQL);
     }
-    if version == 1 && application_id == 1515082545 {
+    if version == 2 && application_id == 1515082545 {
         return Ok(());
     }
     tracing::error!(
