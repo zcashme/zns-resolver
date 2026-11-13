@@ -3,16 +3,14 @@
 use std::collections::HashSet;
 
 use orchard::keys::{FullViewingKey, Scope};
-use orchard::note::Note;
-use orchard::note::Nullifier;
-use orchard::note::{NoteCommitTrapdoor, Psi};
+use orchard::note::{ExtractedNoteCommitment, Nullifier};
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
-use seer_sync::sync::scan::WalletTx;
+use seer_sync::sync::scan::{OrchardOutput, WalletTx};
 use seer_sync::{Cursor, Nullifiers};
 use zcash_address::unified::Encoding as _;
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::{BlockHeight, Parameters as _};
-use zns_verify::{pallas, Action, Memo, NameNote, PrimeField, Tip};
+use zns_verify::{Action, Memo, NameNote, Tip};
 
 use super::anchor_lineage::{
     keeps_anchor_note, Adoption, Lineage, Position, Retirement, TxAnchorFacts,
@@ -21,12 +19,12 @@ use super::nf::{AnchorNf, TipNf};
 use super::notes;
 use super::{Event, Registration};
 
-/// One authenticated candidate: a relaxed registry output whose memo
-/// decodes to a name note that binds to its published commitment, is
-/// zero-valued, and is addressed to the registry — the mint's
-/// `decrypt_name_notes` gates. Parsed and verified once at triage; every
-/// stage reads this form. Flattened from the scan tuple so the admission
-/// boundary is constructible in tests.
+/// One authenticated candidate: a registry output whose memo decodes to a
+/// name note that binds to its published commitment, is zero-valued, and
+/// is addressed to the registry — the mint's `decrypt_name_notes` gates.
+/// Parsed and verified once at triage; every stage reads this form.
+/// Flattened from the scan output so the admission boundary is
+/// constructible in tests.
 struct Candidate<'a> {
     action_index: usize,
     txid: [u8; 32],
@@ -34,14 +32,8 @@ struct Candidate<'a> {
     note: NameNote<'a>,
     /// The published commitment the binding was verified against.
     cand_cmx: [u8; 32],
-    /// The decrypted note: the source of the admission nullifier.
-    note_orchard: Note,
-    /// The verified opening of the ZNS binding.
-    psi: pallas::Base,
-    rcm: pallas::Scalar,
-    /// Tests force the underivable-nullifier path.
-    #[cfg(test)]
-    fail_nullifier: bool,
+    /// The note's nullifier: the name's tip nullifier once admitted.
+    nf: Nullifier,
 }
 
 impl Candidate<'_> {
@@ -141,12 +133,10 @@ pub(crate) fn drop_payment_notes(conn: &Connection) -> rusqlite::Result<usize> {
 /// except the parse, which borrows the per-block memo arena.
 struct Source<'a> {
     action_index: usize,
-    cand_note: Note,
     cand_cmx: [u8; 32],
+    nf: Nullifier,
     memo: &'a [u8],
     txid: [u8; 32],
-    psi: pallas::Base,
-    rcm: pallas::Scalar,
 }
 
 /// The main write path: triage and anchor-fact bookkeeping, then candidate
@@ -174,51 +164,46 @@ pub(crate) fn apply_batch(
     for block in transactions.chunk_by(|a, b| a.height == b.height) {
         let height = u32::from(block[0].height);
 
-        // Triage: the candidate lane. The gates are the mint's
-        // `decrypt_name_notes`, so the accept-path count is mint-exact: the
-        // memo decodes to a NameNote, binds to the published commitment, is
-        // zero-valued, and is addressed to the registry. Candidate
-        // authenticity is the recipient and binding gates — `is_sent` is
-        // merged lane routing, not a signal: third-party gifts and mint
-        // self-sends are both candidates. Each survivor's memo is parsed
-        // and verified once, into a per-block arena the candidates borrow.
+        // Triage. The gates are the mint's `decrypt_name_notes`, so the
+        // accept-path count is mint-exact: the memo decodes to a NameNote, its
+        // record gives the note's rseed, the note is zero-valued, and it is
+        // addressed to the registry. Each survivor's memo is parsed once, into
+        // a per-block arena the candidates borrow.
         let registry_recipient = fvk.to_ivk(Scope::External).address_at(0u32);
         let mut memos: Vec<Memo> = Vec::new();
         let mut sources: Vec<Source> = Vec::new();
         for tx in block {
             let txid = *tx.txid.as_ref();
-            for output in &tx.relaxed_ironwood_outputs {
-                let (action_index, cand_note, _action_nullifier, memo, _) = output;
+            for output in &tx.ironwood_outputs {
+                let action_index = output.index as usize;
+                let cand_note = &output.note;
 
-                let Some(memo) = memo else {
-                    candidate_dropped("missing memo", &txid, *action_index);
+                let Some(memo) = &output.memo else {
+                    candidate_dropped("missing memo", &txid, action_index);
                     continue;
                 };
                 let Ok(zns_memo) = Memo::from_bytes(memo) else {
-                    candidate_dropped("undecodable memo", &txid, *action_index);
+                    candidate_dropped("undecodable memo", &txid, action_index);
                     continue;
                 };
                 // Gate: protocol parse. The kernel's structural rules are the
                 // authority — invalid statements never become candidates.
                 let Ok(note) = NameNote::parse(&zns_memo) else {
-                    candidate_dropped("memo is not a name note", &txid, *action_index);
+                    candidate_dropped("memo is not a name note", &txid, action_index);
                     continue;
                 };
-                // Gate: binding — the transition, hashed under the ZNS
-                // binding, must reproduce the published cmx.
-                let Some((psi, rcm)) =
-                    notes::verify_commitment(&note, cand_note.note(), &cand_note.cmx().to_bytes())
-                else {
-                    candidate_dropped("commitment does not bind", &txid, *action_index);
-                    continue;
-                };
-                // Gate: shape — zero value, registry recipient.
-                if cand_note.note().value().inner() != 0 {
-                    candidate_dropped("value is not zero", &txid, *action_index);
+                // Gate: binding — the record gives the note's rseed.
+                if !notes::binds(&note, cand_note) {
+                    candidate_dropped("commitment does not bind", &txid, action_index);
                     continue;
                 }
-                if cand_note.note().recipient() != registry_recipient {
-                    candidate_dropped("recipient is not the registry", &txid, *action_index);
+                // Gate: shape — zero value, registry recipient.
+                if cand_note.value().inner() != 0 {
+                    candidate_dropped("value is not zero", &txid, action_index);
+                    continue;
+                }
+                if cand_note.recipient() != registry_recipient {
+                    candidate_dropped("recipient is not the registry", &txid, action_index);
                     continue;
                 }
                 // Gate: the bound UA must decode as a Unified Address on this
@@ -227,29 +212,33 @@ pub(crate) fn apply_batch(
                 let Some((ua_network, revision, _)) =
                     zcash_address::unified::Address::decode(ua).ok()
                 else {
-                    candidate_dropped("ua does not decode", &txid, *action_index);
+                    candidate_dropped("ua does not decode", &txid, action_index);
                     continue;
                 };
                 if ua_network != crate::NETWORK.network_type() {
-                    candidate_dropped("ua is for another network", &txid, *action_index);
+                    candidate_dropped("ua is for another network", &txid, action_index);
                     continue;
                 }
                 // The mint only speaks revision-0 unified encoding (ZIP 316);
                 // a later revision is a UA the mint cannot have produced.
                 if revision != zcash_address::unified::Revision::R0 {
-                    candidate_dropped("ua is not revision 0", &txid, *action_index);
+                    candidate_dropped("ua is not revision 0", &txid, action_index);
                     continue;
                 }
 
+                // The scan derives every registry note's nullifier from the
+                // full viewing key.
+                let nf = output
+                    .nf
+                    .ok_or_else(|| invariant_failure("registry output has no nullifier"))?;
+
                 memos.push(zns_memo);
                 sources.push(Source {
-                    action_index: *action_index,
-                    cand_note: *cand_note.note(),
-                    cand_cmx: cand_note.cmx().to_bytes(),
+                    action_index,
+                    cand_cmx: ExtractedNoteCommitment::from(cand_note.commitment()).to_bytes(),
+                    nf,
                     memo: memo.as_slice(),
                     txid,
-                    psi,
-                    rcm,
                 });
             }
         }
@@ -265,11 +254,7 @@ pub(crate) fn apply_batch(
                 memo: src.memo,
                 note,
                 cand_cmx: src.cand_cmx,
-                note_orchard: src.cand_note,
-                psi: src.psi,
-                rcm: src.rcm,
-                #[cfg(test)]
-                fail_nullifier: false,
+                nf: src.nf,
             });
         }
 
@@ -313,9 +298,7 @@ pub(crate) fn apply_batch(
                 }
             }
 
-            let adoptions: Vec<Adoption> = tx
-                .ironwood_outputs
-                .iter()
+            let adoptions: Vec<Adoption> = anchor_outputs(tx, &candidates)
                 .filter(|o| !o.is_sent && o.note.value().inner() == 0)
                 .filter_map(|o| o.nf.map(AnchorNf::from_scan))
                 .map(|nf| Adoption { nf })
@@ -346,8 +329,7 @@ pub(crate) fn apply_batch(
                     claim_successor: shape,
                 },
             };
-            let seated =
-                apply_transaction(&db_tx, &candidates, &law, &lineage, &mut live_names, fvk)?;
+            let seated = apply_transaction(&db_tx, &candidates, &law, &lineage, &mut live_names)?;
             // A rejected claim's zero-value note is not a successor: the
             // fold would seat it later.
             if shape && !seated {
@@ -357,7 +339,7 @@ pub(crate) fn apply_batch(
             // A payment is not an anchor fact. Storing it would grow the
             // table the lineage rereads on every batch.
             if !law.facts.adoptions.is_empty() {
-                for output in &tx.ironwood_outputs {
+                for output in anchor_outputs(tx, &candidates) {
                     if output.is_sent || output.note.value().inner() != 0 {
                         continue;
                     }
@@ -451,12 +433,31 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
     Ok(events)
 }
 
-/// The mint's successor output: one registry output, zero-value and
-/// received, and the transaction's one name note is a claim. A sent note
-/// is not stored as an adoption, so it cannot be the successor the fold
-/// seats.
+/// The transaction's registry outputs other than its name notes: the notes
+/// that can be anchors. The mint's `apply_block` takes a claim's successor
+/// from the same set.
+fn anchor_outputs<'t>(
+    tx: &'t WalletTx,
+    candidates: &[Candidate<'_>],
+) -> impl Iterator<Item = &'t OrchardOutput> {
+    let txid = *tx.txid.as_ref();
+    let name_notes: Vec<u32> = candidates
+        .iter()
+        .filter(|candidate| candidate.txid == txid)
+        .filter_map(|candidate| u32::try_from(candidate.action_index).ok())
+        .collect();
+    tx.ironwood_outputs
+        .iter()
+        .filter(move |output| !name_notes.contains(&output.index))
+}
+
+/// The mint's successor output: one registry output besides the name note,
+/// zero-value and received, and the transaction's one name note is a
+/// claim. A sent note is not stored as an adoption, so it cannot be the
+/// successor the fold seats.
 fn claim_successor_output(tx: &WalletTx, candidates: &[Candidate<'_>]) -> bool {
-    let [output] = tx.ironwood_outputs.as_slice() else {
+    let outputs: Vec<&OrchardOutput> = anchor_outputs(tx, candidates).collect();
+    let [output] = outputs.as_slice() else {
         return false;
     };
     if output.is_sent || output.note.value().inner() != 0 || output.nf.is_none() {
@@ -561,7 +562,6 @@ fn apply_transaction(
     law: &TxLaw,
     lineage: &Lineage,
     live_names: &mut HashSet<TipNf>,
-    fvk: &FullViewingKey,
 ) -> rusqlite::Result<bool> {
     let height = law.height;
     let tx_facts = &law.facts;
@@ -637,15 +637,7 @@ fn apply_transaction(
                 return Ok(false);
             };
 
-            let Some(nullifier) = admit_nullifier(candidate, fvk) else {
-                admission_dropped(
-                    "nullifier underivable",
-                    candidate.name(),
-                    &candidate.txid,
-                    height,
-                );
-                return Ok(false);
-            };
+            let nullifier = TipNf::from_scan(candidate.nf);
             if record_admission(
                 db_tx,
                 &AdmissionRow {
@@ -657,9 +649,7 @@ fn apply_transaction(
                         .expires_at()
                         .map(|e| e.field_bytes().to_string())
                         .unwrap_or_else(|| "none".to_string()),
-                    prev_rcm: expected_prev.as_slice(),
-                    rcm: candidate.rcm.to_repr().as_slice(),
-                    psi: candidate.psi.to_repr().as_slice(),
+                    prev: expected_prev.as_slice(),
                     cmx: &candidate.cand_cmx,
                     nullifier: nullifier.as_bytes(),
                     txid: candidate.txid.as_slice(),
@@ -722,30 +712,7 @@ fn apply_transaction(
             // deadlines — a mint-authorized update that clears the
             // predecessor and spend gates is the transition to index,
             // so this tip follows the mint's ledger (issue #61).
-            let Some(nullifier) = admit_nullifier(candidate, fvk) else {
-                // The tip was spent on chain. Leaving the names row in
-                // place would keep serving a note that can never be spent
-                // again.
-                admission_dropped(
-                    "nullifier underivable",
-                    candidate.name(),
-                    &candidate.txid,
-                    height,
-                );
-                if let Some(consumed) = tip_nf {
-                    end_binding_implicitly(
-                        db_tx,
-                        live_names,
-                        candidate.name(),
-                        height,
-                        &candidate.txid,
-                        law.tx_index,
-                        candidate.action_index,
-                        &consumed,
-                    )?;
-                }
-                return Ok(false);
-            };
+            let nullifier = TipNf::from_scan(candidate.nf);
             if record_admission(
                 db_tx,
                 &AdmissionRow {
@@ -757,9 +724,7 @@ fn apply_transaction(
                         .expires_at()
                         .map(|e| e.field_bytes().to_string())
                         .unwrap_or_else(|| "none".to_string()),
-                    prev_rcm: expected_prev.as_slice(),
-                    rcm: candidate.rcm.to_repr().as_slice(),
-                    psi: candidate.psi.to_repr().as_slice(),
+                    prev: expected_prev.as_slice(),
                     cmx: &candidate.cand_cmx,
                     nullifier: nullifier.as_bytes(),
                     txid: candidate.txid.as_slice(),
@@ -786,22 +751,6 @@ fn candidate_dropped(reason: &'static str, txid: &[u8; 32], action_index: usize)
 
 fn admission_dropped(reason: &'static str, name: &str, txid: &[u8; 32], height: u32) {
     tracing::warn!(reason, name, txid = ?txid, height, "admission dropped");
-}
-
-/// The admission nullifier of a verified candidate.
-fn admit_nullifier(candidate: &Candidate, fvk: &FullViewingKey) -> Option<TipNf> {
-    #[cfg(test)]
-    if candidate.fail_nullifier {
-        return None;
-    }
-    candidate
-        .note_orchard
-        .zns_nullifier(
-            fvk,
-            NoteCommitTrapdoor::from_inner(candidate.rcm),
-            Psi::from_inner(candidate.psi),
-        )
-        .map(TipNf::from_scan)
 }
 
 /// The mint's `mark_released`: every live name whose tip this transaction
@@ -877,9 +826,7 @@ struct AdmissionRow<'a> {
     action: &'a str,
     ua: &'a str,
     expires_at: &'a str,
-    prev_rcm: &'a [u8],
-    rcm: &'a [u8],
-    psi: &'a [u8],
+    prev: &'a [u8],
     cmx: &'a [u8],
     nullifier: &'a [u8],
     txid: &'a [u8],
@@ -898,9 +845,7 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
         row.action,
         row.ua,
         row.expires_at,
-        row.prev_rcm,
-        row.rcm,
-        row.psi,
+        row.prev,
         row.cmx,
         row.nullifier,
         row.txid,
@@ -909,8 +854,8 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
         row.memo,
     ];
     let inserted = db_tx.execute(
-        "INSERT OR IGNORE INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT OR IGNORE INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         sql_params,
     )?;
     if inserted == 0 {
@@ -920,12 +865,12 @@ fn record_admission(db_tx: &Transaction<'_>, row: &AdmissionRow<'_>) -> rusqlite
         db_tx.execute("DELETE FROM names WHERE name = ?1", params![row.name])?;
     } else {
         db_tx.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT (name) DO UPDATE SET
                height = excluded.height, action = excluded.action, ua = excluded.ua,
                expires_at = excluded.expires_at,
-               prev_rcm = excluded.prev_rcm, rcm = excluded.rcm, psi = excluded.psi,
+               prev = excluded.prev,
                cmx = excluded.cmx, nullifier = excluded.nullifier,
                txid = excluded.txid, tx_index = excluded.tx_index,
                action_index = excluded.action_index,
@@ -1219,17 +1164,17 @@ struct LiveTip {
 
 fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<LiveTip>> {
     conn.query_row(
-        "SELECT action, rcm, nullifier FROM names WHERE name = ?1",
+        "SELECT action, cmx, nullifier FROM names WHERE name = ?1",
         params![name],
         |row| {
             let action =
                 Action::from_bytes(row.get::<_, String>(0)?.as_bytes()).ok_or(corrupt_record())?;
-            let rcm: Vec<u8> = row.get(1)?;
-            let rcm: [u8; 32] = rcm.try_into().map_err(|_| corrupt_record())?;
+            let cmx: Vec<u8> = row.get(1)?;
+            let cmx: [u8; 32] = cmx.try_into().map_err(|_| corrupt_record())?;
             let nullifier: Vec<u8> = row.get(2)?;
             let nullifier: [u8; 32] = nullifier.try_into().map_err(|_| corrupt_record())?;
             Ok(LiveTip {
-                tip: Tip { action, rcm },
+                tip: Tip { action, rcm: cmx },
                 nullifier: TipNf::from_bytes(&nullifier),
             })
         },
@@ -1263,7 +1208,7 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
         .optional()?;
     let row = tx
         .query_row(
-            "SELECT action, memo, txid, height, tx_index, action_index, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier
+            "SELECT action, memo, txid, height, tx_index, action_index, ua, expires_at, prev, cmx, nullifier
              FROM name_events WHERE name = ?1
              ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT 1",
             params![name],
@@ -1280,8 +1225,6 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                     row.get::<_, Vec<u8>>(8)?,
                     row.get::<_, Vec<u8>>(9)?,
                     row.get::<_, Vec<u8>>(10)?,
-                    row.get::<_, Vec<u8>>(11)?,
-                    row.get::<_, Vec<u8>>(12)?,
                 ))
             },
         )
@@ -1298,8 +1241,6 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
         ua_b,
         expires_col,
         prev_b,
-        rcm_b,
-        psi_b,
         cmx_b,
         nullifier_b,
     )) = row
@@ -1322,8 +1263,8 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
 
     if matches!(action, Action::Claim | Action::Update) {
         tx.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 name,
                 height,
@@ -1331,8 +1272,6 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
                 ua_b,
                 expires_col,
                 prev_b,
-                rcm_b,
-                psi_b,
                 cmx_b,
                 nullifier_b,
                 txid_b,
@@ -1430,14 +1369,14 @@ mod tests {
         let memo =
             b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
         conn.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', x'06', 0, 0, ?1)",
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'04', x'5a', x'06', 0, 0, ?1)",
             params![&memo[..]],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', x'06', 0, 0, ?1)",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'04', x'5a', x'06', 0, 0, ?1)",
             params![&memo[..]],
         )
         .unwrap();
@@ -1481,8 +1420,8 @@ mod tests {
         let memo =
             b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
         conn.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', x'06', 0, 0, ?1)",
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'04', x'5a', x'06', 0, 0, ?1)",
             params![&memo[..]],
         )
         .unwrap();
@@ -1495,14 +1434,14 @@ mod tests {
         // A re-claim above the fork: rewinding past it must not resurrect
         // the pre-release event.
         conn.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 100, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5b', x'08', 0, 0, x'09')",
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 100, 'claim', 'u', 'none', x'00', x'04', x'5b', x'08', 0, 0, x'09')",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 100, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5b', x'08', 0, 0, x'09')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 100, 'claim', 'u', 'none', x'00', x'04', x'5b', x'08', 0, 0, x'09')",
             [],
         )
         .unwrap();
@@ -1547,7 +1486,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1635,15 +1574,15 @@ mod tests {
             b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
         for (height, txid) in [(39_i64, 1_u8), (40, 2), (41, 3)] {
             conn.execute(
-                "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-                 VALUES ('z', ?1, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', ?2, 0, 0, ?3)",
+                "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+                 VALUES ('z', ?1, 'claim', 'u', 'none', x'00', x'04', x'5a', ?2, 0, 0, ?3)",
                 params![height, vec![txid; 32], &memo[..]],
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 41, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', ?1, 0, 0, ?2)",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 41, 'claim', 'u', 'none', x'00', x'04', x'5a', ?1, 0, 0, ?2)",
             params![vec![3_u8; 32], &memo[..]],
         )
         .unwrap();
@@ -1704,9 +1643,7 @@ mod tests {
                 action: "claim",
                 ua: "u",
                 expires_at: "none",
-                prev_rcm: &[0],
-                rcm: &[2],
-                psi: &[3],
+                prev: &[0],
                 cmx: &[4],
                 nullifier: &[0x5a],
                 txid: &[2; 32],
@@ -1941,8 +1878,8 @@ mod tests {
         let memo =
             b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
         conn.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'5a', ?1, 0, 0, ?2)",
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'04', x'5a', ?1, 0, 0, ?2)",
             params![vec![6u8; 32], &memo[..]],
         )
         .unwrap();
@@ -1979,8 +1916,8 @@ mod tests {
         for name in ["a", "b"] {
             let memo = format!("ZNS:claim:{name}:u:none:{prev}");
             conn.execute(
-                "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-                 VALUES (?1, 90, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', ?2, ?3, 0, 0, ?4)",
+                "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+                 VALUES (?1, 90, 'claim', 'u', 'none', x'00', x'04', ?2, ?3, 0, 0, ?4)",
                 params![name, name.as_bytes(), vec![6u8; 32], memo.as_bytes()],
             )
             .unwrap();
@@ -2012,10 +1949,10 @@ mod admission {
     use super::*;
     use crate::registry::storage::SCHEMA_SQL;
     use orchard::keys::SpendingKey;
-    use orchard::note::NoteVersion;
+    use orchard::note::{Note, NoteVersion};
     use zcash_address::unified;
     use zcash_protocol::consensus::Parameters;
-    use zns_verify::zns_psi_rcm;
+    use zns_verify::name_note_rseed;
 
     const RAW_ADDR: [u8; 43] = [
         7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -2054,13 +1991,18 @@ mod admission {
 
     /// A zero-value note addressed to the test recipient.
     fn test_note() -> Note {
+        note_with_rseed([4u8; 32])
+    }
+
+    /// A zero-value note to the test recipient with the given rseed.
+    fn note_with_rseed(rseed: [u8; 32]) -> Note {
         use orchard::note::{RandomSeed, Rho};
         use orchard::value::NoteValue;
         let recipient = orchard::Address::from_raw_address_bytes(&RAW_ADDR)
             .into_option()
             .expect("address");
         let rho = Rho::from_bytes(&[9u8; 32]).into_option().expect("rho");
-        let rseed = RandomSeed::from_bytes([4u8; 32], &rho)
+        let rseed = RandomSeed::from_bytes(rseed, &rho)
             .into_option()
             .expect("rseed");
         Note::from_parts(recipient, NoteValue::ZERO, rho, rseed, NoteVersion::V3)
@@ -2085,29 +2027,23 @@ mod admission {
         let note = NameNote::parse(stored).expect("parsed");
         let memo_bytes = stored.text().expect("memo is utf-8").as_bytes();
 
-        let rho = zns_verify::Rho::from_bytes(&[9u8; 32]).expect("rho");
-        let (psi, rcm) = zns_psi_rcm(
+        let rseed = name_note_rseed(
             action.as_bytes(),
             name.as_bytes(),
             ua.as_bytes(),
             b"none",
             &prev,
         );
-        let diversifier: [u8; 11] = RAW_ADDR[..11].try_into().expect("diversifier");
-        let g_d = notes::diversify_hash(&diversifier);
-        let pk_d: [u8; 32] = RAW_ADDR[11..].try_into().expect("pk_d");
-        let cmx = zns_verify::note_commitment_cmx(g_d, pk_d, 0, rho, psi, rcm).expect("commitment");
+        let bound = note_with_rseed(rseed);
+        assert!(notes::binds(&note, &bound));
 
         Candidate {
             action_index,
             txid,
             memo: memo_bytes,
             note,
-            cand_cmx: cmx.to_bytes(),
-            note_orchard: test_note(),
-            psi,
-            rcm,
-            fail_nullifier: false,
+            cand_cmx: ExtractedNoteCommitment::from(bound.commitment()).to_bytes(),
+            nf: bound.nullifier(&fvk()),
         }
     }
 
@@ -2147,7 +2083,6 @@ mod admission {
     fn backed_claim_binds_the_name() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
         let candidates = vec![candidate(
@@ -2163,7 +2098,7 @@ mod admission {
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
 
-        assert!(apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap());
+        assert!(apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap());
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
@@ -2176,7 +2111,6 @@ mod admission {
     fn a_second_claim_leaves_the_first_name_in_place() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
         let first = vec![candidate(
@@ -2191,9 +2125,7 @@ mod admission {
             true,
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
-        assert!(
-            apply_transaction(&tx, &first, &first_law, &lineage, &mut live_names, &fvk).unwrap()
-        );
+        assert!(apply_transaction(&tx, &first, &first_law, &lineage, &mut live_names).unwrap());
         lineage.step_tx(100, &first_law.facts);
 
         let second_memo = vec![memo_for("claim", "alice", &[0u8; 32])];
@@ -2217,7 +2149,7 @@ mod admission {
         // The name is already live, so the successor stays out. The anchor
         // it spent still retires.
         let seated =
-            apply_transaction(&tx, &second, &second_law, &lineage, &mut live_names, &fvk).unwrap();
+            apply_transaction(&tx, &second, &second_law, &lineage, &mut live_names).unwrap();
         assert!(!seated);
         second_law.facts.claim_successor = seated;
         lineage.step_tx(101, &second_law.facts);
@@ -2240,10 +2172,9 @@ mod admission {
     fn a_later_claim_in_the_block_follows_the_release() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('alice', 100, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('alice', 100, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
@@ -2267,7 +2198,7 @@ mod admission {
             }],
             true,
         );
-        apply_transaction(&tx, &candidates, &release, &seeded, &mut live_names, &fvk).unwrap();
+        apply_transaction(&tx, &candidates, &release, &seeded, &mut live_names).unwrap();
 
         let mut claim = tx_law_for(
             [1; 32],
@@ -2277,9 +2208,7 @@ mod admission {
             true,
         );
         claim.tx_index = 1;
-        assert!(
-            apply_transaction(&tx, &candidates, &claim, &seeded, &mut live_names, &fvk).unwrap()
-        );
+        assert!(apply_transaction(&tx, &candidates, &claim, &seeded, &mut live_names).unwrap());
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
     }
 
@@ -2289,7 +2218,6 @@ mod admission {
     fn an_update_that_spends_an_anchor_ends_the_binding() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
         let claim = vec![candidate(
@@ -2304,9 +2232,7 @@ mod admission {
             true,
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
-        assert!(
-            apply_transaction(&tx, &claim, &claim_law, &lineage, &mut live_names, &fvk).unwrap()
-        );
+        assert!(apply_transaction(&tx, &claim, &claim_law, &lineage, &mut live_names).unwrap());
         lineage.step_tx(100, &claim_law.facts);
 
         let tip: Vec<u8> = tx
@@ -2340,7 +2266,7 @@ mod admission {
             ],
             true,
         );
-        apply_transaction(&tx, &update, &update_law, &lineage, &mut live_names, &fvk).unwrap();
+        apply_transaction(&tx, &update, &update_law, &lineage, &mut live_names).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(
@@ -2359,7 +2285,6 @@ mod admission {
     fn claim_with_an_extra_registry_output_does_not_bind() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
         let candidates = vec![candidate(
@@ -2380,9 +2305,7 @@ mod admission {
         };
         let mut live_names: HashSet<TipNf> = HashSet::new();
 
-        assert!(
-            !apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap()
-        );
+        assert!(!apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap());
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
@@ -2395,11 +2318,10 @@ mod admission {
     fn replaying_a_recorded_claim_leaves_a_free_name_free() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         tx.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('alice', 100, 'claim', 'u', 'none', x'00', x'02', x'03', x'04', x'05', ?1, 0, 0, x'07')",
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('alice', 100, 'claim', 'u', 'none', x'00', x'04', x'05', ?1, 0, 0, x'07')",
             params![vec![1_u8; 32]],
         )
         .unwrap();
@@ -2418,7 +2340,7 @@ mod admission {
         );
         let mut live_names = HashSet::new();
 
-        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap();
+        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap();
 
         assert!(live_names.is_empty());
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
@@ -2432,7 +2354,6 @@ mod admission {
     fn claim_binds_when_the_anchor_spend_is_a_different_action() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         let memos = vec![memo_for("claim", "julian", &[0u8; 32])];
         let candidates = vec![candidate(
@@ -2448,7 +2369,7 @@ mod admission {
         );
         let mut live_names = HashSet::new();
 
-        assert!(apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap());
+        assert!(apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap());
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(
@@ -2462,7 +2383,6 @@ mod admission {
     fn unbacked_claim_is_rejected_without_state_change() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
         let candidates = vec![candidate(
@@ -2480,9 +2400,7 @@ mod admission {
         );
         let mut live_names = HashSet::new();
 
-        assert!(
-            !apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap()
-        );
+        assert!(!apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap());
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
@@ -2495,12 +2413,11 @@ mod admission {
     fn claim_spending_a_live_name_tip_ends_that_binding() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         // "z" is live, its tip nullifier is 0x5a…
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
@@ -2519,9 +2436,7 @@ mod admission {
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
-        assert!(
-            !apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap()
-        );
+        assert!(!apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap());
 
         // z's binding ended; the claim did not land.
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
@@ -2543,12 +2458,11 @@ mod admission {
     fn update_then_stale_release_ends_the_binding() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
-        // "z" is live with tip nullifier 0x5a and commitment rcm 0x02.
+        // "z" is live with tip nullifier 0x5a and cmx 0x02.
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
@@ -2561,7 +2475,7 @@ mod admission {
         ];
         let update = candidate(&memos, 0, 0, 0, [1; 32], "update", "z", [0x02; 32]);
         let release = candidate(&memos, 1, 0, 0, [2; 32], "release", "z", [0x02; 32]);
-        let nullifier_u = admit_nullifier(&update, &fvk).expect("update nullifier");
+        let nullifier_u = TipNf::from_scan(update.nf);
 
         let seeded = seeded_lineage(&[1]);
         let update_law = tx_law_for(
@@ -2586,24 +2500,8 @@ mod admission {
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
         let candidates = vec![update, release];
-        apply_transaction(
-            &tx,
-            &candidates,
-            &update_law,
-            &seeded,
-            &mut live_names,
-            &fvk,
-        )
-        .unwrap();
-        apply_transaction(
-            &tx,
-            &candidates,
-            &release_law,
-            &seeded,
-            &mut live_names,
-            &fvk,
-        )
-        .unwrap();
+        apply_transaction(&tx, &candidates, &update_law, &seeded, &mut live_names).unwrap();
+        apply_transaction(&tx, &candidates, &release_law, &seeded, &mut live_names).unwrap();
 
         // The update admitted; the stale release ended the binding.
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
@@ -2618,47 +2516,6 @@ mod admission {
         assert_eq!(rel_nf.as_slice(), nullifier_u.as_bytes());
     }
 
-    /// The tip was spent and the chain rule passed, but the successor
-    /// nullifier cannot be derived. The binding ends; the spent name does
-    /// not stay resolvable.
-    #[test]
-    fn update_whose_nullifier_cannot_be_derived_ends_the_binding() {
-        let conn = db();
-        let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
-
-        conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
-            params![vec![0x5a_u8; 32]],
-        )
-        .unwrap();
-
-        let memos = vec![memo_for("update", "z", &[0x02; 32])];
-        let mut update = candidate(&memos, 0, 0, 0, [1; 32], "update", "z", [0x02; 32]);
-        update.fail_nullifier = true;
-        assert!(admit_nullifier(&update, &fvk).is_none());
-
-        let seeded = seeded_lineage(&[1]);
-        let law = tx_law_for(
-            [1; 32],
-            100,
-            vec![],
-            vec![Retirement {
-                nf: AnchorNf::from_bytes(&[0x5a; 32]),
-            }],
-            true,
-        );
-        let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
-
-        apply_transaction(&tx, &[update], &law, &seeded, &mut live_names, &fvk).unwrap();
-
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
-        assert!(!live_names.contains(&TipNf::from_bytes(&[0x5a; 32])));
-    }
-
     /// The mint spends the live tip in one action and writes the release
     /// note in another. `accept_release` still ends the binding: the tip
     /// nullifier is among the transaction's spends, and the predecessor matches.
@@ -2666,11 +2523,10 @@ mod admission {
     fn release_binds_when_the_tip_spend_is_a_different_action() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('jesuschrist', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('jesuschrist', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
@@ -2701,7 +2557,7 @@ mod admission {
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
-        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap();
+        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
@@ -2722,11 +2578,10 @@ mod admission {
     fn multi_candidate_tx_takes_follow_spends() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
@@ -2751,7 +2606,7 @@ mod admission {
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
-        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap();
+        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
@@ -2766,11 +2621,10 @@ mod admission {
     fn candidate_free_tx_spending_a_live_tip_ends_the_binding() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
@@ -2789,7 +2643,7 @@ mod admission {
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
         let candidates: Vec<Candidate> = vec![];
-        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names, &fvk).unwrap();
+        apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
@@ -2805,11 +2659,10 @@ mod admission {
     fn an_update_past_the_predecessors_recorded_term_still_renews() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
-        let fvk = fvk();
 
         conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev_rcm, rcm, psi, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', '1000', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', x'03', x'04', ?1, x'06', 0, 0, x'07')",
+            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('z', 90, 'claim', 'u', '1000', x'00', x'0202020202020202020202020202020202020202020202020202020202020202', ?1, x'06', 0, 0, x'07')",
             params![vec![0x5a_u8; 32]],
         )
         .unwrap();
@@ -2828,7 +2681,7 @@ mod admission {
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
-        apply_transaction(&tx, &[update], &law, &seeded, &mut live_names, &fvk).unwrap();
+        apply_transaction(&tx, &[update], &law, &seeded, &mut live_names).unwrap();
 
         let action: String = tx
             .query_row("SELECT action FROM names WHERE name = 'z'", [], |r| {
@@ -2925,7 +2778,6 @@ mod admission {
                 },
             ],
             ironwood_spends: vec![],
-            relaxed_ironwood_outputs: vec![],
             transparent_outputs: vec![],
             transparent_spends: vec![],
         };

@@ -1,11 +1,9 @@
-//! Nullifier provenance. Two nullifier families share one byte
-//! representation and must never be compared: the anchor lineage (standard
-//! derivation, ordinary-lane notes) and name-chain tips (`zns_nullifier`,
-//! relaxed-lane notes). Each family gets its own type; conversions happen
-//! only at the scan boundary.
+//! Nullifier roles. Anchors and name-chain tips are both registry notes
+//! with standard nullifiers, but they confer different authority: an anchor
+//! backs a claim, a tip backs its name's next transition. Each role gets its
+//! own type; conversions happen only at the scan boundary.
 
-/// A revealed nullifier of an ordinary-lane registry note — the anchor
-/// lineage.
+/// A revealed nullifier of a registry note in the anchor lineage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct AnchorNf([u8; 32]);
 
@@ -26,12 +24,12 @@ impl AnchorNf {
     }
 }
 
-/// A name-chain tip nullifier: `zns_nullifier` on a relaxed-lane note.
+/// A name-chain tip nullifier: the nullifier of a name's admitted note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TipNf([u8; 32]);
 
 impl TipNf {
-    /// Adopts the admission nullifier from `zns_nullifier`.
+    /// Adopts the admitted note's nullifier from the scan.
     pub(crate) fn from_scan(nf: orchard::note::Nullifier) -> Self {
         Self(nf.to_bytes())
     }
