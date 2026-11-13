@@ -19,11 +19,13 @@ pub(crate) fn check_chain_rule(
 pub(crate) fn binds(note: &zns_verify::NameNote<'_>, cand_note: &Note) -> bool {
     let expires_at = note.expires_at().unwrap_or(Expiry::NEVER);
     let prev = note.prev_rcm().unwrap_or(PrevRcm::ZERO);
+    let terms = note.terms();
     let rseed = name_note_rseed(
         note.action().as_bytes(),
         note.name().as_str().as_bytes(),
         note.ua().as_str().as_bytes(),
         expires_at.field_bytes().as_bytes(),
+        &terms[..note.term_count()],
         prev.as_bytes(),
     );
     cand_note.rseed().as_bytes() == &rseed

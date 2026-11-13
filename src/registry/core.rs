@@ -662,11 +662,16 @@ fn apply_transaction(
             }
             Ok(true)
         }
-        Action::Update | Action::Release => {
+        Action::Update
+        | Action::Release
+        | Action::Sale
+        | Action::List
+        | Action::Auction
+        | Action::Delist => {
             // Gate: predecessor — the transaction must consume this
-            // name's live tip, only this name's, and no anchor. Anything
-            // else is follow_spends: every spent live name ends its
-            // binding.
+            // name's live tip, only this name's, and no anchor. A sale,
+            // list, auction, and delist spend the tip the way an update
+            // does. Anything else ends every live name it spent.
             let spent_other_live = tx_facts.retirements.iter().any(|r| {
                 let nf = TipNf::from_revealed(&r.nf);
                 live_names.contains(&nf) && tip_nf != Some(nf)
@@ -711,7 +716,8 @@ fn apply_transaction(
             // or frees the name. The resolver does not re-evaluate the
             // deadlines — a mint-authorized update that clears the
             // predecessor and spend gates is the transition to index,
-            // so this tip follows the mint's ledger (issue #61).
+            //             so this tip follows the mint's ledger.
+            // A sale, list, auction, or delist stays live on those gates.
             let nullifier = TipNf::from_scan(candidate.nf);
             if record_admission(
                 db_tx,
@@ -736,7 +742,10 @@ fn apply_transaction(
                 if let Some(live) = binding.as_ref() {
                     live_names.remove(&live.nullifier);
                 }
-                if note.action() == Action::Update {
+                if matches!(
+                    note.action(),
+                    Action::Update | Action::Sale | Action::List | Action::Auction | Action::Delist
+                ) {
                     live_names.insert(nullifier);
                 }
             }
@@ -1261,7 +1270,15 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
     }
     let action = Action::from_bytes(action_col.as_bytes()).ok_or(corrupt_record())?;
 
-    if matches!(action, Action::Claim | Action::Update) {
+    if matches!(
+        action,
+        Action::Claim
+            | Action::Update
+            | Action::Sale
+            | Action::List
+            | Action::Auction
+            | Action::Delist
+    ) {
         tx.execute(
             "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -1486,7 +1503,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let facts: i64 = conn
             .query_row("SELECT COUNT(*) FROM anchor_facts", [], |r| r.get(0))
             .unwrap();
@@ -1952,7 +1969,7 @@ mod admission {
     use orchard::note::{Note, NoteVersion};
     use zcash_address::unified;
     use zcash_protocol::consensus::Parameters;
-    use zns_verify::name_note_rseed;
+    use zns_verify::{name_note_rseed, Expiry, PrevRcm};
 
     const RAW_ADDR: [u8; 43] = [
         7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1977,6 +1994,18 @@ mod admission {
     fn memo_for(action: &str, name: &str, prev: &[u8; 32]) -> Memo {
         Memo::from_bytes(format!("ZNS:{action}:{name}:{}:none:{}", test_ua(), hex(prev)).as_bytes())
             .expect("memo")
+    }
+
+    fn list_memo(name: &str, prev: &[u8; 32]) -> Memo {
+        Memo::from_bytes(
+            format!("ZNS:list:{name}:{}:none:t1abc:5:{}", test_ua(), hex(prev)).as_bytes(),
+        )
+        .expect("list memo")
+    }
+
+    fn sale_memo(name: &str, ua: &str, prev: &[u8; 32]) -> Memo {
+        Memo::from_bytes(format!("ZNS:sale:{name}:{ua}:none:{}", hex(prev)).as_bytes())
+            .expect("sale memo")
     }
 
     fn hex(bytes: &[u8; 32]) -> String {
@@ -2022,16 +2051,22 @@ mod admission {
         name: &str,
         prev: [u8; 32],
     ) -> Candidate<'a> {
-        let ua = test_ua();
         let stored = &memos[i];
         let note = NameNote::parse(stored).expect("parsed");
+        assert_eq!(note.action().as_str(), action);
+        assert_eq!(note.name().as_str(), name);
+        assert_eq!(note.prev_rcm().unwrap_or(PrevRcm::ZERO).as_bytes(), &prev);
         let memo_bytes = stored.text().expect("memo is utf-8").as_bytes();
-
+        let terms = note.terms();
         let rseed = name_note_rseed(
-            action.as_bytes(),
-            name.as_bytes(),
-            ua.as_bytes(),
-            b"none",
+            note.action().as_bytes(),
+            note.name().as_str().as_bytes(),
+            note.ua().as_str().as_bytes(),
+            note.expires_at()
+                .unwrap_or(Expiry::NEVER)
+                .field_bytes()
+                .as_bytes(),
+            &terms[..note.term_count()],
             &prev,
         );
         let bound = note_with_rseed(rseed);
@@ -2277,6 +2312,132 @@ mod admission {
             0
         );
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+    }
+
+    /// A list spends the live tip and leaves the name listed.
+    #[test]
+    fn a_list_keeps_the_name() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let (mut lineage, mut live_names, tip, cmx) = claim_alice(&tx);
+
+        let memos = vec![list_memo("alice", &cmx)];
+        let list = vec![candidate(&memos, 0, 0, 0, [3; 32], "list", "alice", cmx)];
+        let law = tx_law_for(
+            [3; 32],
+            101,
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&tip),
+            }],
+            true,
+        );
+        apply_transaction(&tx, &list, &law, &lineage, &mut live_names).unwrap();
+        lineage.step_tx(101, &law.facts);
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+        let action: String = tx
+            .query_row("SELECT action FROM names WHERE name = 'alice'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(action, "list");
+        assert_eq!(live_names.len(), 1);
+    }
+
+    /// A sale spends the live tip and the buyer's address becomes the record.
+    #[test]
+    fn a_sale_rebinds_the_name() {
+        let conn = db();
+        let tx = conn.unchecked_transaction().unwrap();
+        let (lineage, mut live_names, tip, cmx) = claim_alice(&tx);
+
+        let memos = vec![sale_memo("alice", "u1buyer", &cmx)];
+        let sale = vec![candidate(&memos, 0, 0, 0, [4; 32], "sale", "alice", cmx)];
+        let law = tx_law_for(
+            [4; 32],
+            101,
+            vec![],
+            vec![Retirement {
+                nf: AnchorNf::from_bytes(&tip),
+            }],
+            true,
+        );
+        apply_transaction(&tx, &sale, &law, &lineage, &mut live_names).unwrap();
+
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
+        let (action, ua): (String, String) = tx
+            .query_row(
+                "SELECT action, ua FROM names WHERE name = 'alice'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action, "sale");
+        assert_eq!(ua, "u1buyer");
+    }
+
+    /// A listed name is still live after the tip table is rebuilt.
+    #[test]
+    fn a_restart_restores_a_listed_name() {
+        let conn = db();
+        let prev = [0xab; 32];
+        let memo = list_memo("alice", &prev);
+        let text = memo.text().unwrap();
+        conn.execute(
+            "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+             VALUES ('alice', 90, 'list', ?1, 'none', ?2, x'04', x'5a', x'06', 0, 0, ?3)",
+            params![test_ua(), prev.as_slice(), text.as_bytes()],
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        rebuild_name_tip(&tx, "alice").unwrap();
+        let action: String = tx
+            .query_row("SELECT action FROM names WHERE name = 'alice'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(action, "list");
+    }
+
+    /// Admits a claim for `alice` and returns the live tip and its cmx.
+    fn claim_alice(tx: &Transaction<'_>) -> (Lineage, HashSet<TipNf>, [u8; 32], [u8; 32]) {
+        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
+        let claim = vec![candidate(
+            &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
+        )];
+        let mut lineage = seeded_lineage(&[1]);
+        let law = tx_law_for(
+            [1; 32],
+            100,
+            vec![Adoption { nf: nf(200) }],
+            vec![Retirement { nf: nf(1) }],
+            true,
+        );
+        let mut live_names = HashSet::new();
+        assert!(apply_transaction(tx, &claim, &law, &lineage, &mut live_names).unwrap());
+        lineage.step_tx(100, &law.facts);
+        let tip: Vec<u8> = tx
+            .query_row(
+                "SELECT nullifier FROM names WHERE name = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cmx: Vec<u8> = tx
+            .query_row("SELECT cmx FROM names WHERE name = 'alice'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        (
+            lineage,
+            live_names,
+            tip.try_into().unwrap(),
+            cmx.try_into().unwrap(),
+        )
     }
 
     /// A second registry output means the mint's successor is absent, so

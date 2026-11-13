@@ -2679,9 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "zns-verify"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f224dfcf63c7f60342516228ac9eb8ced4748ffd9886934432b32189536fead5"
+version = "0.3.0"
 dependencies = [
  "blake2b_simd",
  "group",

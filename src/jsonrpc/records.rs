@@ -17,7 +17,7 @@ pub struct NameRecord {
     pub txid: String,
     /// Block height of the transaction that produced this binding.
     pub height: u64,
-    /// The last lifecycle action that produced this state ("claim", "update", or "release").
+    /// The action that produced this state.
     pub last_action: String,
     /// Canonical Name Note `expires_at`: `"none"` or a decimal Unix timestamp.
     pub expires_at: String,
