@@ -1,11 +1,15 @@
-/// The actions a Name Note records: `claim`, `update` and `release`.
+/// The actions a Name Note records.
 ///
 /// Each value carries the lowercase wire string the resolver uses in
 /// `last_action`, `action` and the `events` filter.
 enum ZnsAction {
   claim('claim'),
   update('update'),
-  release('release');
+  release('release'),
+  sale('sale'),
+  list('list'),
+  auction('auction'),
+  delist('delist');
 
   const ZnsAction(this.wire);
 

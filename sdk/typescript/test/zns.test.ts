@@ -114,6 +114,43 @@ describe("ZNS", () => {
       expect(await zns.isAvailable("Alice")).toBe(false);
       expect((bodies[0].params as { query: string }).query).toBe("alice");
     });
+
+    it("reads a sale, list, auction, and delist", async () => {
+      for (const action of ["sale", "list", "auction", "delist"]) {
+        vi.stubGlobal("fetch", vi.fn(async () => ({
+          ok: true,
+          json: async () => ({
+            result: {
+              name: "alice",
+              address: VALID_TESTNET_UA,
+              txid: "ab".repeat(32),
+              height: 100,
+              last_action: action,
+              expires_at: "none",
+            },
+          }),
+        })));
+        const reg = await zns.resolveName("alice");
+        expect(reg?.lastAction).toBe(action);
+      }
+    });
+
+    it("throws on an action the resolver does not send", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          result: {
+            name: "alice",
+            address: VALID_TESTNET_UA,
+            txid: "ab".repeat(32),
+            height: 100,
+            last_action: "buy",
+            expires_at: "none",
+          },
+        }),
+      })));
+      await expect(zns.resolveName("alice")).rejects.toThrow(/unknown action/);
+    });
   });
 
   describe("status and events", () => {

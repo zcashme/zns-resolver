@@ -39,6 +39,10 @@ pub enum Action {
     Claim,
     Update,
     Release,
+    Sale,
+    List,
+    Auction,
+    Delist,
 }
 
 impl Action {
@@ -47,6 +51,10 @@ impl Action {
             Self::Claim => "claim",
             Self::Update => "update",
             Self::Release => "release",
+            Self::Sale => "sale",
+            Self::List => "list",
+            Self::Auction => "auction",
+            Self::Delist => "delist",
         }
     }
 
@@ -55,6 +63,10 @@ impl Action {
             "claim" => Some(Self::Claim),
             "update" => Some(Self::Update),
             "release" => Some(Self::Release),
+            "sale" => Some(Self::Sale),
+            "list" => Some(Self::List),
+            "auction" => Some(Self::Auction),
+            "delist" => Some(Self::Delist),
             _ => None,
         }
     }
@@ -491,7 +503,20 @@ mod tests {
             r#"{"name":"alice","address":"utest1abc","txid":"00","height":42,"last_action":"claim","expires_at":"none"}"#,
         )
         .unwrap();
-        assert!(matches!(record, ResolveResult::Exact(Some(_))));
+        assert!(matches!(
+            record,
+            ResolveResult::Exact(Some(ref found)) if found.last_action == Action::Claim
+        ));
+
+        let listed: ResolveResult = serde_json::from_str(
+            r#"{"name":"alice","address":"utest1abc","txid":"00","height":42,"last_action":"list","expires_at":"none"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            listed,
+            ResolveResult::Exact(Some(ref found)) if found.last_action == Action::List
+        ));
+        assert!(Action::from_wire("buy").is_none());
 
         let missing: ResolveResult = serde_json::from_str("null").unwrap();
         assert_eq!(missing, ResolveResult::Exact(None));
