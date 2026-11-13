@@ -7,7 +7,7 @@ use orchard::note::Note;
 use orchard::note::Nullifier;
 use orchard::note::{NoteCommitTrapdoor, Psi};
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
-use seer_sync::sync::scan::WalletTx;
+use seer_sync::sync::scan::{OrchardOutput, WalletTx};
 use seer_sync::{Cursor, Nullifiers};
 use zcash_address::unified::Encoding as _;
 use zcash_primitives::block::BlockHash;
@@ -313,9 +313,7 @@ pub(crate) fn apply_batch(
                 }
             }
 
-            let adoptions: Vec<Adoption> = tx
-                .ironwood_outputs
-                .iter()
+            let adoptions: Vec<Adoption> = anchor_outputs(tx, &candidates)
                 .filter(|o| !o.is_sent && o.note.value().inner() == 0)
                 .filter_map(|o| o.nf.map(AnchorNf::from_scan))
                 .map(|nf| Adoption { nf })
@@ -357,7 +355,7 @@ pub(crate) fn apply_batch(
             // A payment is not an anchor fact. Storing it would grow the
             // table the lineage rereads on every batch.
             if !law.facts.adoptions.is_empty() {
-                for output in &tx.ironwood_outputs {
+                for output in anchor_outputs(tx, &candidates) {
                     if output.is_sent || output.note.value().inner() != 0 {
                         continue;
                     }
@@ -451,12 +449,31 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
     Ok(events)
 }
 
-/// The mint's successor output: one registry output, zero-value and
-/// received, and the transaction's one name note is a claim. A sent note
-/// is not stored as an adoption, so it cannot be the successor the fold
-/// seats.
+/// The transaction's registry outputs other than its name notes: the notes
+/// that can be anchors. The mint's `apply_block` takes a claim's successor
+/// from the same set.
+fn anchor_outputs<'t>(
+    tx: &'t WalletTx,
+    candidates: &[Candidate<'_>],
+) -> impl Iterator<Item = &'t OrchardOutput> {
+    let txid = *tx.txid.as_ref();
+    let name_notes: Vec<u32> = candidates
+        .iter()
+        .filter(|candidate| candidate.txid == txid)
+        .filter_map(|candidate| u32::try_from(candidate.action_index).ok())
+        .collect();
+    tx.ironwood_outputs
+        .iter()
+        .filter(move |output| !name_notes.contains(&output.index))
+}
+
+/// The mint's successor output: one registry output besides the name note,
+/// zero-value and received, and the transaction's one name note is a
+/// claim. A sent note is not stored as an adoption, so it cannot be the
+/// successor the fold seats.
 fn claim_successor_output(tx: &WalletTx, candidates: &[Candidate<'_>]) -> bool {
-    let [output] = tx.ironwood_outputs.as_slice() else {
+    let outputs: Vec<&OrchardOutput> = anchor_outputs(tx, candidates).collect();
+    let [output] = outputs.as_slice() else {
         return false;
     };
     if output.is_sent || output.note.value().inner() != 0 || output.nf.is_none() {
