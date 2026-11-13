@@ -1,6 +1,14 @@
 /** Read-only data types returned by the ZNS resolver. */
 
-export const ZNS_ACTIONS = ["claim", "update", "release"] as const;
+export const ZNS_ACTIONS = [
+  "claim",
+  "update",
+  "release",
+  "sale",
+  "list",
+  "auction",
+  "delist",
+] as const;
 export type ZnsAction = (typeof ZNS_ACTIONS)[number];
 export type LastAction = ZnsAction;
 export type EventAction = ZnsAction;

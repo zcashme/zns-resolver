@@ -1,11 +1,11 @@
 import { bech32m } from "bech32";
-import type {
-  Registration,
-  Status,
-  Event,
-  EventsFilter,
-  EventsResult,
-  Paginated,
+import {
+  ZNS_ACTIONS,
+  type Registration,
+  type Status,
+  type EventsFilter,
+  type EventsResult,
+  type Paginated,
 } from "./types.js";
 
 export * from "./pricing.js";
@@ -41,6 +41,30 @@ function normalizeApiResponse<T>(obj: unknown): T {
     ) as T;
   }
   return obj as T;
+}
+
+function knownAction(value: unknown): void {
+  if (typeof value !== "string" || !(ZNS_ACTIONS as readonly string[]).includes(value)) {
+    throw new Error(`ZNS: unknown action from the resolver: ${String(value)}`);
+  }
+}
+
+function registration(raw: Record<string, unknown>): Registration {
+  const record = normalizeApiResponse<Registration>(raw);
+  knownAction(record.lastAction);
+  return record;
+}
+
+function registrationPage(raw: Record<string, unknown>): Paginated<Registration> {
+  const page = normalizeApiResponse<Paginated<Registration>>(raw);
+  for (const item of page.items) knownAction(item.lastAction);
+  return page;
+}
+
+function eventsResult(raw: Record<string, unknown>): EventsResult {
+  const result = normalizeApiResponse<EventsResult>(raw);
+  for (const event of result.events) knownAction(event.action);
+  return result;
 }
 
 function toRpcParams(obj: Record<string, unknown>): Record<string, unknown> {
@@ -346,7 +370,7 @@ export class ZNS {
       { query: normalized },
       signal,
     );
-    return raw ? normalizeApiResponse<Registration>(raw) : null;
+    return raw ? registration(raw) : null;
   }
 
   /** Resolve a Zcash Unified Address to all names pointing to it. Returns empty array if none.
@@ -362,7 +386,7 @@ export class ZNS {
       { query: address, limit, offset },
       signal,
     );
-    return raw.map((r) => normalizeApiResponse<Registration>(r));
+    return raw.map((r) => registration(r));
   }
 
   /** Reverse lookup: all names currently bound to a unified address, with
@@ -380,7 +404,7 @@ export class ZNS {
       toRpcParams({ address, limit, offset }),
       signal,
     );
-    return normalizeApiResponse<Paginated<Registration>>(raw);
+    return registrationPage(raw);
   }
 
   /** List all registered names. Useful for explorers or browsers.
@@ -395,7 +419,7 @@ export class ZNS {
       { query: "", limit, offset },
       signal,
     );
-    return raw.map((r) => normalizeApiResponse<Registration>(r));
+    return raw.map((r) => registration(r));
   }
 
   /** List all currently registered names via the typed `list_names` verb,
@@ -411,7 +435,7 @@ export class ZNS {
       toRpcParams({ limit, offset }),
       signal,
     );
-    return normalizeApiResponse<Paginated<Registration>>(raw);
+    return registrationPage(raw);
   }
 
   /** Check if a name is available for registration.
@@ -448,7 +472,7 @@ export class ZNS {
       toRpcParams((filter ?? {}) as Record<string, unknown>),
       signal,
     );
-    return normalizeApiResponse<EventsResult>(raw);
+    return eventsResult(raw);
   }
 
   /** Parse a ZIP-321 URI into its components. */

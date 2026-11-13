@@ -2,6 +2,7 @@
 
 ## 0.2.0 (unreleased)
 
+- `Action` accepts `sale`, `list`, `auction`, and `delist`.
 - Bring the Rust SDK to feature parity with Dart SDK 0.8.0: claim, update,
   release and OTP memo builders; OTP parsing; ZIP-321 payment URI helpers;
   unified address validation; and annual/forever USD pricing with zatoshi

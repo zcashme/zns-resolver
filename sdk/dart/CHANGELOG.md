@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `ZnsAction` accepts `sale`, `list`, `auction`, and `delist`.
+
 ## 0.8.0
 
 - BREAKING: ported to the ZNS resolver API for the mainnet launch, matching

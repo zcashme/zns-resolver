@@ -23,7 +23,7 @@ testnet = []
 
 [dependencies]
 seer-sync = { version = "0.8", default-features = false }
-zns-verify = "0.2.1"
+zns-verify = { git = "https://github.com/zcashme/zns-verify", rev = "db88be28a58b83c477f284c690854562cf0a8c3b" }
 zcash_address = "0.14"
 orchard = { version = "0.16", default-features = false, features = ["std"] }
 zcash_protocol = { version = "0.11", default-features = false, features = ["std"] }

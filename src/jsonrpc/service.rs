@@ -63,7 +63,7 @@ pub trait ZnsApi {
     #[method(name = "status")]
     async fn status(&self) -> RpcResult<Status>;
 
-    /// Paginated event history (the append-only log of all claims/updates/releases).
+    /// Paginated event history.
     #[method(name = "events")]
     async fn events(
         &self,
@@ -258,7 +258,7 @@ impl ZnsApiServer for JsonRpcApi {
         let action = match action {
             Some(s) => Some(Action::from_bytes(s.as_bytes()).ok_or_else(|| {
                 RpcError::InvalidParams(format!(
-                    "invalid action '{s}': expected claim, update, or release"
+                    "invalid action '{s}': expected claim, update, release, sale, list, auction, or delist"
                 ))
             })?),
             None => None,

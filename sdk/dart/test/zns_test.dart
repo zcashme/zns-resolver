@@ -95,6 +95,14 @@ void main() {
       expect(requests.single['params']['query'], 'alice');
     });
 
+    test('reads a sale, list, auction, and delist', () async {
+      for (final action in ['sale', 'list', 'auction', 'delist']) {
+        final (zns, _) = _client({..._record, 'last_action': action});
+        final reg = await zns.resolveName('alice');
+        expect(reg?.lastAction.wire, action);
+      }
+    });
+
     test('throws on an action the resolver does not send', () async {
       final (zns, _) = _client({..._record, 'last_action': 'buy'});
       expect(zns.resolveName('alice'), throwsFormatException);
