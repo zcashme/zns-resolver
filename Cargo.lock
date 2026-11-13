@@ -2680,6 +2680,7 @@ dependencies = [
 [[package]]
 name = "zns-verify"
 version = "0.3.0"
+source = "git+https://github.com/zcashme/zns-verify?rev=bda2dd58c55f8c7263adbbdfd026a5c26bba1aee#bda2dd58c55f8c7263adbbdfd026a5c26bba1aee"
 dependencies = [
  "blake2b_simd",
  "group",
