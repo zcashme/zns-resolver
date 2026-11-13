@@ -164,14 +164,11 @@ pub(crate) fn apply_batch(
     for block in transactions.chunk_by(|a, b| a.height == b.height) {
         let height = u32::from(block[0].height);
 
-        // Triage: the candidate lane. The gates are the mint's
-        // `decrypt_name_notes`, so the accept-path count is mint-exact: the
-        // memo decodes to a NameNote, binds to the published commitment, is
-        // zero-valued, and is addressed to the registry. Candidate
-        // authenticity is the recipient and binding gates — `is_sent` is
-        // merged lane routing, not a signal: third-party gifts and mint
-        // self-sends are both candidates. Each survivor's memo is parsed
-        // and verified once, into a per-block arena the candidates borrow.
+        // Triage. The gates are the mint's `decrypt_name_notes`, so the
+        // accept-path count is mint-exact: the memo decodes to a NameNote, its
+        // record gives the note's rseed, the note is zero-valued, and it is
+        // addressed to the registry. Each survivor's memo is parsed once, into
+        // a per-block arena the candidates borrow.
         let registry_recipient = fvk.to_ivk(Scope::External).address_at(0u32);
         let mut memos: Vec<Memo> = Vec::new();
         let mut sources: Vec<Source> = Vec::new();
