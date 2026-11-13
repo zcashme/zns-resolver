@@ -1,7 +1,3 @@
-# ZNS resolver binary (`sync`, `orchard`, `registry`, `jsonrpc`). Watches the registry inbox on Zcash,
-# verifies Orchard note bindings, indexes name→UA, serves JSON-RPC.
-# Deps: seer-sync (chain I/O + relaxed Ironwood Name Note scan), zns-verify
-# (crypto + memos; its decrypt feature via seer-sync), orchard via patched fork.
 [package]
 name = "zns-resolver"
 description = "ZNS resolver: verifies name bindings and maintains a name → UA index."
@@ -26,14 +22,12 @@ mainnet = []
 testnet = []
 
 [dependencies]
-seer-sync = { version = "0.8", default-features = false, features = ["zns-decrypt"] }
+seer-sync = { version = "0.8", default-features = false }
 zns-verify = "0.2.1"
 zcash_address = "0.14"
-orchard = { version = "0.16", default-features = false, features = ["std", "unsafe-zns"] }
+orchard = { version = "0.16", default-features = false, features = ["std"] }
 zcash_protocol = { version = "0.11", default-features = false, features = ["std"] }
 zcash_primitives = { version = "0.31", default-features = false }
-pasta_curves = "0.6"
-group = "0.14"
 rusqlite = { version = "0.32", features = ["bundled"] }
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 serde = { version = "1", features = ["derive"] }
@@ -42,10 +36,6 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = true }
-
-[patch.crates-io]
-# zns-orchard in place of crates.io orchard, for its `unsafe-zns` API.
-orchard = { git = "https://github.com/zcashme/orchard.git", tag = "zns-orchard-v0.16.0" }
 
 [dev-dependencies]
 serde_json = "1"

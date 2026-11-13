@@ -1172,14 +1172,12 @@ fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<Li
         |row| {
             let action =
                 Action::from_bytes(row.get::<_, String>(0)?.as_bytes()).ok_or(corrupt_record())?;
-            // A bound note names its predecessor by cmx; zns-verify's
-            // `Tip.rcm` carries that link.
             let cmx: Vec<u8> = row.get(1)?;
-            let rcm: [u8; 32] = cmx.try_into().map_err(|_| corrupt_record())?;
+            let cmx: [u8; 32] = cmx.try_into().map_err(|_| corrupt_record())?;
             let nullifier: Vec<u8> = row.get(2)?;
             let nullifier: [u8; 32] = nullifier.try_into().map_err(|_| corrupt_record())?;
             Ok(LiveTip {
-                tip: Tip { action, rcm },
+                tip: Tip { action, rcm: cmx },
                 nullifier: TipNf::from_bytes(&nullifier),
             })
         },
@@ -2783,7 +2781,6 @@ mod admission {
                 },
             ],
             ironwood_spends: vec![],
-            relaxed_ironwood_outputs: vec![],
             transparent_outputs: vec![],
             transparent_spends: vec![],
         };

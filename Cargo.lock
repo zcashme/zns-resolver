@@ -1143,7 +1143,8 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "orchard"
 version = "0.16.0"
-source = "git+https://github.com/zcashme/orchard.git?tag=zns-orchard-v0.16.0#6ffdf4ef8825b15b4e436252b6da4e0182ae5d74"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ae7ceb7b5387bd76cf3c0712f57708795c925cecf097036cedb60b5c3706e8f"
 dependencies = [
  "aes",
  "bitvec",
@@ -1731,7 +1732,6 @@ dependencies = [
  "zcash_script",
  "zcash_transparent",
  "zip32",
- "zns-verify",
 ]
 
 [[package]]
@@ -2661,10 +2661,8 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 name = "zns-resolver"
 version = "0.0.3"
 dependencies = [
- "group",
  "jsonrpsee",
  "orchard",
- "pasta_curves",
  "rusqlite",
  "seer-sync",
  "serde",
@@ -2687,9 +2685,6 @@ checksum = "f224dfcf63c7f60342516228ac9eb8ced4748ffd9886934432b32189536fead5"
 dependencies = [
  "blake2b_simd",
  "group",
- "orchard",
  "pasta_curves",
  "sinsemilla",
- "zcash_note_encryption",
- "zcash_protocol",
 ]
