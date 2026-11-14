@@ -61,7 +61,7 @@ const DB_PATH: &str = "zns-testnet.sqlite";
 #[cfg(feature = "mainnet")]
 const MINT_BIRTHDAY: u32 = 3_518_764;
 #[cfg(feature = "testnet")]
-const MINT_BIRTHDAY: u32 = 4_504_792;
+const MINT_BIRTHDAY: u32 = 4_619_162;
 
 /// Where clients send JSON-RPC name queries. Distinct per network so both
 /// resolvers can run on one host.
