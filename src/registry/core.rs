@@ -193,7 +193,7 @@ pub(crate) fn apply_batch(
                     continue;
                 };
                 // Gate: binding — the record gives the note's rseed.
-                if !notes::binds(&note, cand_note) {
+                if !notes::binds(&zns_memo, &note, cand_note) {
                     candidate_dropped("commitment does not bind", &txid, action_index);
                     continue;
                 }
@@ -1183,7 +1183,7 @@ fn read_tip_offline(conn: &Connection, name: &str) -> rusqlite::Result<Option<Li
             let nullifier: Vec<u8> = row.get(2)?;
             let nullifier: [u8; 32] = nullifier.try_into().map_err(|_| corrupt_record())?;
             Ok(LiveTip {
-                tip: Tip { action, rcm: cmx },
+                tip: Tip { action, cmx },
                 nullifier: TipNf::from_bytes(&nullifier),
             })
         },
@@ -1969,7 +1969,7 @@ mod admission {
     use orchard::note::{Note, NoteVersion};
     use zcash_address::unified;
     use zcash_protocol::consensus::Parameters;
-    use zns_verify::{name_note_rseed, Expiry, PrevRcm};
+    use zns_verify::{name_note_rseed, PrevCmx};
 
     const RAW_ADDR: [u8; 43] = [
         7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -2055,22 +2055,11 @@ mod admission {
         let note = NameNote::parse(stored).expect("parsed");
         assert_eq!(note.action().as_str(), action);
         assert_eq!(note.name().as_str(), name);
-        assert_eq!(note.prev_rcm().unwrap_or(PrevRcm::ZERO).as_bytes(), &prev);
+        assert_eq!(note.prev().unwrap_or(PrevCmx::ZERO).as_bytes(), &prev);
         let memo_bytes = stored.text().expect("memo is utf-8").as_bytes();
-        let terms = note.terms();
-        let rseed = name_note_rseed(
-            note.action().as_bytes(),
-            note.name().as_str().as_bytes(),
-            note.ua().as_str().as_bytes(),
-            note.expires_at()
-                .unwrap_or(Expiry::NEVER)
-                .field_bytes()
-                .as_bytes(),
-            &terms[..note.term_count()],
-            &prev,
-        );
+        let rseed = name_note_rseed(stored.fields().expect("fields"), &prev);
         let bound = note_with_rseed(rseed);
-        assert!(notes::binds(&note, &bound));
+        assert!(notes::binds(stored, &note, &bound));
 
         Candidate {
             action_index,
