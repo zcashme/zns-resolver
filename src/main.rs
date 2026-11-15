@@ -59,7 +59,7 @@ const DB_PATH: &str = "zns-testnet.sqlite";
 /// registry_account row keeps its own birthday; this constant only seeds
 /// a first sync.
 #[cfg(feature = "mainnet")]
-const MINT_BIRTHDAY: u32 = 3_518_764;
+const MINT_BIRTHDAY: u32 = 3_575_820;
 #[cfg(feature = "testnet")]
 const MINT_BIRTHDAY: u32 = 4_619_162;
 
