@@ -248,10 +248,23 @@ int? _decodeZec(String text) {
   return _isZats(zats) ? zats : null;
 }
 
+bool _isHeight(int height) => height >= 0 && height <= _maxHeight;
+
 int? _decodeHeight(String text) {
   if (!_decimal.hasMatch(text) || text.length > 10) return null;
   final height = int.parse(text);
-  return height <= _maxHeight ? height : null;
+  return _isHeight(height) ? height : null;
+}
+
+/// The largest whole number a JavaScript number holds exactly, 2^53 - 1: the
+/// TypeScript SDK's bound on a dutch quote's expiry.
+const int _maxUntil = 9007199254740991;
+
+/// A dutch quote's expiry in unix seconds, or `null`.
+int? _decodeUntil(String text) {
+  if (!_decimal.hasMatch(text) || text.length > 16) return null;
+  final until = int.parse(text);
+  return until <= _maxUntil ? until : null;
 }
 
 /// The shape of a transparent public-key-hash address on the UA's network:
@@ -275,9 +288,10 @@ String _termsFields(ListingTerms terms, String ua) {
     case FlatAsk(:final priceZats):
       return '${terms.payTo}:${_encodeZec(priceZats)}';
     case final DutchAsk ask:
-      if (ask.startBlock < 0 ||
-          ask.endBlock > _maxHeight ||
-          !_isValidAuction(ask)) {
+      if (!_isHeight(ask.startBlock) || !_isHeight(ask.endBlock)) {
+        throw FormatException("ZNS: an auction's blocks are heights.", ask);
+      }
+      if (!_isValidAuction(ask)) {
         throw FormatException(
             'ZNS: an auction ends after it starts, and its price falls.', ask);
       }
@@ -486,12 +500,12 @@ BuyOtpMemo? parseBuyOtpMemo(String text) {
         null
       ),
     ['ZNS', 'dutch', final code, final name, final ua, final price, final until]
-        when _decodeZec(price) != null && _decimal.hasMatch(until) =>
+        when _decodeZec(price) != null && _decodeUntil(until) != null =>
       (
         code,
         name,
         ua,
-        DutchQuote(priceZats: _decodeZec(price)!, until: int.parse(until))
+        DutchQuote(priceZats: _decodeZec(price)!, until: _decodeUntil(until)!)
       ),
     _ => (null, null, null, null),
   };

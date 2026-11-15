@@ -68,7 +68,15 @@ void main() {
     });
 
     test('rejects a missing or malformed address', () {
-      for (final address in ['', 'u1abc?amount=1', 'zcash:u1abc', 'u1 abc']) {
+      for (final address in [
+        '',
+        'u1abc?amount=1',
+        'zcash:u1abc',
+        'u1 abc',
+        'u1abc#x',
+        'u1abc%20',
+        'a=b',
+      ]) {
         expect(
             () => buildZip321Uri(address: address), _throwsFormat('address'));
       }
