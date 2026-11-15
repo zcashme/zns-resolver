@@ -18,6 +18,7 @@
 library;
 
 import 'validators.dart';
+import 'zip321.dart' show maxMoneyZec;
 
 /// A registration term: 1-99 whole years, or forever.
 sealed class ZnsTerm {
@@ -213,7 +214,7 @@ final RegExp _sixDigits = RegExp(r'^\d{6}$');
 final RegExp _trailingNuls = RegExp('\x00+\$');
 
 const int _zatsPerZec = 100000000;
-const int _maxZats = 21000000 * _zatsPerZec;
+const int _maxZats = maxMoneyZec * _zatsPerZec;
 const int _maxHeight = 0xffffffff;
 final RegExp _base58Address = RegExp(r'^[1-9A-HJ-NP-Za-km-z]{35}$');
 final RegExp _zec = RegExp(r'^(0|[1-9]\d*)(\.\d{1,8})?$');

@@ -90,7 +90,7 @@ pub struct DutchQuote {
 }
 
 const ZATS_PER_ZEC: u64 = 100_000_000;
-const MAX_ZATS: u64 = 21_000_000 * ZATS_PER_ZEC;
+const MAX_ZATS: u64 = crate::zip321::MAX_ZEC * ZATS_PER_ZEC;
 
 fn six_digits(code: &str) -> bool {
     code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit())
