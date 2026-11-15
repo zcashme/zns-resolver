@@ -1,8 +1,9 @@
 use crate::Error;
 
-pub const ANNUAL_USD_TIERS: [u64; 5] = [10_000, 2_500, 800, 400, 100];
-pub const ANNUAL_USD_MINIMUM: u64 = 20;
-pub const FOREVER_MULTIPLE: u64 = 3;
+/// Annual USD for 1–9 character names, from zns-mint/mint/src/mint/pricing.rs.
+pub const ANNUAL_USD_TIERS: [u64; 9] = [12_480, 2_720, 920, 472, 188, 112, 48, 32, 24];
+pub const ANNUAL_USD_MINIMUM: u64 = 18;
+pub const FOREVER_MULTIPLE: u64 = 4;
 
 /// Annual USD display price by name length. Empty input uses the first tier.
 /// Valid protocol names are ASCII; UTF-16 length matches the Dart helper.
@@ -14,7 +15,7 @@ pub fn annual_usd(name: &str) -> u64 {
         .unwrap_or(ANNUAL_USD_MINIMUM)
 }
 
-/// Forever registration costs three annual prices.
+/// Forever registration costs `FOREVER_MULTIPLE` annual prices.
 pub fn forever_usd(name: &str) -> u64 {
     annual_usd(name) * FOREVER_MULTIPLE
 }

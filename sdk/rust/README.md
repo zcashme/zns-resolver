@@ -98,9 +98,20 @@ fn claim_payment(ua: &str, amount_zec: &str) -> Result<String, zcashname_sdk::Er
   access codes for protected names.
 - `build_update_memo(name, ua, term)` preserves the expiry when `term` is `None`.
 - `build_release_memo(name, ua)` builds a release request.
-- `build_otp_memo(&OtpMemo)` and `parse_otp_memo(text)` handle update/release
-  challenges, including trailing NUL memo padding.
+- `build_otp_memo(&OtpMemo)` and `parse_otp_memo(text)` handle update,
+  release, list, auction and delist challenges, including trailing NUL memo
+  padding. A list or auction challenge carries its `ListingTerms`: the t1 the
+  buyer pays, and the ask.
 - `Term::Years(1..=99)` and `Term::Forever` select the registration term.
+- `build_list_memo(name, ua, pay_to, price_zats)` and
+  `build_auction_memo(name, ua, pay_to, Auction)` list a name at a fixed price,
+  or at a price falling between two block heights. `pay_to` is a `t1` address
+  (`tm` on testnet); its shape is checked, not its checksum.
+- `build_delist_memo(name, ua)` takes a listing down. `build_buy_memo(name, ua)`
+  asks to buy a listed name; `ua` is the buyer's address.
+- `parse_buy_otp_memo(text)` reads the mint's answer to a buy, with the
+  `DutchQuote` for an auction. `buy_payment_zats(price_zats, code)` is what the
+  buyer pays the listing's t1: the price plus the code, read as zatoshis.
 
 Memo builders require canonical names and valid unified address checksums.
 `is_valid_name`, `normalize_name`, and `is_valid_unified_address` are public.
@@ -115,9 +126,9 @@ the corresponding parsing and encoding helpers.
 
 ## Display pricing
 
-`annual_usd(name)` returns USD tiers of 10,000 / 2,500 / 800 / 400 / 100 for
-lengths 1–5, and 20 for longer names. Empty input uses the first tier.
-`forever_usd(name)` charges three annual prices. `quote_zats(usd, zats_per_usd)`
+`annual_usd(name)` returns USD tiers of 12,480 / 2,720 / 920 / 472 / 188 / 112 /
+48 / 32 / 24 for lengths 1–9, and 18 for longer names. Empty input uses the
+first tier. `forever_usd(name)` charges four annual prices. `quote_zats(usd, zats_per_usd)`
 rounds up at a supplied oracle rate and returns `Result<u64, Error>`, rejecting
 negative, non-finite or overflowing values. These are display estimates;
 the mint computes the authoritative payment amount.
