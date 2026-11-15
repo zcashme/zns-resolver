@@ -119,7 +119,12 @@ function isValidUnifiedAddress(address: string): boolean {
 export type ZnsTerm = { years: number } | "forever";
 
 /** Actions the mint challenges with an OTP. Claims are never challenged. */
-export type OtpAction = "update" | "release" | "list" | "auction" | "delist";
+const OTP_ACTIONS = ["update", "release", "list", "auction", "delist"] as const;
+export type OtpAction = (typeof OTP_ACTIONS)[number];
+
+function isOtpAction(action: string): action is OtpAction {
+  return (OTP_ACTIONS as readonly string[]).includes(action);
+}
 
 /** What a buyer pays: a fixed price, or an auction falling from `startZats`
  *  to `minZats` between two block heights. Amounts are zatoshis. */
@@ -270,12 +275,7 @@ export function buildClaimMemo(input: {
     throw new Error("ZNS: the access code is six digits.");
   }
   const term = termField(input.term);
-  if (!isValidName(name)) {
-    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
-  }
-  if (!isValidUnifiedAddress(ua)) {
-    throw new Error("ZNS: not a unified address the mint accepts.");
-  }
+  requireNameAndUa(name, ua);
   return accessCode === undefined
     ? `ZNS:claim:${term}:${name}:${ua}`
     : `ZNS:claim:${accessCode}:${term}:${name}:${ua}`;
@@ -290,24 +290,14 @@ export function buildUpdateMemo(input: {
 }): string {
   const { name, ua } = input;
   const term = input.term === undefined ? "none" : termField(input.term);
-  if (!isValidName(name)) {
-    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
-  }
-  if (!isValidUnifiedAddress(ua)) {
-    throw new Error("ZNS: not a unified address the mint accepts.");
-  }
+  requireNameAndUa(name, ua);
   return `ZNS:update:${term}:${name}:${ua}`;
 }
 
 /** Release request: `ZNS:release:<name>:<ua>`. */
 export function buildReleaseMemo(input: { name: string; ua: string }): string {
   const { name, ua } = input;
-  if (!isValidName(name)) {
-    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
-  }
-  if (!isValidUnifiedAddress(ua)) {
-    throw new Error("ZNS: not a unified address the mint accepts.");
-  }
+  requireNameAndUa(name, ua);
   return `ZNS:release:${name}:${ua}`;
 }
 
@@ -361,7 +351,7 @@ export function buildBuyMemo(input: { name: string; ua: string }): string {
  *  the wallet sends the same text back. */
 export function buildOtpMemo(input: OtpMemo): string {
   const { code, name, action, ua, terms } = input;
-  if (!["update", "release", "list", "auction", "delist"].includes(action)) {
+  if (!isOtpAction(action)) {
     throw new Error("ZNS: only updates, releases, listings and delistings are challenged.");
   }
   if (!SIX_DIGITS_RE.test(code)) {
@@ -386,10 +376,10 @@ export function parseOtpMemo(text: string): OtpMemo | null {
   if (parts.length < 6 || parts[0] !== "ZNS" || parts[1] !== "otp") return null;
   const [, , code, name, action, ua, ...rest] = parts;
   if (!SIX_DIGITS_RE.test(code) || !isValidName(name) || !isValidUnifiedAddress(ua)) return null;
-  if (action === "update" || action === "release" || action === "delist") {
+  if (!isOtpAction(action)) return null;
+  if (action !== "list" && action !== "auction") {
     return rest.length === 0 ? { code, name, action, ua } : null;
   }
-  if (action !== "list" && action !== "auction") return null;
   const terms = parseTermsFields(rest, action === "list", ua);
   return terms === null ? null : { code, name, action, ua, terms };
 }
