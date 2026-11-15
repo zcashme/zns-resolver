@@ -1,7 +1,10 @@
 import 'dart:convert';
 
-/// ZIP-321 limits: the largest payment amount in ZEC, and the memo size.
-const int _maxMoney = 21000000;
+/// The money supply: no amount exceeds 21,000,000 ZEC. Not exported: the
+/// package names this file's exports.
+const int maxMoneyZec = 21000000;
+
+/// ZIP-321 limit: the memo size.
 const int _maxMemoBytes = 512;
 
 final RegExp _amountRegExp = RegExp(r'^\d+(\.\d{1,8})?$');
@@ -75,11 +78,11 @@ String buildZip321Uri({
     final [whole, ...rest] = amount.split('.');
     final fraction = rest.isEmpty ? '' : rest.first;
     final wholeZec = BigInt.parse(whole);
-    final max = BigInt.from(_maxMoney);
+    final max = BigInt.from(maxMoneyZec);
     if (wholeZec > max ||
         (wholeZec == max && fraction.contains(RegExp('[1-9]')))) {
       throw FormatException(
-          'ZNS: the amount is more than $_maxMoney ZEC.', amount);
+          'ZNS: the amount is more than $maxMoneyZec ZEC.', amount);
     }
     params.add('amount=$amount');
   }

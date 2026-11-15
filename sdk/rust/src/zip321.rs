@@ -44,12 +44,18 @@ fn valid_amount(amount: &str) -> bool {
     if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
         return false;
     }
+    // Leading zeros are allowed; past them, more than eight digits is over
+    // the limit, and eight or fewer fit a u64.
     let whole = whole.trim_start_matches('0');
-    // Compare decimal strings to avoid overflow and floating-point rounding.
-    whole.len() < 8
-        || (whole.len() == 8
-            && (whole < "21000000" || (whole == "21000000" && fraction.bytes().all(|b| b == b'0'))))
+    if whole.len() > 8 {
+        return false;
+    }
+    let whole: u64 = whole.parse().unwrap_or(0);
+    whole < MAX_ZEC || (whole == MAX_ZEC && fraction.bytes().all(|b| b == b'0'))
 }
+
+/// The money supply: no amount exceeds 21,000,000 ZEC.
+pub(crate) const MAX_ZEC: u64 = 21_000_000;
 
 /// Single-recipient ZIP-321 URI. Amounts have at most eight decimal places
 /// and cannot exceed 21,000,000 ZEC. Memos are at most 512 UTF-8 bytes.
