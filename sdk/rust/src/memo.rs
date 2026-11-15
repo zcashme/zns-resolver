@@ -143,6 +143,16 @@ fn decode_height(text: &str) -> Option<u32> {
     decimal(text).then(|| text.parse().ok()).flatten()
 }
 
+/// A dutch quote's expiry in unix seconds, at most 2^53 - 1: the largest
+/// whole number a JavaScript number holds exactly, the TypeScript SDK's bound.
+fn decode_until(text: &str) -> Option<u64> {
+    const MAX_UNTIL: u64 = (1 << 53) - 1;
+    decimal(text)
+        .then(|| text.parse().ok())
+        .flatten()
+        .filter(|until| *until <= MAX_UNTIL)
+}
+
 /// The shape of a transparent public-key-hash address on the UA's network:
 /// `t1` on mainnet, `tm` on testnet, 35 base58 characters. The checksum is
 /// not verified; the mint refuses a bad one and keeps the listing fee.
@@ -389,7 +399,7 @@ pub fn parse_buy_otp_memo(text: &str) -> Option<BuyOtpMemo> {
             ua,
             Some(DutchQuote {
                 price_zats: decode_zec(price)?,
-                until: decimal(until).then(|| until.parse().ok()).flatten()?,
+                until: decode_until(until)?,
             }),
         ),
         _ => return None,

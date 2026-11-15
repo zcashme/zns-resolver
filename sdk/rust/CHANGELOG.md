@@ -10,6 +10,8 @@
   `build_delist_memo`, `build_buy_memo`, `parse_buy_otp_memo` and
   `buy_payment_zats`. `OtpAction` adds `List`, `Auction` and `Delist`, and
   `OtpMemo` carries a list or auction challenge's `terms`.
+- `parse_buy_otp_memo` refuses a dutch expiry above 2^53 - 1, matching the
+  TypeScript SDK.
 - Bring the Rust SDK to feature parity with Dart SDK 0.8.0: claim, update,
   release and OTP memo builders; OTP parsing; ZIP-321 payment URI helpers;
   unified address validation; and annual/forever USD pricing with zatoshi
