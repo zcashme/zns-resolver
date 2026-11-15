@@ -10,6 +10,9 @@
   `buildDelistMemo`, `buildBuyMemo`, `parseBuyOtpMemo` and `buyPaymentZats`.
   `OtpAction` adds `list`, `auction` and `delist`, and `OtpMemo` carries a
   list or auction challenge's `terms`.
+- Match the TypeScript SDK: `parseBuyOtpMemo` refuses a dutch expiry above
+  2^53 - 1, `buildZip321Uri` accepts only ASCII letters and digits in the
+  address, and an auction block that is not a height gets its own error.
 
 ## 0.8.0
 

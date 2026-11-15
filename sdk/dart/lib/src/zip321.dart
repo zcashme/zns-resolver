@@ -8,7 +8,7 @@ const int maxMoneyZec = 21000000;
 const int _maxMemoBytes = 512;
 
 final RegExp _amountRegExp = RegExp(r'^\d+(\.\d{1,8})?$');
-final RegExp _addressStop = RegExp(r'[?&:\s]');
+final RegExp _addressChars = RegExp(r'^[A-Za-z0-9]+$');
 
 /// Parsed components of a `zcash:` ZIP-321 payment URI.
 class Zip321Parts {
@@ -63,8 +63,12 @@ String buildZip321Uri({
   String? amount,
   String? memo,
 }) {
-  if (address.isEmpty || _addressStop.hasMatch(address)) {
-    throw FormatException('ZNS: a payment URI needs an address.', address);
+  // Zcash addresses (Bech32, Bech32m, Base58Check) are ASCII letters and
+  // digits only, so no URI delimiter (`?`, `&`, `#`, ...) can slip through.
+  if (!_addressChars.hasMatch(address)) {
+    throw FormatException(
+        'ZNS: a payment URI needs an address of ASCII letters and digits.',
+        address);
   }
   final params = <String>[];
   if (amount != null) {

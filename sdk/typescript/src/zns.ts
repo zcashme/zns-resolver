@@ -395,8 +395,9 @@ export function parseBuyOtpMemo(text: string): BuyOtpMemo | null {
   if (!SIX_DIGITS_RE.test(code) || !isValidName(name) || !isValidUnifiedAddress(ua)) return null;
   if (verb === "buyotp") return { code, name, ua };
   const priceZats = decodeZec(price);
-  if (priceZats === null || !HEIGHT_RE.test(until)) return null;
-  return { code, name, ua, dutch: { priceZats, until: Number(until) } };
+  const untilSecs = Number(until);
+  if (priceZats === null || !HEIGHT_RE.test(until) || !Number.isSafeInteger(untilSecs)) return null;
+  return { code, name, ua, dutch: { priceZats, until: untilSecs } };
 }
 
 /** What a buyer pays to the listing's t1: the price plus the buy code, the
@@ -424,8 +425,10 @@ export function buildZip321Uri(input: {
   amount?: string;
   memo?: string;
 }): string {
-  if (!input.address || /[?&:\s]/.test(input.address)) {
-    throw new Error("ZNS: a payment URI needs an address.");
+  // Zcash addresses (Bech32, Bech32m, Base58Check) are ASCII letters and
+  // digits only, so no URI delimiter (`?`, `&`, `#`, ...) can slip through.
+  if (!/^[A-Za-z0-9]+$/.test(input.address)) {
+    throw new Error("ZNS: a payment URI needs an address of ASCII letters and digits.");
   }
   const params: string[] = [];
   if (input.amount !== undefined) {
@@ -564,19 +567,15 @@ export class ZNS {
   }
 
   /** Resolve a Zcash Unified Address to all names pointing to it. Returns empty array if none.
-   *  Supports pagination with limit (default 50, max 500) and offset (default 0). */
+   *  Supports pagination with limit (default 50, max 500) and offset (default 0).
+   *  The items of {@link reverseLookup}. */
   async resolveAddress(
     address: string,
     limit?: number,
     offset?: number,
     signal?: AbortSignal,
   ): Promise<Registration[]> {
-    const raw = await this.rpc<Record<string, unknown>[]>(
-      "resolve",
-      { query: address, limit, offset },
-      signal,
-    );
-    return raw.map((r) => registration(r));
+    return (await this.reverseLookup(address, limit, offset, signal)).items;
   }
 
   /** Reverse lookup: all names currently bound to a unified address, with
@@ -657,9 +656,11 @@ export class ZNS {
     filter?: EventsFilter,
     signal?: AbortSignal,
   ): Promise<EventsResult> {
+    // The name is normalized like {@link resolveName}: the resolver matches it exactly.
+    const name = filter?.name === undefined ? undefined : normalizeName(filter.name);
     const raw = await this.rpc<Record<string, unknown>>(
       "events",
-      toRpcParams((filter ?? {}) as Record<string, unknown>),
+      toRpcParams({ ...filter, name }),
       signal,
     );
     return eventsResult(raw);

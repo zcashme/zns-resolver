@@ -149,6 +149,8 @@ void main() {
           _throwsFormat('ends after'));
       expect(() => auctionWith(minZats: auction.startZats),
           _throwsFormat('falls'));
+      expect(() => auctionWith(endBlock: 0x100000000),
+          _throwsFormat('blocks are heights'));
     });
 
     test('reads back list and auction challenges with their terms', () {
@@ -210,6 +212,13 @@ void main() {
       expect(parseBuyOtpMemo('ZNS:otp:004206:alice:update:$_ua'), isNull);
       expect(parseBuyOtpMemo('ZNS:buyotp:004206:alice:$_ua:3.25'), isNull);
       expect(parseBuyOtpMemo('ZNS:dutch:004206:alice:$_ua:3.25'), isNull);
+      // An expiry past 2^53 - 1 is refused, as in TypeScript, and an
+      // overlong one returns null instead of throwing.
+      expect(
+          parseBuyOtpMemo('ZNS:dutch:004206:alice:$_ua:3.25:9007199254740992'),
+          isNull);
+      expect(parseBuyOtpMemo('ZNS:dutch:004206:alice:$_ua:3.25:${'9' * 40}'),
+          isNull);
     });
 
     test('pays the price plus the buy code in zatoshis', () {

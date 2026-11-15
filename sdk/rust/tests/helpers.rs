@@ -222,6 +222,9 @@ fn buy_answers_parse_and_pay_price_plus_code() {
         format!("ZNS:otp:004206:alice:update:{UA}"),
         format!("ZNS:buyotp:004206:alice:{UA}:3.25"),
         format!("ZNS:dutch:004206:alice:{UA}:3.25"),
+        // An expiry past 2^53 - 1 is refused, as in TypeScript.
+        format!("ZNS:dutch:004206:alice:{UA}:3.25:9007199254740992"),
+        format!("ZNS:dutch:004206:alice:{UA}:3.25:{}", "9".repeat(40)),
     ] {
         assert_eq!(parse_buy_otp_memo(&text), None);
     }

@@ -158,7 +158,7 @@ describe("ZNS", () => {
       vi.unstubAllGlobals();
     });
 
-    it("sends lowercase event filters using resolver parameter names", async () => {
+    it("sends normalized event filters using resolver parameter names", async () => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
         request = JSON.parse(init.body);
@@ -179,7 +179,7 @@ describe("ZNS", () => {
         } }) };
       }));
 
-      const result = await zns.events({ name: "alice", action: "update", sinceHeight: 100 });
+      const result = await zns.events({ name: " Alice ", action: "update", sinceHeight: 100 });
       expect(request?.params).toEqual({ name: "alice", action: "update", since_height: 100 });
       expect(result.events[0]).toMatchObject({
         action: "update",
@@ -359,6 +359,11 @@ describe("ZNS", () => {
       expect(request?.params).toEqual({ address: VALID_TESTNET_UA, limit: 1, offset: 0 });
       expect(page.total).toBe(3);
       expect(page.items[0]).toMatchObject({ name: "alice", lastAction: "claim" });
+
+      // resolveAddress is the same lookup, its items only.
+      const items = await zns.resolveAddress(VALID_TESTNET_UA, 1, 0);
+      expect(request?.method).toBe("reverse_lookup");
+      expect(items).toEqual(page.items);
     });
 
     it("calls the typed list_names verb", async () => {

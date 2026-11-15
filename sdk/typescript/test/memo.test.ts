@@ -122,6 +122,9 @@ describe("marketplace memos", () => {
     expect(parseBuyOtpMemo(`ZNS:otp:004206:alice:update:${UA}`)).toBeNull();
     expect(parseBuyOtpMemo(`ZNS:buyotp:004206:alice:${UA}:3.25`)).toBeNull();
     expect(parseBuyOtpMemo(`ZNS:dutch:004206:alice:${UA}:3.25`)).toBeNull();
+    // An expiry past 2^53 - 1 cannot be held exactly, so it is refused.
+    expect(parseBuyOtpMemo(`ZNS:dutch:004206:alice:${UA}:3.25:9007199254740992`)).toBeNull();
+    expect(parseBuyOtpMemo(`ZNS:dutch:004206:alice:${UA}:3.25:${"9".repeat(40)}`)).toBeNull();
   });
 
   it("pays the price plus the buy code in zatoshis", () => {
@@ -187,5 +190,11 @@ describe("buildZip321Uri", () => {
     const taddr = "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs";
     expect(buildZip321Uri({ address: taddr, amount: "1" })).toBe(`zcash:${taddr}?amount=1`);
     expect(() => buildZip321Uri({ address: taddr, memo: "hi" })).toThrow(/transparent/);
+  });
+
+  it("rejects an address with a URI delimiter in it", () => {
+    for (const address of ["", `${TESTNET_UA}#x`, `${TESTNET_UA}%20`, "a=b", "u1 x"]) {
+      expect(() => buildZip321Uri({ address, amount: "1" })).toThrow(/address/);
+    }
   });
 });
