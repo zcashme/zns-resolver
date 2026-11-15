@@ -56,9 +56,9 @@ async function main() {
     case "resolve": {
       const query = positional[0];
       if (!query) throw new Error("Usage: zns resolve <name-or-address>");
-      const result = query.startsWith("u")
-        ? await zns.resolveAddress(query)
-        : await zns.resolveName(query);
+      const result = zns.isValidName(zns.normalizeName(query))
+        ? await zns.resolveName(query)
+        : await zns.resolveAddress(query);
       const records = Array.isArray(result) ? result : result ? [result] : [];
       if (records.length === 0) {
         console.log("Not found");
@@ -86,7 +86,6 @@ async function main() {
       console.log(`Height:     ${status.syncedHeight}`);
       console.log(`Synced:     ${status.synced}`);
       console.log(`Viewing key: ${status.viewingKey.slice(0, 30)}...`);
-      console.log(`Registered: ${status.registered}`);
       break;
     }
     case "events": {
