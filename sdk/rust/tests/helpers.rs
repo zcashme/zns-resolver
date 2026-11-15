@@ -49,7 +49,8 @@ fn rejects_invalid_mint_inputs() {
             code: code.into(),
             name: "alice".into(),
             action: OtpAction::Update,
-            ua: UA.into()
+            ua: UA.into(),
+            terms: None,
         })
         .is_err());
     }
@@ -63,12 +64,13 @@ fn rejects_invalid_mint_inputs() {
 
 #[test]
 fn otp_challenges_round_trip_with_memo_padding() {
-    for action in [OtpAction::Update, OtpAction::Release] {
+    for action in [OtpAction::Update, OtpAction::Release, OtpAction::Delist] {
         let memo = OtpMemo {
             code: "004206".into(),
             name: "alice".into(),
             action,
             ua: UA.into(),
+            terms: None,
         };
         let text = build_otp_memo(&memo).unwrap();
         assert_eq!(
@@ -91,6 +93,143 @@ fn otp_challenges_round_trip_with_memo_padding() {
     ] {
         assert_eq!(parse_otp_memo(text), None);
     }
+}
+
+// A mainnet public-key-hash address: where a buyer pays.
+const T1: &str = "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs";
+const AUCTION: Auction = Auction {
+    start_zats: 500_000_000,
+    min_zats: 150_000_000,
+    start_block: 3_600_000,
+    end_block: 3_610_000,
+};
+
+#[test]
+fn marketplace_memos_match_the_mint_grammar() {
+    assert_eq!(
+        build_list_memo("alice", UA, T1, 250_000_000).unwrap(),
+        format!("ZNS:list:alice:{UA}:{T1}:2.5")
+    );
+    assert_eq!(
+        build_list_memo("alice", UA, T1, 1).unwrap(),
+        format!("ZNS:list:alice:{UA}:{T1}:0.00000001")
+    );
+    assert_eq!(
+        build_auction_memo("alice", UA, T1, AUCTION).unwrap(),
+        format!("ZNS:auction:alice:{UA}:{T1}:5:1.5:3600000:3610000")
+    );
+    assert_eq!(
+        build_delist_memo("alice", UA).unwrap(),
+        format!("ZNS:delist:alice:{UA}")
+    );
+    assert_eq!(
+        build_buy_memo("alice", UA).unwrap(),
+        format!("ZNS:buy:alice:{UA}")
+    );
+}
+
+#[test]
+fn rejects_listing_terms_the_mint_refuses() {
+    assert!(build_list_memo("alice", UA, UA, 1).is_err());
+    // A testnet address for a mainnet name.
+    assert!(build_list_memo("alice", UA, "tmEZhbWHTpdKMw5it8YDspUXSMGQyFwovpU", 1).is_err());
+    assert!(build_list_memo("alice", UA, T1, 21_000_001 * 100_000_000).is_err());
+    let ends_at_start = Auction {
+        end_block: AUCTION.start_block,
+        ..AUCTION
+    };
+    let flat = Auction {
+        min_zats: AUCTION.start_zats,
+        ..AUCTION
+    };
+    assert!(build_auction_memo("alice", UA, T1, ends_at_start).is_err());
+    assert!(build_auction_memo("alice", UA, T1, flat).is_err());
+}
+
+#[test]
+fn listing_challenges_round_trip_with_their_terms() {
+    for (action, ask, tail) in [
+        (OtpAction::List, Ask::Flat(250_000_000), "2.5"),
+        (
+            OtpAction::Auction,
+            Ask::Dutch(AUCTION),
+            "5:1.5:3600000:3610000",
+        ),
+    ] {
+        let memo = OtpMemo {
+            code: "417293".into(),
+            name: "alice".into(),
+            action,
+            ua: UA.into(),
+            terms: Some(ListingTerms {
+                pay_to: T1.into(),
+                ask,
+            }),
+        };
+        let text = build_otp_memo(&memo).unwrap();
+        assert_eq!(
+            text,
+            format!("ZNS:otp:417293:alice:{}:{UA}:{T1}:{tail}", action.as_str())
+        );
+        assert_eq!(parse_otp_memo(&text), Some(memo));
+    }
+    for text in [
+        format!("ZNS:otp:417293:alice:list:{UA}"),
+        format!("ZNS:otp:417293:alice:list:{UA}:{T1}:5:1.5:3600000:3610000"),
+        format!("ZNS:otp:417293:alice:auction:{UA}:{T1}:1.5:5:3600000:3610000"),
+        format!("ZNS:otp:417293:alice:delist:{UA}:{T1}:2.5"),
+        format!("ZNS:otp:417293:alice:list:{UA}:{T1}:02.5"),
+    ] {
+        assert_eq!(parse_otp_memo(&text), None);
+    }
+    assert!(build_otp_memo(&OtpMemo {
+        code: "417293".into(),
+        name: "alice".into(),
+        action: OtpAction::Update,
+        ua: UA.into(),
+        terms: Some(ListingTerms {
+            pay_to: T1.into(),
+            ask: Ask::Flat(1),
+        }),
+    })
+    .is_err());
+}
+
+#[test]
+fn buy_answers_parse_and_pay_price_plus_code() {
+    assert_eq!(
+        parse_buy_otp_memo(&format!("ZNS:buyotp:004206:alice:{UA}")),
+        Some(BuyOtpMemo {
+            code: "004206".into(),
+            name: "alice".into(),
+            ua: UA.into(),
+            dutch: None,
+        })
+    );
+    assert_eq!(
+        parse_buy_otp_memo(&format!("ZNS:dutch:004206:alice:{UA}:3.25:1763215200\0\0")),
+        Some(BuyOtpMemo {
+            code: "004206".into(),
+            name: "alice".into(),
+            ua: UA.into(),
+            dutch: Some(DutchQuote {
+                price_zats: 325_000_000,
+                until: 1_763_215_200,
+            }),
+        })
+    );
+    for text in [
+        format!("ZNS:otp:004206:alice:update:{UA}"),
+        format!("ZNS:buyotp:004206:alice:{UA}:3.25"),
+        format!("ZNS:dutch:004206:alice:{UA}:3.25"),
+    ] {
+        assert_eq!(parse_buy_otp_memo(&text), None);
+    }
+    assert_eq!(
+        buy_payment_zats(250_000_000, "004206").unwrap(),
+        250_004_206
+    );
+    assert!(buy_payment_zats(250_000_000, "4206").is_err());
 }
 
 #[test]
@@ -120,20 +259,24 @@ fn unified_address_checksum_and_lengths_are_validated() {
 #[test]
 fn pricing_matches_dart_protocol_tiers_and_rounds_up() {
     for (name, price) in [
-        ("", 10000),
-        ("a", 10000),
-        ("ab", 2500),
-        ("abc", 800),
-        ("abcd", 400),
-        ("alice", 100),
-        ("abcdef", 20),
-        (&"a".repeat(63), 20),
+        ("", 12480),
+        ("a", 12480),
+        ("ab", 2720),
+        ("abc", 920),
+        ("abcd", 472),
+        ("alice", 188),
+        ("abcdef", 112),
+        ("abcdefg", 48),
+        ("abcdefgh", 32),
+        ("abcdefghi", 24),
+        ("abcdefghij", 18),
+        (&"a".repeat(63), 18),
     ] {
         assert_eq!(annual_usd(name), price);
-        assert_eq!(forever_usd(name), price * 3);
+        assert_eq!(forever_usd(name), price * 4);
     }
-    assert_eq!(quote_zats(800.0, 1000.0).unwrap(), 800000);
-    assert_eq!(quote_zats(20.0, 333.0).unwrap(), 6660);
+    assert_eq!(quote_zats(920.0, 1000.0).unwrap(), 920000);
+    assert_eq!(quote_zats(18.0, 333.0).unwrap(), 5994);
     assert_eq!(quote_zats(1.0, 0.5).unwrap(), 1);
     assert_eq!(quote_zats(0.0, 1.0).unwrap(), 0);
     for (usd, rate) in [

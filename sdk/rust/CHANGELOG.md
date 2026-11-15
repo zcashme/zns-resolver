@@ -3,6 +3,13 @@
 ## 0.2.0 (unreleased)
 
 - `Action` accepts `sale`, `list`, `auction`, and `delist`.
+- Pricing matches the mint: nine tiers for 1–9 character names (12,480 / 2,720
+  / 920 / 472 / 188 / 112 / 48 / 32 / 24 USD), a minimum of 18 USD from 10
+  characters, and forever at four annual prices.
+- Marketplace memos: `build_list_memo`, `build_auction_memo`,
+  `build_delist_memo`, `build_buy_memo`, `parse_buy_otp_memo` and
+  `buy_payment_zats`. `OtpAction` adds `List`, `Auction` and `Delist`, and
+  `OtpMemo` carries a list or auction challenge's `terms`.
 - Bring the Rust SDK to feature parity with Dart SDK 0.8.0: claim, update,
   release and OTP memo builders; OTP parsing; ZIP-321 payment URI helpers;
   unified address validation; and annual/forever USD pricing with zatoshi

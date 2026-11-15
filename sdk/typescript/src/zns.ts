@@ -105,19 +105,50 @@ function isValidUnifiedAddress(address: string): boolean {
 //   Claim a protected name:  ZNS:claim:<access code>:<term>:<name>:<ua>
 //   Update:                  ZNS:update:<term or none>:<name>:<ua>
 //   Release:                 ZNS:release:<name>:<ua>
-//   OTP reply:               ZNS:otp:<otp code>:<name>:<update or release>:<ua>
+//   List at a price:         ZNS:list:<name>:<ua>:<t1>:<price>
+//   List as an auction:      ZNS:auction:<name>:<ua>:<t1>:<start>:<min>:<start block>:<end block>
+//   Delist:                  ZNS:delist:<name>:<ua>
+//   Buy:                     ZNS:buy:<name>:<buyer ua>
+//   OTP reply:               ZNS:otp:<otp code>:<name>:<action>:<ua>[:<t1>:<terms>]
+//
+// The mint answers a buy with ZNS:buyotp:<code>:<name>:<buyer ua>, or for an
+// auction ZNS:dutch:<code>:<name>:<buyer ua>:<price>:<until>. The buyer pays
+// the price plus the code, read as zatoshis, to the listing's t1.
 
 /** A registration term: 1–99 whole years, or forever. */
 export type ZnsTerm = { years: number } | "forever";
 
 /** Actions the mint challenges with an OTP. Claims are never challenged. */
-export type OtpAction = "update" | "release";
+export type OtpAction = "update" | "release" | "list" | "auction" | "delist";
+
+/** What a buyer pays: a fixed price, or an auction falling from `startZats`
+ *  to `minZats` between two block heights. Amounts are zatoshis. */
+export type ListingAsk =
+  | { kind: "flat"; priceZats: number }
+  | { kind: "dutch"; startZats: number; minZats: number; startBlock: number; endBlock: number };
+
+/** A listing's terms: the transparent address the buyer pays, and the ask. */
+export interface ListingTerms {
+  payTo: string;
+  ask: ListingAsk;
+}
 
 export interface OtpMemo {
   code: string;
   name: string;
   action: OtpAction;
   ua: string;
+  /** Present exactly when `action` is `list` (a flat ask) or `auction` (a dutch ask). */
+  terms?: ListingTerms;
+}
+
+/** The mint's answer to a buy. `dutch` is set for an auction: the price the
+ *  buyer's block fixed, and the unix time the quote holds until. */
+export interface BuyOtpMemo {
+  code: string;
+  name: string;
+  ua: string;
+  dutch?: { priceZats: number; until: number };
 }
 
 const MAX_TERM_YEARS = 99;
@@ -134,6 +165,96 @@ function termField(term: ZnsTerm): string {
     throw new Error("ZNS: a term is 1-99 years, or forever.");
   }
   return `${years}y`;
+}
+
+const ZATS_PER_ZEC = 100_000_000;
+const MAX_ZATS = MAX_MONEY * ZATS_PER_ZEC;
+const MAX_HEIGHT = 2 ** 32 - 1;
+const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{35}$/;
+const ZEC_RE = /^(0|[1-9]\d*)(\.\d{1,8})?$/;
+const HEIGHT_RE = /^(0|[1-9]\d*)$/;
+
+function isZats(zats: number): boolean {
+  return Number.isSafeInteger(zats) && zats >= 0 && zats <= MAX_ZATS;
+}
+
+/** Zatoshis as the mint writes ZEC: whole zatoshis stay an integer, and a
+ *  fraction drops trailing zeros (`5`, `1.5`, `0.00000001`). */
+function encodeZec(zats: number): string {
+  if (!isZats(zats)) throw new Error("ZNS: an amount is whole zatoshis within the money supply.");
+  const whole = Math.floor(zats / ZATS_PER_ZEC);
+  const frac = zats % ZATS_PER_ZEC;
+  if (frac === 0) return `${whole}`;
+  return `${whole}.${frac.toString().padStart(8, "0").replace(/0+$/, "")}`;
+}
+
+/** ZEC text as the mint reads it, in zatoshis, or null. */
+function decodeZec(text: string): number | null {
+  if (!ZEC_RE.test(text)) return null;
+  const [whole, frac = ""] = text.split(".");
+  const zats = Number(whole) * ZATS_PER_ZEC + Number(frac.padEnd(8, "0"));
+  return isZats(zats) ? zats : null;
+}
+
+function isHeight(height: number): boolean {
+  return Number.isInteger(height) && height >= 0 && height <= MAX_HEIGHT;
+}
+
+function decodeHeight(text: string): number | null {
+  if (!HEIGHT_RE.test(text)) return null;
+  const height = Number(text);
+  return isHeight(height) ? height : null;
+}
+
+/**
+ * The shape of a transparent public-key-hash address on the UA's network:
+ * `t1` on mainnet, `tm` on testnet, 35 base58 characters. The checksum is
+ * not verified; the mint refuses a bad one and keeps the listing fee.
+ */
+function isPayTo(address: string, ua: string): boolean {
+  return BASE58_RE.test(address) && address.startsWith(ua.startsWith("utest1") ? "tm" : "t1");
+}
+
+function requireNameAndUa(name: string, ua: string): void {
+  if (!isValidName(name)) {
+    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  }
+  if (!isValidUnifiedAddress(ua)) {
+    throw new Error("ZNS: not a unified address the mint accepts.");
+  }
+}
+
+/** `<t1>:<price>`, or `<t1>:<start>:<min>:<start block>:<end block>`. */
+function termsFields(terms: ListingTerms, ua: string): string {
+  if (!isPayTo(terms.payTo, ua)) {
+    throw new Error("ZNS: pay to a transparent t1 address on the name's network.");
+  }
+  const { ask } = terms;
+  if (ask.kind === "flat") return `${terms.payTo}:${encodeZec(ask.priceZats)}`;
+  if (!isHeight(ask.startBlock) || !isHeight(ask.endBlock)) {
+    throw new Error("ZNS: an auction's blocks are heights.");
+  }
+  if (ask.endBlock <= ask.startBlock || ask.startZats <= ask.minZats) {
+    throw new Error("ZNS: an auction ends after it starts, and its price falls.");
+  }
+  return `${terms.payTo}:${encodeZec(ask.startZats)}:${encodeZec(ask.minZats)}:${ask.startBlock}:${ask.endBlock}`;
+}
+
+/** Reads `<t1>:<terms>` back. `fields` are the parts after the UA. */
+function parseTermsFields(fields: string[], flat: boolean, ua: string): ListingTerms | null {
+  const [payTo, ...rest] = fields;
+  if (payTo === undefined || !isPayTo(payTo, ua)) return null;
+  if (flat) {
+    if (rest.length !== 1) return null;
+    const priceZats = decodeZec(rest[0]);
+    return priceZats === null ? null : { payTo, ask: { kind: "flat", priceZats } };
+  }
+  if (rest.length !== 4) return null;
+  const [startZats, minZats] = [decodeZec(rest[0]), decodeZec(rest[1])];
+  const [startBlock, endBlock] = [decodeHeight(rest[2]), decodeHeight(rest[3])];
+  if (startZats === null || minZats === null || startBlock === null || endBlock === null) return null;
+  if (endBlock <= startBlock || startZats <= minZats) return null;
+  return { payTo, ask: { kind: "dutch", startZats, minZats, startBlock, endBlock } };
 }
 
 /** Claim request: `ZNS:claim:<term>:<name>:<ua>`. To claim a protected name,
@@ -190,34 +311,113 @@ export function buildReleaseMemo(input: { name: string; ua: string }): string {
   return `ZNS:release:${name}:${ua}`;
 }
 
-/** OTP memo: `ZNS:otp:<otp code>:<name>:<update or release>:<ua>`. The mint sends
- *  it as the challenge; the wallet sends the same text back. */
+/** List request: `ZNS:list:<name>:<ua>:<t1>:<price>`. `ua` is the name's
+ *  current address; a buyer pays `priceZats` to `payTo`. */
+export function buildListMemo(input: {
+  name: string;
+  ua: string;
+  payTo: string;
+  priceZats: number;
+}): string {
+  const { name, ua, payTo, priceZats } = input;
+  requireNameAndUa(name, ua);
+  return `ZNS:list:${name}:${ua}:${termsFields({ payTo, ask: { kind: "flat", priceZats } }, ua)}`;
+}
+
+/** Auction request: `ZNS:auction:<name>:<ua>:<t1>:<start>:<min>:<start block>:<end block>`.
+ *  The price falls from `startZats` at `startBlock` to `minZats` at `endBlock`. */
+export function buildAuctionMemo(input: {
+  name: string;
+  ua: string;
+  payTo: string;
+  startZats: number;
+  minZats: number;
+  startBlock: number;
+  endBlock: number;
+}): string {
+  const { name, ua, payTo, startZats, minZats, startBlock, endBlock } = input;
+  requireNameAndUa(name, ua);
+  const ask = { kind: "dutch" as const, startZats, minZats, startBlock, endBlock };
+  return `ZNS:auction:${name}:${ua}:${termsFields({ payTo, ask }, ua)}`;
+}
+
+/** Delist request: `ZNS:delist:<name>:<ua>`. */
+export function buildDelistMemo(input: { name: string; ua: string }): string {
+  const { name, ua } = input;
+  requireNameAndUa(name, ua);
+  return `ZNS:delist:${name}:${ua}`;
+}
+
+/** Buy request: `ZNS:buy:<name>:<ua>`. `ua` is the buyer's address, the one
+ *  the sale binds the name to. */
+export function buildBuyMemo(input: { name: string; ua: string }): string {
+  const { name, ua } = input;
+  requireNameAndUa(name, ua);
+  return `ZNS:buy:${name}:${ua}`;
+}
+
+/** OTP memo: `ZNS:otp:<otp code>:<name>:<action>:<ua>`, with `:<t1>:<terms>`
+ *  after the UA for a list or an auction. The mint sends it as the challenge;
+ *  the wallet sends the same text back. */
 export function buildOtpMemo(input: OtpMemo): string {
-  const { code, name, action, ua } = input;
-  if (action !== "update" && action !== "release") {
-    throw new Error("ZNS: only updates and releases are challenged.");
+  const { code, name, action, ua, terms } = input;
+  if (!["update", "release", "list", "auction", "delist"].includes(action)) {
+    throw new Error("ZNS: only updates, releases, listings and delistings are challenged.");
   }
   if (!SIX_DIGITS_RE.test(code)) {
     throw new Error("ZNS: the OTP code is six digits.");
   }
-  if (!isValidName(name)) {
-    throw new Error("ZNS: a name is 1-63 characters: lowercase letters and digits only.");
+  requireNameAndUa(name, ua);
+  const listed = action === "list" || action === "auction";
+  if (listed !== (terms !== undefined)) {
+    throw new Error("ZNS: a list or auction challenge carries its terms, and no other does.");
   }
-  if (!isValidUnifiedAddress(ua)) {
-    throw new Error("ZNS: not a unified address the mint accepts.");
+  if (terms === undefined) return `ZNS:otp:${code}:${name}:${action}:${ua}`;
+  if ((action === "list") !== (terms.ask.kind === "flat")) {
+    throw new Error("ZNS: a list has a flat price, and an auction a falling one.");
   }
-  return `ZNS:otp:${code}:${name}:${action}:${ua}`;
+  return `ZNS:otp:${code}:${name}:${action}:${ua}:${termsFields(terms, ua)}`;
 }
 
 /** Read a mint challenge. Returns null for anything that is not an OTP memo.
  *  Trailing NUL padding from a 512-byte memo field is ignored. */
 export function parseOtpMemo(text: string): OtpMemo | null {
   const parts = text.replace(/\0+$/, "").split(":");
-  if (parts.length !== 6 || parts[0] !== "ZNS" || parts[1] !== "otp") return null;
-  const [, , code, name, action, ua] = parts;
+  if (parts.length < 6 || parts[0] !== "ZNS" || parts[1] !== "otp") return null;
+  const [, , code, name, action, ua, ...rest] = parts;
   if (!SIX_DIGITS_RE.test(code) || !isValidName(name) || !isValidUnifiedAddress(ua)) return null;
-  if (action !== "update" && action !== "release") return null;
-  return { code, name, action, ua };
+  if (action === "update" || action === "release" || action === "delist") {
+    return rest.length === 0 ? { code, name, action, ua } : null;
+  }
+  if (action !== "list" && action !== "auction") return null;
+  const terms = parseTermsFields(rest, action === "list", ua);
+  return terms === null ? null : { code, name, action, ua, terms };
+}
+
+/** Read the mint's answer to a buy: `ZNS:buyotp:<code>:<name>:<ua>`, or
+ *  `ZNS:dutch:<code>:<name>:<ua>:<price>:<until>` for an auction. Returns
+ *  null for anything else. Trailing NUL padding is ignored. */
+export function parseBuyOtpMemo(text: string): BuyOtpMemo | null {
+  const parts = text.replace(/\0+$/, "").split(":");
+  const [zns, verb, code, name, ua, price, until] = parts;
+  if (zns !== "ZNS" || (verb !== "buyotp" && verb !== "dutch")) return null;
+  if (parts.length !== (verb === "buyotp" ? 5 : 7)) return null;
+  if (!SIX_DIGITS_RE.test(code) || !isValidName(name) || !isValidUnifiedAddress(ua)) return null;
+  if (verb === "buyotp") return { code, name, ua };
+  const priceZats = decodeZec(price);
+  if (priceZats === null || !HEIGHT_RE.test(until)) return null;
+  return { code, name, ua, dutch: { priceZats, until: Number(until) } };
+}
+
+/** What a buyer pays to the listing's t1: the price plus the buy code, the
+ *  code read as zatoshis (`004206` adds 4,206). */
+export function buyPaymentZats(priceZats: number, code: string): number {
+  if (!SIX_DIGITS_RE.test(code)) throw new Error("ZNS: the buy code is six digits.");
+  const zats = priceZats + Number(code);
+  if (!isZats(priceZats) || !isZats(zats)) {
+    throw new Error("ZNS: an amount is whole zatoshis within the money supply.");
+  }
+  return zats;
 }
 
 function toBase64Url(text: string): string {

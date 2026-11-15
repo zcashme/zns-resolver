@@ -1,8 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
 
 - `ZnsAction` accepts `sale`, `list`, `auction`, and `delist`.
+- BREAKING: pricing matches the mint: nine tiers for 1-9 character names
+  (12,480 / 2,720 / 920 / 472 / 188 / 112 / 48 / 32 / 24 USD), a minimum of
+  18 USD from 10 characters, and forever at four annual prices.
+- New: marketplace memos: `buildListMemo`, `buildAuctionMemo`,
+  `buildDelistMemo`, `buildBuyMemo`, `parseBuyOtpMemo` and `buyPaymentZats`.
+  `OtpAction` adds `list`, `auction` and `delist`, and `OtpMemo` carries a
+  list or auction challenge's `terms`.
 
 ## 0.8.0
 

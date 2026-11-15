@@ -102,4 +102,120 @@ void main() {
       expect(parseOtpMemo('hello world'), isNull);
     });
   });
+
+  group('marketplace memos', () {
+    // A mainnet public-key-hash address: where a buyer pays.
+    const t1 = 't1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs';
+    const auction = DutchAsk(
+        startZats: 500000000,
+        minZats: 150000000,
+        startBlock: 3600000,
+        endBlock: 3610000);
+
+    test('builds the formats the mint parses', () {
+      expect(
+          buildListMemo(
+              name: 'alice', ua: _ua, payTo: t1, priceZats: 250000000),
+          'ZNS:list:alice:$_ua:$t1:2.5');
+      expect(buildListMemo(name: 'alice', ua: _ua, payTo: t1, priceZats: 1),
+          'ZNS:list:alice:$_ua:$t1:0.00000001');
+      expect(
+          buildAuctionMemo(name: 'alice', ua: _ua, payTo: t1, auction: auction),
+          'ZNS:auction:alice:$_ua:$t1:5:1.5:3600000:3610000');
+      expect(buildDelistMemo(name: 'alice', ua: _ua), 'ZNS:delist:alice:$_ua');
+      expect(buildBuyMemo(name: 'alice', ua: _ua), 'ZNS:buy:alice:$_ua');
+    });
+
+    test('throws on terms the mint refuses', () {
+      String list({String payTo = t1, int priceZats = 1}) => buildListMemo(
+          name: 'alice', ua: _ua, payTo: payTo, priceZats: priceZats);
+      expect(() => list(payTo: _ua), _throwsFormat('t1'));
+      // A testnet address for a mainnet name.
+      expect(() => list(payTo: 'tmEZhbWHTpdKMw5it8YDspUXSMGQyFwovpU'),
+          _throwsFormat('t1'));
+      for (final priceZats in [-1, 21000001 * 100000000]) {
+        expect(() => list(priceZats: priceZats), _throwsFormat('zatoshis'));
+      }
+      String auctionWith({int? endBlock, int? minZats}) => buildAuctionMemo(
+          name: 'alice',
+          ua: _ua,
+          payTo: t1,
+          auction: DutchAsk(
+              startZats: auction.startZats,
+              minZats: minZats ?? auction.minZats,
+              startBlock: auction.startBlock,
+              endBlock: endBlock ?? auction.endBlock));
+      expect(() => auctionWith(endBlock: auction.startBlock),
+          _throwsFormat('ends after'));
+      expect(() => auctionWith(minZats: auction.startZats),
+          _throwsFormat('falls'));
+    });
+
+    test('reads back list and auction challenges with their terms', () {
+      const list = OtpMemo(
+          code: '417293',
+          name: 'alice',
+          action: OtpAction.list,
+          ua: _ua,
+          terms: ListingTerms(payTo: t1, ask: FlatAsk(250000000)));
+      expect(buildOtpMemo(list), 'ZNS:otp:417293:alice:list:$_ua:$t1:2.5');
+      expect(parseOtpMemo(buildOtpMemo(list)), list);
+      const dutch = OtpMemo(
+          code: '417293',
+          name: 'alice',
+          action: OtpAction.auction,
+          ua: _ua,
+          terms: ListingTerms(payTo: t1, ask: auction));
+      expect(parseOtpMemo(buildOtpMemo(dutch)), dutch);
+      expect(
+          parseOtpMemo('ZNS:otp:417293:alice:delist:$_ua'),
+          const OtpMemo(
+              code: '417293',
+              name: 'alice',
+              action: OtpAction.delist,
+              ua: _ua));
+    });
+
+    test('refuses a challenge whose terms do not fit its verb', () {
+      for (final text in [
+        'ZNS:otp:417293:alice:list:$_ua',
+        'ZNS:otp:417293:alice:list:$_ua:$t1:5:1.5:3600000:3610000',
+        'ZNS:otp:417293:alice:auction:$_ua:$t1:1.5:5:3600000:3610000',
+        'ZNS:otp:417293:alice:delist:$_ua:$t1:2.5',
+        'ZNS:otp:417293:alice:list:$_ua:$t1:02.5',
+      ]) {
+        expect(parseOtpMemo(text), isNull, reason: text);
+      }
+      expect(
+          () => buildOtpMemo(const OtpMemo(
+              code: '417293',
+              name: 'alice',
+              action: OtpAction.update,
+              ua: _ua,
+              terms: ListingTerms(payTo: t1, ask: FlatAsk(1)))),
+          _throwsFormat('terms'));
+    });
+
+    test("reads the mint's answer to a buy", () {
+      expect(parseBuyOtpMemo('ZNS:buyotp:004206:alice:$_ua'),
+          const BuyOtpMemo(code: '004206', name: 'alice', ua: _ua));
+      expect(
+          parseBuyOtpMemo('ZNS:dutch:004206:alice:$_ua:3.25:1763215200'
+              '${'\x00' * 8}'),
+          const BuyOtpMemo(
+              code: '004206',
+              name: 'alice',
+              ua: _ua,
+              dutch: DutchQuote(priceZats: 325000000, until: 1763215200)));
+      expect(parseBuyOtpMemo('ZNS:otp:004206:alice:update:$_ua'), isNull);
+      expect(parseBuyOtpMemo('ZNS:buyotp:004206:alice:$_ua:3.25'), isNull);
+      expect(parseBuyOtpMemo('ZNS:dutch:004206:alice:$_ua:3.25'), isNull);
+    });
+
+    test('pays the price plus the buy code in zatoshis', () {
+      expect(buyPaymentZats(250000000, '004206'), 250004206);
+      expect(
+          () => buyPaymentZats(250000000, '4206'), _throwsFormat('six digits'));
+    });
+  });
 }
