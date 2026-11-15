@@ -31,7 +31,8 @@ pub trait ZnsApi {
     /// - an address → the names currently bound to it, paginated.
     ///
     /// A string of 1–63 lowercase letters or digits is a name, including
-    /// one that also parses as a TEX address.
+    /// one that also parses as a TEX address. A name longer than 32
+    /// characters resolves to `null`.
     #[method(name = "resolve")]
     async fn resolve(
         &self,
@@ -120,6 +121,9 @@ fn clamp_pagination(limit: Option<u64>, offset: Option<u64>) -> (u32, u32) {
     (limit, offset)
 }
 
+/// The longest name `resolve` answers for.
+const MAX_RESOLVED_NAME_LEN: usize = 32;
+
 /// How `resolve` reads a query.
 enum QueryClass {
     /// The empty query lists registrations.
@@ -172,6 +176,9 @@ impl ZnsApiServer for JsonRpcApi {
                 Ok(ResolveResult::Many(
                     regs.into_iter().map(NameRecord::from).collect(),
                 ))
+            }
+            QueryClass::Name if query.len() > MAX_RESOLVED_NAME_LEN => {
+                Ok(ResolveResult::Exact(None))
             }
             // 1–63 lowercase letters or digits, the shape the mint accepts.
             QueryClass::Name => {
