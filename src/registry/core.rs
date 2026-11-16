@@ -1042,6 +1042,14 @@ pub(crate) fn registrations_by_ua(
     Ok((rows, total as u64))
 }
 
+/// Every live registration, sorted by name, unpaginated.
+pub(crate) fn all_registrations(conn: &Connection) -> rusqlite::Result<Vec<Registration>> {
+    let mut stmt =
+        conn.prepare("SELECT name, ua, txid, height, action, memo FROM names ORDER BY name")?;
+    let rows = stmt.query_map([], registration_from_row)?;
+    rows.collect()
+}
+
 pub(crate) fn list_registrations(
     conn: &Connection,
     limit: u32,
@@ -1369,6 +1377,39 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
         conn
+    }
+
+    /// The full listing holds every live name past the 500-name page cap,
+    /// in byte order (digits before letters), and no released name.
+    #[test]
+    fn all_registrations_lists_every_live_name_in_order() {
+        let conn = database();
+        let mut names: Vec<String> = (0..600).map(|i| format!("n{i:03}")).collect();
+        names.push("0a".to_string());
+        names.push("gone".to_string());
+        for (i, name) in names.iter().rev().enumerate() {
+            let memo = format!("ZNS:claim:{name}:u:none:{}", "0".repeat(64));
+            conn.execute(
+                "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
+                 VALUES (?1, 90, 'claim', 'u', 'none', x'00', x'04', ?2, ?3, 0, 0, ?4)",
+                params![name, (i as u32).to_le_bytes().to_vec(), vec![7u8; 32], memo.as_bytes()],
+            )
+            .unwrap();
+        }
+        conn.execute("DELETE FROM names WHERE name = 'gone'", [])
+            .unwrap();
+
+        let listed: Vec<String> = all_registrations(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+
+        let mut expected: Vec<String> = names.into_iter().filter(|n| n != "gone").collect();
+        expected.sort();
+        assert_eq!(listed.len(), 601);
+        assert_eq!(listed.first().map(String::as_str), Some("0a"));
+        assert_eq!(listed, expected);
     }
 
     /// A rewound implicit release restores the binding it ended: the name
