@@ -26,17 +26,24 @@ use super::records::{EventsPage, NameEvent, NameRecord, Paginated, ResolveResult
 pub trait ZnsApi {
     /// Resolve a query to its current binding state.
     ///
+    /// - no query (missing or `null`) → every registered name, sorted by
+    ///   name, in one response; `limit` or `offset` with it is invalid
+    ///   params (`-32602`), so every client asking for the full list sends
+    ///   the same request;
+    /// - empty query `""` → registered names, paginated (default 50, max 500);
     /// - exact name → the record, or `null` if unregistered/released;
-    /// - empty query → all currently registered names, paginated;
     /// - an address → the names currently bound to it, paginated.
     ///
     /// A string of 1–63 lowercase letters or digits is a name, including
     /// one that also parses as a TEX address. A name longer than 32
     /// characters resolves to `null`.
+    ///
+    /// A response over the server's size limit fails with `-32008`
+    /// ("Response is too big").
     #[method(name = "resolve")]
     async fn resolve(
         &self,
-        query: String,
+        query: Option<String>,
         limit: Option<u64>,
         offset: Option<u64>,
     ) -> RpcResult<ResolveResult>;
@@ -125,7 +132,10 @@ fn clamp_pagination(limit: Option<u64>, offset: Option<u64>) -> (u32, u32) {
 const MAX_RESOLVED_NAME_LEN: usize = 32;
 
 /// How `resolve` reads a query.
+#[derive(Debug)]
 enum QueryClass {
+    /// No query: every registration, unpaginated.
+    All,
     /// The empty query lists registrations.
     List,
     /// Exact name lookup.
@@ -141,6 +151,22 @@ fn is_name(query: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9'))
+}
+
+/// Reads a `resolve` request. A missing query asks for every name, which
+/// takes no paging.
+fn classify_request(
+    query: Option<&str>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<QueryClass, RpcError> {
+    match query {
+        None if limit.is_some() || offset.is_some() => Err(RpcError::InvalidParams(
+            "resolve without a query returns every name and takes no limit or offset".into(),
+        )),
+        None => Ok(QueryClass::All),
+        Some(query) => Ok(classify_query(query)),
+    }
 }
 
 fn classify_query(query: &str) -> QueryClass {
@@ -160,14 +186,24 @@ fn classify_query(query: &str) -> QueryClass {
 impl ZnsApiServer for JsonRpcApi {
     async fn resolve(
         &self,
-        query: String,
+        query: Option<String>,
         limit: Option<u64>,
         offset: Option<u64>,
     ) -> RpcResult<ResolveResult> {
+        let class = classify_request(query.as_deref(), limit, offset)?;
+        let query = query.unwrap_or_default();
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
         let conn = self.db.lock();
 
-        match classify_query(&query) {
+        match class {
+            // No query: every registered name in one response, the same
+            // request from every client.
+            QueryClass::All => {
+                let regs = core::all_registrations(&conn).map_err(RpcError::from)?;
+                Ok(ResolveResult::Many(
+                    regs.into_iter().map(NameRecord::from).collect(),
+                ))
+            }
             // The empty query lists all registrations — the page-through form
             // explorers and sitemaps build on.
             QueryClass::List => {
@@ -292,7 +328,62 @@ impl ZnsApiServer for JsonRpcApi {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_query, QueryClass};
+    use super::{classify_query, classify_request, QueryClass, RpcError};
+
+    #[test]
+    fn no_query_is_the_full_list() {
+        assert!(matches!(
+            classify_request(None, None, None),
+            Ok(QueryClass::All)
+        ));
+    }
+
+    #[test]
+    fn no_query_takes_no_limit_or_offset() {
+        for (limit, offset) in [(Some(10), None), (None, Some(0)), (Some(500), Some(0))] {
+            assert!(matches!(
+                classify_request(None, limit, offset),
+                Err(RpcError::InvalidParams(_))
+            ));
+        }
+    }
+
+    /// jsonrpsee reads a missing `query`, `null`, and empty positional
+    /// params alike: each is the full list. Paging it is invalid params.
+    #[tokio::test]
+    async fn the_wire_forms_of_no_query() {
+        use super::{JsonRpcApi, ZnsApiServer};
+
+        let db = crate::registry::Db::open(crate::UFVK, 1, ":memory:").unwrap();
+        let (_tip_tx, tip_rx) = tokio::sync::watch::channel(None);
+        let rpc = JsonRpcApi::new(db, tip_rx).into_rpc();
+
+        for params in [r#"{}"#, r#"{"query":null}"#, r#"[]"#] {
+            let req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"resolve","params":{params}}}"#);
+            let (resp, _) = rpc.raw_json_request(&req, 1).await.unwrap();
+            let resp: serde_json::Value = serde_json::from_str(resp.get()).unwrap();
+            assert_eq!(resp["result"], serde_json::json!([]), "{params}: {resp}");
+        }
+
+        for params in [r#"{"limit":10}"#, r#"{"query":null,"offset":0}"#] {
+            let req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"resolve","params":{params}}}"#);
+            let (resp, _) = rpc.raw_json_request(&req, 1).await.unwrap();
+            let resp: serde_json::Value = serde_json::from_str(resp.get()).unwrap();
+            assert_eq!(resp["error"]["code"], -32602, "{params}: {resp}");
+        }
+    }
+
+    #[test]
+    fn a_query_reads_as_before() {
+        assert!(matches!(
+            classify_request(Some(""), Some(10), Some(5)),
+            Ok(QueryClass::List)
+        ));
+        assert!(matches!(
+            classify_request(Some("alice"), None, None),
+            Ok(QueryClass::Name)
+        ));
+    }
 
     const TEX: &str = "tex1s2rt77ggv6q989lr49rkgzmh5slsksa9khdgte";
 
