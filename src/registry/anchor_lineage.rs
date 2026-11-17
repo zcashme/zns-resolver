@@ -1,10 +1,10 @@
 //! The anchor lineage, derived: a pure fold over position-ordered facts.
 //!
 //! The lineage is never maintained — it is recomputed from chain facts.
-//! The starting anchors are the zero-value registry notes received in the
-//! birthday block: the mint's anchor transaction. A zero-value note in
-//! any later block joins only as an admitted claim's successor. A revealed
-//! nullifier retires whatever the rest of its transaction turned out to be.
+//! The starting anchors are every zero-value registry note received in the
+//! birthday block. A zero-value note in a later block joins only as an
+//! admitted claim's successor. A spent anchor leaves, whatever its
+//! transaction.
 //!
 //! Because the fold is a pure function of facts, reorg correctness is
 //! inherited from the fact tables' rewind semantics: folding the facts
@@ -35,9 +35,8 @@ pub(crate) struct Retirement {
     pub(crate) nf: AnchorNf,
 }
 
-/// One transaction's anchor facts, in canonical order. Adoptions and
-/// retirements are grouped per transaction: a transaction's retirements
-/// land before its claim successor joins.
+/// One transaction's anchor facts: its zero-value registry notes kept as
+/// anchor facts, and its spends.
 #[derive(Debug, Default)]
 pub(crate) struct TxAnchorFacts {
     pub(crate) adoptions: Vec<Adoption>,
@@ -69,18 +68,22 @@ impl Lineage {
     }
 
     /// Whether a zero-value registry note at `height` is an anchor fact: a
-    /// starting anchor in the birthday block, or a claim's successor. The
-    /// scan and the in-memory batch use the same check, so a replay of
-    /// stored facts matches the batch that wrote them.
+    /// starting anchor, or a claim's successor.
     pub(crate) fn keeps_anchor_note(&self, height: u32, claim_successor: bool) -> bool {
-        claim_successor || height == self.birthday
+        claim_successor || self.is_birthday(height)
+    }
+
+    /// Whether `height` is the birthday block, whose zero-value registry
+    /// notes are the starting anchors.
+    fn is_birthday(&self, height: u32) -> bool {
+        height == self.birthday
     }
 
     /// Advances the lineage across one transaction: the birthday block's
     /// notes, then retirements (facts follow the chain whatever the verdict),
     /// then the admitted claim's successor.
     pub(crate) fn step_tx(&mut self, height: u32, facts: &TxAnchorFacts) {
-        if height == self.birthday {
+        if self.is_birthday(height) {
             for adoption in &facts.adoptions {
                 self.live.insert(adoption.nf);
             }
@@ -305,12 +308,11 @@ mod tests {
     }
 }
 
-/// The resolver folds the same chain facts the mint folds; the vendored
-/// canon fixture is the executable cross-repo contract. Every scenario whose
-/// anchors are adopted in one block is replayed into the fold, with that block
-/// as the birthday; the live set must equal the mint's recorded snapshot after
-/// every event. The two ceremony scenarios exercise the mint's adoption cap,
-/// which the resolver does not have: it takes the birthday block's anchors.
+/// Replays the vendored canon fixture, the mint's recorded anchor-pool
+/// snapshots, through the fold. Each scenario's first adoption block is its
+/// birthday, and the live set must equal the snapshot after every event. The
+/// scenarios in `CEREMONY_SCENARIOS` adopt anchors across several blocks and
+/// are not replayed.
 #[cfg(test)]
 mod canon {
     use super::*;
@@ -318,7 +320,7 @@ mod canon {
 
     const FIXTURE: &str = include_str!("../../tests/fixtures/canon-vectors-v1.json");
 
-    /// Scenarios that adopt anchors across several blocks and cap the pool.
+    /// Scenarios that adopt anchors across several blocks.
     const CEREMONY_SCENARIOS: [&str; 2] = ["ceremony_closes_once", "ceremony_fill"];
 
     #[derive(Deserialize)]

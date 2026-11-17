@@ -84,8 +84,7 @@ pub(crate) fn install_registry_config(
         ));
     }
 
-    // The birthday only seeds the first sync. A database that has scanned
-    // keeps the height it started from.
+    // A database that has scanned keeps the birthday it started from.
     tracing::warn!(
         stored = stored_birthday,
         configured = birthday,
@@ -359,7 +358,7 @@ pub(crate) fn apply_batch(
 /// folds them with [`fold_lineage`] after releasing the database lock.
 pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position, FactEvent)>> {
     let mut stmt = conn.prepare(
-        "SELECT nullifier, height, tx_index, action_index, name_note_candidates, claim_successor,
+        "SELECT nullifier, height, tx_index, action_index, claim_successor,
                 spent_height, spent_tx_index, spent_action_index
          FROM anchor_facts
          WHERE value = 0",
@@ -371,25 +370,15 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
             row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
+            row.get::<_, Option<i64>>(5)?,
             row.get::<_, Option<i64>>(6)?,
             row.get::<_, Option<i64>>(7)?,
-            row.get::<_, Option<i64>>(8)?,
         ))
     })?;
     let mut events = Vec::new();
     for row in rows {
-        let (
-            nf,
-            height,
-            tx_index,
-            action_index,
-            cands,
-            claim_successor,
-            spent_h,
-            spent_tx,
-            spent_a,
-        ) = row?;
+        let (nf, height, tx_index, action_index, claim_successor, spent_h, spent_tx, spent_a) =
+            row?;
         let nf_bytes: [u8; 32] = nf.try_into().map_err(|_| corrupt_record())?;
         let nf = AnchorNf::from_bytes(&nf_bytes);
         let adopt_at = Position {
@@ -401,7 +390,6 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
             adopt_at,
             FactEvent::Adoption {
                 nf,
-                name_note_candidates: cands,
                 claim_successor: claim_successor != 0,
             },
         ));
@@ -463,9 +451,9 @@ fn row_u32(value: i64) -> rusqlite::Result<u32> {
 
 /// Folds anchor facts into the lineage. Each zero-value received note is an
 /// adoption at its own position, each spent zero-value note a retirement at
-/// its spending position. The candidate count marks the accept path, and
-/// `claim_successor` marks a claim whose only registry output is that note.
-/// The notes adopted in the `birthday` block are the starting anchors.
+/// its spending position. `claim_successor` marks an admitted claim's
+/// successor. The notes adopted in the `birthday` block are the starting
+/// anchors.
 pub(crate) fn fold_lineage(birthday: u32, mut events: Vec<(Position, FactEvent)>) -> Lineage {
     events.sort_by_key(|(pos, _)| *pos);
 
@@ -478,10 +466,8 @@ pub(crate) fn fold_lineage(birthday: u32, mut events: Vec<(Position, FactEvent)>
             match event {
                 FactEvent::Adoption {
                     nf,
-                    name_note_candidates,
                     claim_successor,
                 } => {
-                    facts.name_notes = usize::try_from(name_note_candidates).unwrap_or(usize::MAX);
                     facts.claim_successor = claim_successor;
                     facts.adoptions.push(Adoption { nf });
                 }
@@ -490,8 +476,7 @@ pub(crate) fn fold_lineage(birthday: u32, mut events: Vec<(Position, FactEvent)>
         }
         lineage.step_tx(height, &facts);
     }
-    // An empty lineage past the birthday means the birthday block held no
-    // anchors: every claim will be rejected (fail closed).
+    // With no live anchors, every claim is rejected (fail closed).
     tracing::debug!(
         anchors = lineage.len(),
         empty = lineage.is_empty(),
@@ -501,15 +486,11 @@ pub(crate) fn fold_lineage(birthday: u32, mut events: Vec<(Position, FactEvent)>
     lineage
 }
 
-/// One replayed fact: an adoption carrying its transaction's candidate
-/// count (the accept-path marker), or a retirement.
+/// One replayed fact: a zero-value registry note kept as an anchor fact, or
+/// the spend that retires one.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FactEvent {
-    Adoption {
-        nf: AnchorNf,
-        name_note_candidates: i64,
-        claim_successor: bool,
-    },
+    Adoption { nf: AnchorNf, claim_successor: bool },
     Retirement(AnchorNf),
 }
 
