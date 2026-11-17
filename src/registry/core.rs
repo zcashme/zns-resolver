@@ -915,10 +915,7 @@ pub(crate) fn rewind(conn: &Connection, to: Cursor) -> rusqlite::Result<()> {
     }
 
     // Keep the hash so a restart resumes after `to`, not at the birthday.
-    tx.execute(
-        "UPDATE registry_account SET sync_height = ?1, sync_hash = ?2 WHERE id = 0",
-        params![kept, to.hash.0.as_slice()],
-    )?;
+    set_checkpoint_in_tx(&tx, &to)?;
 
     tx.commit()?;
     Ok(())
