@@ -2091,9 +2091,9 @@ mod admission {
         height: u32,
         adoptions: Vec<Adoption>,
         retirements: Vec<Retirement>,
-        has_single_name_note: bool,
+        name_notes: usize,
     ) -> TxLaw {
-        let claim_successor = has_single_name_note && adoptions.len() == 1;
+        let claim_successor = name_notes == 1 && adoptions.len() == 1;
         TxLaw {
             txid,
             tx_index: 0,
@@ -2101,7 +2101,7 @@ mod admission {
             facts: TxAnchorFacts {
                 adoptions,
                 retirements,
-                name_notes: usize::from(has_single_name_note),
+                name_notes,
                 claim_successor,
             },
         }
@@ -2132,7 +2132,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
 
@@ -2160,7 +2160,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
         assert!(apply_transaction(&tx, &first, &first_law, &lineage, &mut live_names).unwrap());
@@ -2182,7 +2182,7 @@ mod admission {
             101,
             vec![Adoption { nf: nf(201) }],
             vec![Retirement { nf: nf(200) }],
-            true,
+            1,
         );
         // The name is already live, so the successor stays out. The anchor
         // it spent still retires.
@@ -2234,7 +2234,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            true,
+            1,
         );
         apply_transaction(&tx, &candidates, &release, &seeded, &mut live_names).unwrap();
 
@@ -2243,7 +2243,7 @@ mod admission {
             200,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         claim.tx_index = 1;
         assert!(apply_transaction(&tx, &candidates, &claim, &seeded, &mut live_names).unwrap());
@@ -2267,7 +2267,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
         assert!(apply_transaction(&tx, &claim, &claim_law, &lineage, &mut live_names).unwrap());
@@ -2302,7 +2302,7 @@ mod admission {
                 },
                 Retirement { nf: nf(200) },
             ],
-            true,
+            1,
         );
         apply_transaction(&tx, &update, &update_law, &lineage, &mut live_names).unwrap();
 
@@ -2333,7 +2333,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&tip),
             }],
-            true,
+            1,
         );
         apply_transaction(&tx, &list, &law, &lineage, &mut live_names).unwrap();
         lineage.step_tx(101, &law.facts);
@@ -2365,7 +2365,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&tip),
             }],
-            true,
+            1,
         );
         apply_transaction(&tx, &sale, &law, &lineage, &mut live_names).unwrap();
 
@@ -2418,7 +2418,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         let mut live_names = HashSet::new();
         assert!(apply_transaction(tx, &claim, &law, &lineage, &mut live_names).unwrap());
@@ -2499,7 +2499,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         let mut live_names = HashSet::new();
 
@@ -2528,7 +2528,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }, Retirement { nf: nf(9) }],
-            true,
+            1,
         );
         let mut live_names = HashSet::new();
 
@@ -2559,7 +2559,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[9; 32]),
             }],
-            true,
+            1,
         );
         let mut live_names = HashSet::new();
 
@@ -2595,7 +2595,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
@@ -2648,7 +2648,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            true,
+            1,
         );
         let release_law = tx_law_for(
             [2; 32],
@@ -2657,7 +2657,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(nullifier_u.as_bytes()),
             }],
-            true,
+            1,
         );
 
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
@@ -2716,7 +2716,7 @@ mod admission {
                 },
                 Retirement { nf: nf(9) },
             ],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
@@ -2765,7 +2765,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            false, // two candidates: follow_spends
+            2, // two candidates: follow_spends
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
@@ -2801,7 +2801,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            false,
+            0,
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
@@ -2840,7 +2840,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
