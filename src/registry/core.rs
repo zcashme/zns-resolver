@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 
-use orchard::keys::{FullViewingKey, Scope};
 use orchard::note::{ExtractedNoteCommitment, Nullifier};
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
 use seer_sync::sync::scan::{OrchardOutput, WalletTx};
@@ -17,10 +16,9 @@ use super::nf::{AnchorNf, TipNf};
 use super::notes;
 use super::{Event, Registration};
 
-/// One authenticated candidate: a registry output whose memo decodes to a
-/// name note that binds to its published commitment, is zero-valued, and
-/// is addressed to the registry — the mint's `decrypt_name_notes` gates.
-/// Parsed and verified once at triage; every stage reads this form.
+/// One candidate: a Name Note the registry received, whose memo binds to its
+/// published commitment and names a revision-0 unified address on this
+/// network. Identified once per block; every stage reads this form.
 /// Flattened from the scan output so the admission boundary is
 /// constructible in tests.
 struct Candidate<'a> {
@@ -115,8 +113,8 @@ fn config_refused(detail: &str) -> rusqlite::Error {
     )
 }
 
-/// One triage survivor, pre-verification: everything `Candidate` needs
-/// except the parse, which borrows the per-block memo arena.
+/// One identified Name Note: everything `Candidate` needs except the parse,
+/// which borrows the per-block memo arena.
 struct Source<'a> {
     action_index: usize,
     cand_cmx: [u8; 32],
@@ -125,8 +123,8 @@ struct Source<'a> {
     txid: [u8; 32],
 }
 
-/// The main write path: triage and anchor-fact bookkeeping, then candidate
-/// admission in canonical transaction order. Admission applies the chain rule,
+/// The main write path: identifying Name Notes and anchor-fact bookkeeping,
+/// then admission in canonical transaction order. Admission applies the chain rule,
 /// commitment binding and consumption proof.
 /// All work runs in one transaction, so readers see pre-batch or post-batch
 /// state, never partial. `lineage` is the fold of the facts at the start of
@@ -136,7 +134,6 @@ pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
     transactions: &[WalletTx],
-    fvk: &FullViewingKey,
     mut lineage: Lineage,
 ) -> rusqlite::Result<()> {
     let db_tx = conn.unchecked_transaction()?;
@@ -150,12 +147,11 @@ pub(crate) fn apply_batch(
     for block in transactions.chunk_by(|a, b| a.height == b.height) {
         let height = u32::from(block[0].height);
 
-        // Triage. The gates are the mint's `decrypt_name_notes`, so the
-        // accept-path count is mint-exact: the memo decodes to a NameNote, its
-        // record gives the note's rseed, the note is zero-valued, and it is
-        // addressed to the registry. Each survivor's memo is parsed once, into
+        // Identifying Name Notes, in order: the registry received the note
+        // (it has a nullifier), its memo decodes to a Name Note, the memo
+        // gives the note's rseed, and the memo's UA is a revision-0 unified
+        // address on this network. Each Name Note's memo is parsed once, into
         // a per-block arena the candidates borrow.
-        let registry_recipient = fvk.to_ivk(Scope::External).address_at(0u32);
         let mut memos: Vec<Memo> = Vec::new();
         let mut sources: Vec<Source> = Vec::new();
         for tx in block {
@@ -164,6 +160,13 @@ pub(crate) fn apply_batch(
                 let action_index = output.index as usize;
                 let cand_note = &output.note;
 
+                // Gate: a note the registry received, the only kind with a
+                // nullifier to watch. The scan also recovers outgoing outputs,
+                // which have none.
+                let Some(nf) = output.nf else {
+                    candidate_dropped("not a received registry note", &txid, action_index);
+                    continue;
+                };
                 let Some(memo) = &output.memo else {
                     candidate_dropped("missing memo", &txid, action_index);
                     continue;
@@ -181,15 +184,6 @@ pub(crate) fn apply_batch(
                 // Gate: binding — the record gives the note's rseed.
                 if !notes::binds(&zns_memo, &note, cand_note) {
                     candidate_dropped("commitment does not bind", &txid, action_index);
-                    continue;
-                }
-                // Gate: shape — zero value, registry recipient.
-                if cand_note.value().inner() != 0 {
-                    candidate_dropped("value is not zero", &txid, action_index);
-                    continue;
-                }
-                if cand_note.recipient() != registry_recipient {
-                    candidate_dropped("recipient is not the registry", &txid, action_index);
                     continue;
                 }
                 // Gate: the bound UA must decode as a Unified Address on this
@@ -212,12 +206,6 @@ pub(crate) fn apply_batch(
                     continue;
                 }
 
-                // The scan derives every registry note's nullifier from the
-                // full viewing key.
-                let nf = output
-                    .nf
-                    .ok_or_else(|| invariant_failure("registry output has no nullifier"))?;
-
                 memos.push(zns_memo);
                 sources.push(Source {
                     action_index,
@@ -230,10 +218,10 @@ pub(crate) fn apply_batch(
         }
         let mut candidates = Vec::with_capacity(memos.len());
         for (memo, src) in memos.iter().zip(&sources) {
-            // Triage already parsed this memo. A second failure aborts the
-            // batch instead of panicking while the database lock is held.
+            // Identification already parsed this memo. A second failure aborts
+            // the batch instead of panicking while the database lock is held.
             let note = NameNote::parse(memo)
-                .map_err(|_| invariant_failure("name note failed to reparse after triage"))?;
+                .map_err(|_| invariant_failure("name note failed to reparse"))?;
             candidates.push(Candidate {
                 action_index: src.action_index,
                 txid: src.txid,
@@ -283,10 +271,10 @@ pub(crate) fn apply_batch(
                 }
             }
 
-            // Every zero-value registry note the transaction received, by
-            // action index. A claim must create at least one.
+            // Every zero-value registry note the transaction received (it has
+            // a nullifier), by action index. A claim must create at least one.
             let zero_value_notes: Vec<(u32, AnchorNf)> = anchor_outputs(tx, &candidates)
-                .filter(|o| !o.is_sent && o.note.value().inner() == 0)
+                .filter(|o| o.note.value().inner() == 0)
                 .filter_map(|o| o.nf.map(|nf| (o.index, AnchorNf::from_scan(nf))))
                 .collect();
             let mut law = TxLaw {
@@ -1595,10 +1583,11 @@ mod tests {
 mod admission {
     use super::*;
     use crate::registry::storage::SCHEMA_SQL;
-    use orchard::keys::SpendingKey;
+    use orchard::keys::{FullViewingKey, Scope, SpendingKey};
     use orchard::note::{Note, NoteVersion};
     use zcash_address::unified;
     use zcash_protocol::consensus::Parameters;
+    use zcash_protocol::TxId;
     use zns_verify::{name_note_rseed, PrevCmx};
 
     const RAW_ADDR: [u8; 43] = [
@@ -1655,6 +1644,11 @@ mod admission {
 
     /// A zero-value note to the test recipient with the given rseed.
     fn note_with_rseed(rseed: [u8; 32]) -> Note {
+        note(0, rseed)
+    }
+
+    /// A note of `zatoshis` to the test recipient with the given rseed.
+    fn note(zatoshis: u64, rseed: [u8; 32]) -> Note {
         use orchard::note::{RandomSeed, Rho};
         use orchard::value::NoteValue;
         let recipient = orchard::Address::from_raw_address_bytes(&RAW_ADDR)
@@ -1664,12 +1658,70 @@ mod admission {
         let rseed = RandomSeed::from_bytes(rseed, &rho)
             .into_option()
             .expect("rseed");
-        Note::from_parts(recipient, NoteValue::ZERO, rho, rseed, NoteVersion::V3)
-            .into_option()
-            .expect("note")
+        Note::from_parts(
+            recipient,
+            NoteValue::from_raw(zatoshis),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .into_option()
+        .expect("note")
     }
 
-    /// Builds a verified candidate the same way triage does.
+    /// A scanned registry output: received, with a nullifier, or recovered
+    /// with the outgoing viewing key, with none.
+    fn scanned(index: u32, note: Note, memo: Option<[u8; 512]>, received: bool) -> OrchardOutput {
+        OrchardOutput {
+            index,
+            note,
+            recipient: note.recipient(),
+            nf: received.then(|| note.nullifier(&fvk())),
+            position: u64::from(index),
+            scope: Scope::External,
+            memo,
+            is_sent: !received,
+            is_change: false,
+        }
+    }
+
+    /// A 512-byte claim memo for `name`, and a note whose rseed it binds.
+    fn bound_claim(name: &str) -> ([u8; 512], Note) {
+        let prev = [0u8; 32];
+        let text = format!("ZNS:claim:{name}:{}:none:{}", test_ua(), hex(&prev));
+        let mut raw = [0u8; 512];
+        raw[..text.len()].copy_from_slice(text.as_bytes());
+        let memo = Memo::from_bytes(&raw).expect("memo");
+        let bound = note_with_rseed(name_note_rseed(memo.fields().expect("fields"), &prev));
+        let parsed = NameNote::parse(&memo).expect("name note");
+        assert!(notes::binds(&memo, &parsed, &bound));
+        (raw, bound)
+    }
+
+    /// Applies one transaction's registry outputs as a batch at height 10,
+    /// after a birthday at height 1.
+    fn apply_outputs(conn: &Connection, outputs: Vec<OrchardOutput>) {
+        let tx = WalletTx {
+            txid: TxId::from_bytes([1; 32]),
+            height: BlockHeight::from_u32(10),
+            tx_index: 0,
+            sapling_outputs: vec![],
+            sapling_spends: vec![],
+            orchard_outputs: vec![],
+            orchard_spends: vec![],
+            ironwood_outputs: outputs,
+            ironwood_spends: vec![],
+            transparent_outputs: vec![],
+            transparent_spends: vec![],
+        };
+        let at = Cursor {
+            height: BlockHeight::from_u32(10),
+            hash: BlockHash([2; 32]),
+        };
+        apply_batch(conn, at, &[tx], Lineage::new(1)).unwrap();
+    }
+
+    /// Builds a verified candidate the same way identification does.
     #[allow(clippy::too_many_arguments)] // a fixture; grouping the args hides the shape
     fn candidate<'a>(
         memos: &'a [Memo],
@@ -2428,109 +2480,36 @@ mod admission {
         assert_eq!(action, "update", "the mint accepted the renewal");
     }
 
-    /// A received zero-value note after the birthday block, outside an
-    /// admitted claim, is not stored. A payment and a note this account sent
-    /// are not stored either.
+    /// After the birthday block and outside an admitted claim, nothing is
+    /// stored: not a received zero-value note, a payment, or a note this
+    /// account sent.
     #[test]
     fn a_batch_skips_a_note_outside_the_birthday_block_and_a_payment() {
-        use orchard::keys::Scope;
-        use orchard::note::{Nullifier, RandomSeed, Rho};
-        use orchard::value::NoteValue;
-        use orchard::Address;
-        use seer_sync::sync::scan::WalletTx;
-        use seer_sync::Cursor;
-        use zcash_primitives::block::BlockHash;
-        use zcash_protocol::consensus::BlockHeight;
-        use zcash_protocol::TxId;
-
         let conn = db();
-        conn.execute(
-            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
-            [],
-        )
-        .unwrap();
-
-        let rho = Rho::from_bytes(&[9u8; 32]).into_option().expect("rho");
-        let rseed = RandomSeed::from_bytes([4u8; 32], &rho)
-            .into_option()
-            .expect("rseed");
-        let recipient = Address::from_raw_address_bytes(&RAW_ADDR)
-            .into_option()
-            .expect("address");
-        let payment = Note::from_parts(
-            recipient,
-            NoteValue::from_raw(1),
-            rho,
-            rseed,
-            orchard::note::NoteVersion::V3,
-        )
-        .into_option()
-        .expect("payment note");
-        let zero = test_note();
-        let nf_bytes = [9u8; 32];
-        let nullifier = Option::from(Nullifier::from_bytes(&nf_bytes)).expect("nullifier");
-
-        let tx = WalletTx {
-            txid: TxId::from_bytes([1; 32]),
-            height: BlockHeight::from_u32(10),
-            tx_index: 0,
-            sapling_outputs: vec![],
-            sapling_spends: vec![],
-            orchard_outputs: vec![],
-            orchard_spends: vec![],
-            ironwood_outputs: vec![
-                seer_sync::sync::scan::OrchardOutput {
-                    index: 0,
-                    note: zero,
-                    recipient,
-                    nf: Some(nullifier),
-                    position: 0,
-                    scope: Scope::External,
-                    memo: None,
-                    is_sent: false,
-                    is_change: false,
-                },
-                seer_sync::sync::scan::OrchardOutput {
-                    index: 1,
-                    note: payment,
-                    recipient,
-                    nf: Some(nullifier),
-                    position: 1,
-                    scope: Scope::External,
-                    memo: None,
-                    is_sent: false,
-                    is_change: false,
-                },
-                seer_sync::sync::scan::OrchardOutput {
-                    index: 2,
-                    note: zero,
-                    recipient,
-                    nf: Some(nullifier),
-                    position: 2,
-                    scope: Scope::External,
-                    memo: None,
-                    is_sent: true,
-                    is_change: false,
-                },
-            ],
-            ironwood_spends: vec![],
-            transparent_outputs: vec![],
-            transparent_spends: vec![],
-        };
-        apply_batch(
+        apply_outputs(
             &conn,
-            Cursor {
-                height: BlockHeight::from_u32(10),
-                hash: BlockHash([2; 32]),
-            },
-            &[tx],
-            &fvk(),
-            Lineage::new(1),
-        )
-        .unwrap();
+            vec![
+                scanned(0, test_note(), None, true),
+                scanned(1, note(1, [4u8; 32]), None, true),
+                scanned(2, test_note(), None, false),
+            ],
+        );
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM anchor_facts"), 0);
+    }
+
+    /// An output recovered with the registry's outgoing viewing key has no
+    /// nullifier, so it is not a candidate even with a binding Name Note
+    /// memo: the batch applies and admits nothing.
+    #[test]
+    fn a_recovered_outgoing_name_note_is_not_a_candidate() {
+        let conn = db();
+        let (memo, note) = bound_claim("alice");
+        apply_outputs(&conn, vec![scanned(0, note, Some(memo), false)]);
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM name_events"), 0);
     }
 
     /// A lineage whose birthday block holds the anchors `anchors`.

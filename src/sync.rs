@@ -3,7 +3,6 @@
 use std::error::Error;
 use std::time::Duration;
 
-use orchard::keys::FullViewingKey;
 use seer_sync::sync::chain;
 use seer_sync::sync::scan::WalletTx;
 use seer_sync::{Account, Cursor as SeerCursor, Nullifiers};
@@ -24,7 +23,6 @@ const TIP_RETRY: Duration = Duration::from_secs(5);
 /// The resolver's local registry replica as a seer-sync account.
 pub(crate) struct Registry {
     pub(crate) db: Db,
-    pub(crate) fvk: FullViewingKey,
 }
 
 /// The network path: observes the chain head live and publishes it to status
@@ -121,7 +119,7 @@ impl Account for Registry {
         };
         let lineage = core::fold_lineage(u32::from(birthday), facts);
         let conn = self.db.lock();
-        core::apply_batch(&conn, at, transactions, &self.fvk, lineage)?;
+        core::apply_batch(&conn, at, transactions, lineage)?;
         Ok(())
     }
 }

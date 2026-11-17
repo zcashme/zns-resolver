@@ -78,11 +78,10 @@ async fn main() {
 
     // --- The registry key is decoded before anything persists it: a bad key
     // --- panics here and never poisons the registry_account row. ---
-    let registry_fvk = UnifiedFullViewingKey::decode(&NETWORK, UFVK)
+    let _ = UnifiedFullViewingKey::decode(&NETWORK, UFVK)
         .expect("registry UFVK decodes")
         .orchard()
-        .expect("registry UFVK has an orchard component")
-        .clone();
+        .expect("registry UFVK has an orchard component");
 
     // --- Network path: the live chain head, observed and published ---
     let (tip_tx, tip_rx) = tokio::sync::watch::channel(None);
@@ -108,10 +107,7 @@ async fn main() {
 
     // --- The indexer: run forever, reconnecting when sync returns ---
     tracing::info!(network = ?NETWORK, birthday = MINT_BIRTHDAY, "starting indexer");
-    let account = Registry {
-        db,
-        fvk: registry_fvk,
-    };
+    let account = Registry { db };
 
     loop {
         if let Err(error) = seer_sync::run(UFVK, &NETWORK, &account).await {
