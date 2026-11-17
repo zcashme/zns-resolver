@@ -16,9 +16,9 @@ use super::nf::{AnchorNf, TipNf};
 use super::notes;
 use super::{Event, Registration};
 
-/// One candidate: a note the registry received whose memo decodes to a name
-/// note that binds to its published commitment.
-/// Parsed and verified once at triage; every stage reads this form.
+/// One candidate: a Name Note the registry received, whose memo binds to its
+/// published commitment and names a revision-0 unified address on this
+/// network. Identified once per block; every stage reads this form.
 /// Flattened from the scan output so the admission boundary is
 /// constructible in tests.
 struct Candidate<'a> {
@@ -113,8 +113,8 @@ fn config_refused(detail: &str) -> rusqlite::Error {
     )
 }
 
-/// One triage survivor, pre-verification: everything `Candidate` needs
-/// except the parse, which borrows the per-block memo arena.
+/// One identified Name Note: everything `Candidate` needs except the parse,
+/// which borrows the per-block memo arena.
 struct Source<'a> {
     action_index: usize,
     cand_cmx: [u8; 32],
@@ -123,8 +123,8 @@ struct Source<'a> {
     txid: [u8; 32],
 }
 
-/// The main write path: triage and anchor-fact bookkeeping, then candidate
-/// admission in canonical transaction order. Admission applies the chain rule,
+/// The main write path: identifying Name Notes and anchor-fact bookkeeping,
+/// then admission in canonical transaction order. Admission applies the chain rule,
 /// commitment binding and consumption proof.
 /// All work runs in one transaction, so readers see pre-batch or post-batch
 /// state, never partial. `lineage` is the fold of the facts at the start of
@@ -147,9 +147,11 @@ pub(crate) fn apply_batch(
     for block in transactions.chunk_by(|a, b| a.height == b.height) {
         let height = u32::from(block[0].height);
 
-        // Triage: the memo decodes to a NameNote, and its record gives the
-        // note's rseed. Each survivor's memo is parsed once, into a per-block
-        // arena the candidates borrow.
+        // Identifying Name Notes, in order: the registry received the note
+        // (it has a nullifier), its memo decodes to a Name Note, the memo
+        // gives the note's rseed, and the memo's UA is a revision-0 unified
+        // address on this network. Each Name Note's memo is parsed once, into
+        // a per-block arena the candidates borrow.
         let mut memos: Vec<Memo> = Vec::new();
         let mut sources: Vec<Source> = Vec::new();
         for tx in block {
@@ -216,10 +218,10 @@ pub(crate) fn apply_batch(
         }
         let mut candidates = Vec::with_capacity(memos.len());
         for (memo, src) in memos.iter().zip(&sources) {
-            // Triage already parsed this memo. A second failure aborts the
-            // batch instead of panicking while the database lock is held.
+            // Identification already parsed this memo. A second failure aborts
+            // the batch instead of panicking while the database lock is held.
             let note = NameNote::parse(memo)
-                .map_err(|_| invariant_failure("name note failed to reparse after triage"))?;
+                .map_err(|_| invariant_failure("name note failed to reparse"))?;
             candidates.push(Candidate {
                 action_index: src.action_index,
                 txid: src.txid,
@@ -269,10 +271,10 @@ pub(crate) fn apply_batch(
                 }
             }
 
-            // Every zero-value registry note the transaction received, by
-            // action index. A claim must create at least one.
+            // Every zero-value registry note the transaction received (it has
+            // a nullifier), by action index. A claim must create at least one.
             let zero_value_notes: Vec<(u32, AnchorNf)> = anchor_outputs(tx, &candidates)
-                .filter(|o| !o.is_sent && o.note.value().inner() == 0)
+                .filter(|o| o.note.value().inner() == 0)
                 .filter_map(|o| o.nf.map(|nf| (o.index, AnchorNf::from_scan(nf))))
                 .collect();
             let mut law = TxLaw {
@@ -1719,7 +1721,7 @@ mod admission {
         apply_batch(conn, at, &[tx], Lineage::new(1)).unwrap();
     }
 
-    /// Builds a verified candidate the same way triage does.
+    /// Builds a verified candidate the same way identification does.
     #[allow(clippy::too_many_arguments)] // a fixture; grouping the args hides the shape
     fn candidate<'a>(
         memos: &'a [Memo],
