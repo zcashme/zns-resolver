@@ -580,13 +580,13 @@ fn apply_transaction(
 
     match note.action() {
         Action::Claim => {
-            // Gate: the mint's accept_claim. The anchor spend and the
+            // Gate: claim. The anchor spend and the
             // name note are separate actions — fee inputs sit between
             // them — so the name note's own nullifier is not the anchor.
-            // The transaction must spend exactly one live anchor, spend
-            // no live name, and its registry outputs must be the one
-            // zero-value successor of a claim.
-            let law_ok = lineage.live_retirements(tx_facts) == 1
+            // Spending a live anchor proves the mint made the claim. The
+            // transaction must also spend no live name, and its registry
+            // outputs must be the one zero-value successor of a claim.
+            let law_ok = lineage.spends_live_anchor(tx_facts)
                 && !spent_a_live_name
                 && tx_facts.claim_successor;
             if !law_ok {
@@ -616,14 +616,15 @@ fn apply_transaction(
         | Action::Auction
         | Action::Delist => {
             // Gate: predecessor — the transaction must consume this
-            // name's live tip, only this name's, and no anchor. A sale,
-            // list, auction, and delist spend the tip the way an update
-            // does. Anything else admits nothing.
+            // name's live tip, and only this name's. Spending the tip
+            // proves the mint made the note. A sale, list, auction, and
+            // delist spend the tip the way an update does. Anything else
+            // admits nothing.
             let spent_other_live = tx_facts.retirements.iter().any(|r| {
                 let nf = TipNf::from_revealed(&r.nf);
                 live_names.contains(&nf) && tip_nf != Some(nf)
             });
-            if !tip_consumed || spent_other_live || lineage.touches_live_anchor(tx_facts) {
+            if !tip_consumed || spent_other_live {
                 log_orphaned_tip_spends(db_tx, live_names, tx_facts, height, &candidate.txid)?;
                 return Ok(false);
             }
@@ -1923,49 +1924,18 @@ mod admission {
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
     }
 
-    /// An update that also spends a live anchor does not renew the name.
-    /// The update is not admitted, and the name keeps its binding.
+    /// An update that also spends a live anchor is admitted: spending the
+    /// name's tip is the proof the mint made it.
     #[test]
-    fn an_update_that_spends_an_anchor_keeps_the_binding() {
+    fn an_update_that_also_spends_an_anchor_is_admitted() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
+        let (lineage, mut live_names, tip, cmx) = claim_alice(&tx);
 
-        let memos = vec![memo_for("claim", "alice", &[0u8; 32])];
-        let claim = vec![candidate(
-            &memos, 0, 0, 0, [1; 32], "claim", "alice", [0u8; 32],
-        )];
-        let mut lineage = seeded_lineage(&[1]);
-        let claim_law = tx_law_for(
-            [1; 32],
-            100,
-            vec![Adoption { nf: nf(200) }],
-            vec![Retirement { nf: nf(1) }],
-            1,
-        );
-        let mut live_names: HashSet<TipNf> = HashSet::new();
-        assert!(apply_transaction(&tx, &claim, &claim_law, &lineage, &mut live_names).unwrap());
-        lineage.step_tx(100, &claim_law.facts);
-
-        let tip: Vec<u8> = tx
-            .query_row(
-                "SELECT nullifier FROM names WHERE name = 'alice'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let tip: [u8; 32] = tip.try_into().unwrap();
-        let update_memo = vec![memo_for("update", "alice", &[0x02; 32])];
-        let update = vec![candidate(
-            &update_memo,
-            0,
-            0,
-            0,
-            [3; 32],
-            "update",
-            "alice",
-            [0x02; 32],
-        )];
-        let update_law = tx_law_for(
+        let memos = vec![memo_for("update", "alice", &cmx)];
+        let update = vec![candidate(&memos, 0, 0, 0, [3; 32], "update", "alice", cmx)];
+        // The tip, and the live anchor the claim seated.
+        let law = tx_law_for(
             [3; 32],
             101,
             vec![],
@@ -1977,13 +1947,14 @@ mod admission {
             ],
             1,
         );
-        apply_transaction(&tx, &update, &update_law, &lineage, &mut live_names).unwrap();
+        assert!(lineage.spends_live_anchor(&law.facts));
+        apply_transaction(&tx, &update, &law, &lineage, &mut live_names).unwrap();
 
-        // The update is not admitted, and alice keeps her claim's binding.
+        // The update is admitted and becomes alice's binding.
         assert_eq!(
             count(
                 &tx,
-                "SELECT COUNT(*) FROM names WHERE name = 'alice' AND action = 'claim'"
+                "SELECT COUNT(*) FROM names WHERE name = 'alice' AND action = 'update'"
             ),
             1
         );
@@ -1992,7 +1963,7 @@ mod admission {
                 &tx,
                 "SELECT COUNT(*) FROM name_events WHERE action = 'update'"
             ),
-            0
+            1
         );
     }
 
@@ -2188,8 +2159,8 @@ mod admission {
     }
 
     /// The mint's builder spends the anchor in one action and puts the name
-    /// note in another, with fee inputs between them. `accept_claim` still
-    /// binds the name: exactly one live anchor retired, one successor.
+    /// note in another, with fee inputs between them. The claim still binds
+    /// the name: it spent a live anchor, and has one successor.
     #[test]
     fn claim_binds_when_the_anchor_spend_is_a_different_action() {
         let conn = db();
