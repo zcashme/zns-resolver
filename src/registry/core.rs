@@ -580,7 +580,7 @@ fn apply_transaction(
 
     match note.action() {
         Action::Claim => {
-            // Gate: the mint's accept_claim. The anchor spend and the
+            // Gate: claim. The anchor spend and the
             // name note are separate actions — fee inputs sit between
             // them — so the name note's own nullifier is not the anchor.
             // Spending a live anchor proves the mint made the claim. The
@@ -2159,8 +2159,8 @@ mod admission {
     }
 
     /// The mint's builder spends the anchor in one action and puts the name
-    /// note in another, with fee inputs between them. `accept_claim` still
-    /// binds the name: exactly one live anchor retired, one successor.
+    /// note in another, with fee inputs between them. The claim still binds
+    /// the name: it spent a live anchor, and has one successor.
     #[test]
     fn claim_binds_when_the_anchor_spend_is_a_different_action() {
         let conn = db();

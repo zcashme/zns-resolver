@@ -1,16 +1,16 @@
 //! The anchor lineage, derived: a pure fold over position-ordered facts.
 //!
 //! The lineage is never maintained — it is recomputed from chain facts.
-//! The rules mirror the mint's claim-anchor semantics exactly
-//! (`zns-mint` `AnchorPool` / `apply_block`). The keygen ceremony is one
+//! The rules follow the mint's claim anchors (`zns-mint` `AnchorPool` /
+//! `apply_block`), as far as admission needs them. The keygen ceremony is one
 //! transaction: all 40 zero-value registry notes, and no name note. A
 //! zero-value note in any other transaction does not join the pool.
 //! Spending an anchor later leaves one fewer in the pool, and a new note
 //! does not replace it. A revealed nullifier retires whatever the rest of
 //! its transaction turned out to be; a successor joins one-for-one —
 //! including while the pool is short — only for a claim whose registry
-//! outputs are exactly one zero-value note, and only when exactly one
-//! live anchor retired.
+//! outputs are exactly one zero-value note, and only when it spent at
+//! least one live anchor.
 //!
 //! Because the fold is a pure function of facts, reorg correctness is
 //! inherited from the fact tables' rewind semantics: folding the facts
@@ -74,8 +74,8 @@ pub(crate) struct TxAnchorFacts {
     pub(crate) retirements: Vec<Retirement>,
     /// Name notes in this transaction. The keygen ceremony has none.
     pub(crate) name_notes: usize,
-    /// The mint admits this claim's successor. The output shape is one
-    /// zero-value note, exactly one live anchor retired, the transaction
+    /// The resolver admits this claim's successor. The output shape is one
+    /// zero-value note, at least one live anchor retired, the transaction
     /// spent no name note, and the name was free. A duplicate on a live
     /// name, or a claim that also spends a name note, leaves this false:
     /// the anchor still retires, and the successor stays out.
@@ -125,8 +125,7 @@ impl Lineage {
 
     /// Advances the lineage across one transaction, in the mint's order:
     /// the keygen transaction's notes, then retirements (facts follow the
-    /// chain whatever the verdict), then the one-for-one successor when
-    /// the output shape is exactly one.
+    /// chain whatever the verdict), then the admitted claim's successor.
     pub(crate) fn step_tx(&mut self, height: u32, facts: &TxAnchorFacts) {
         if is_ceremony_fill(facts.adoptions.len(), facts.name_notes) {
             for adoption in &facts.adoptions {
@@ -141,18 +140,19 @@ impl Lineage {
             }
         }
 
-        // One-for-one, mirroring the mint's accept_claim: the successor
-        // joins only when the claim is admitted. The anchor it spent has
-        // already retired, whatever the verdict. Authority cannot be
-        // minted, only succeeded. This insert is independent of ceremony
-        // close: an admitted successor still enters while the pool is short.
-        if retired == 1 && facts.claim_successor && facts.adoptions.len() == 1 {
+        // The successor joins when the claim is admitted, which needs at
+        // least one live anchor spent: the same rule the claim gate applies.
+        // The anchors it spent have already retired, whatever the verdict.
+        // Authority cannot be minted, only succeeded. This insert is
+        // independent of ceremony close: an admitted successor still enters
+        // while the pool is short.
+        if retired >= 1 && facts.claim_successor && facts.adoptions.len() == 1 {
             self.live.insert(facts.adoptions[0].nf);
         }
     }
 
-    /// Whether `nf` is a live claim anchor right now. The claim law counts
-    /// live retirements directly; this query is for the lineage tests.
+    /// Whether `nf` is a live claim anchor right now. Admission uses
+    /// [`Self::spends_live_anchor`]; this query is for the lineage tests.
     #[cfg(test)]
     pub(crate) fn contains(&self, nf: &AnchorNf) -> bool {
         self.live.contains(nf)
