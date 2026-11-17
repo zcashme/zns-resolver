@@ -193,13 +193,15 @@ impl ZnsApiServer for JsonRpcApi {
         let class = classify_request(query.as_deref(), limit, offset)?;
         let query = query.unwrap_or_default();
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
-        let conn = self.db.lock();
 
         match class {
             // No query: every registered name in one response, the same
             // request from every client.
             QueryClass::All => {
-                let regs = core::all_registrations(&conn).map_err(RpcError::from)?;
+                let regs = self
+                    .db
+                    .read(core::all_registrations)
+                    .map_err(RpcError::from)?;
                 Ok(ResolveResult::Many(
                     regs.into_iter().map(NameRecord::from).collect(),
                 ))
@@ -207,7 +209,9 @@ impl ZnsApiServer for JsonRpcApi {
             // The empty query lists all registrations — the page-through form
             // explorers and sitemaps build on.
             QueryClass::List => {
-                let (regs, _) = core::list_registrations(&conn, limit_u32, offset_u32)
+                let (regs, _) = self
+                    .db
+                    .read(|conn| core::list_registrations(conn, limit_u32, offset_u32))
                     .map_err(RpcError::from)?;
                 Ok(ResolveResult::Many(
                     regs.into_iter().map(NameRecord::from).collect(),
@@ -218,12 +222,17 @@ impl ZnsApiServer for JsonRpcApi {
             }
             // 1–63 lowercase letters or digits, the shape the mint accepts.
             QueryClass::Name => {
-                let reg = core::resolve_by_name(&conn, &query).map_err(RpcError::from)?;
+                let reg = self
+                    .db
+                    .read(|conn| core::resolve_by_name(conn, &query))
+                    .map_err(RpcError::from)?;
                 Ok(ResolveResult::Exact(reg.map(NameRecord::from)))
             }
             // Any other Zcash address queries the names currently bound to it.
             QueryClass::Address => {
-                let (regs, _) = core::registrations_by_ua(&conn, &query, limit_u32, offset_u32)
+                let (regs, _) = self
+                    .db
+                    .read(|conn| core::registrations_by_ua(conn, &query, limit_u32, offset_u32))
                     .map_err(RpcError::from)?;
                 Ok(ResolveResult::Many(
                     regs.into_iter().map(NameRecord::from).collect(),
@@ -239,9 +248,10 @@ impl ZnsApiServer for JsonRpcApi {
         offset: Option<u64>,
     ) -> RpcResult<Paginated<NameRecord>> {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
-        let conn = self.db.lock();
-        let (regs, total) =
-            core::list_registrations(&conn, limit_u32, offset_u32).map_err(RpcError::from)?;
+        let (regs, total) = self
+            .db
+            .read(|conn| core::list_registrations(conn, limit_u32, offset_u32))
+            .map_err(RpcError::from)?;
         let items = regs.into_iter().map(NameRecord::from).collect();
         Ok(Paginated {
             items,
@@ -259,8 +269,9 @@ impl ZnsApiServer for JsonRpcApi {
         offset: Option<u64>,
     ) -> RpcResult<Paginated<NameRecord>> {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
-        let conn = self.db.lock();
-        let (regs, total) = core::registrations_by_ua(&conn, &address, limit_u32, offset_u32)
+        let (regs, total) = self
+            .db
+            .read(|conn| core::registrations_by_ua(conn, &address, limit_u32, offset_u32))
             .map_err(RpcError::from)?;
         let items = regs.into_iter().map(NameRecord::from).collect();
         Ok(Paginated {
@@ -272,7 +283,7 @@ impl ZnsApiServer for JsonRpcApi {
     }
 
     async fn status(&self) -> RpcResult<Status> {
-        let position = core::checkpoint(&self.db.lock()).map_err(RpcError::from)?;
+        let position = self.db.read(core::checkpoint).map_err(RpcError::from)?;
         let tip = *self.tip.borrow();
 
         // The verdict needs both facts: our durable position and the network's
@@ -310,10 +321,10 @@ impl ZnsApiServer for JsonRpcApi {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
         let since = since_height.map(|h| h.min(u32::MAX as u64) as u32);
 
-        let conn = self.db.lock();
-        let (events, total) =
-            core::events(&conn, name.as_deref(), action, since, limit_u32, offset_u32)
-                .map_err(RpcError::from)?;
+        let (events, total) = self
+            .db
+            .read(|conn| core::events(conn, name.as_deref(), action, since, limit_u32, offset_u32))
+            .map_err(RpcError::from)?;
 
         let events = events.into_iter().map(NameEvent::from).collect();
 
