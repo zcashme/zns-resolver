@@ -628,26 +628,7 @@ fn apply_transaction(
             };
 
             let nullifier = TipNf::from_scan(candidate.nf);
-            if record_admission(
-                db_tx,
-                &AdmissionRow {
-                    name: candidate.name(),
-                    height: height as i64,
-                    action: note.action().as_str(),
-                    ua: note.ua().as_str(),
-                    expires_at: &note
-                        .expires_at()
-                        .map(|e| e.field_bytes().to_string())
-                        .unwrap_or_else(|| "none".to_string()),
-                    prev: expected_prev.as_slice(),
-                    cmx: &candidate.cand_cmx,
-                    nullifier: nullifier.as_bytes(),
-                    txid: candidate.txid.as_slice(),
-                    tx_index: law.tx_index as i64,
-                    action_index: candidate.action_index as i64,
-                    memo: candidate.memo,
-                },
-            )? {
+            if record_candidate(db_tx, candidate, law, &expected_prev, &nullifier)? {
                 live_names.insert(nullifier);
             }
             Ok(true)
@@ -709,26 +690,7 @@ fn apply_transaction(
             //             so this tip follows the mint's ledger.
             // A sale, list, auction, or delist stays live on those gates.
             let nullifier = TipNf::from_scan(candidate.nf);
-            if record_admission(
-                db_tx,
-                &AdmissionRow {
-                    name: candidate.name(),
-                    height: height as i64,
-                    action: note.action().as_str(),
-                    ua: note.ua().as_str(),
-                    expires_at: &note
-                        .expires_at()
-                        .map(|e| e.field_bytes().to_string())
-                        .unwrap_or_else(|| "none".to_string()),
-                    prev: expected_prev.as_slice(),
-                    cmx: &candidate.cand_cmx,
-                    nullifier: nullifier.as_bytes(),
-                    txid: candidate.txid.as_slice(),
-                    tx_index: law.tx_index as i64,
-                    action_index: candidate.action_index as i64,
-                    memo: candidate.memo,
-                },
-            )? {
+            if record_candidate(db_tx, candidate, law, &expected_prev, &nullifier)? {
                 if let Some(live) = binding.as_ref() {
                     live_names.remove(&live.nullifier);
                 }
@@ -818,6 +780,38 @@ fn end_binding_implicitly(
         ],
     )?;
     Ok(())
+}
+
+/// Records `candidate` as the admitted successor of `expected_prev`. Returns
+/// whether this call inserted the event.
+fn record_candidate(
+    db_tx: &Transaction<'_>,
+    candidate: &Candidate<'_>,
+    law: &TxLaw,
+    expected_prev: &[u8; 32],
+    nullifier: &TipNf,
+) -> rusqlite::Result<bool> {
+    let note = &candidate.note;
+    record_admission(
+        db_tx,
+        &AdmissionRow {
+            name: candidate.name(),
+            height: law.height as i64,
+            action: note.action().as_str(),
+            ua: note.ua().as_str(),
+            expires_at: &note
+                .expires_at()
+                .map(|e| e.field_bytes().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            prev: expected_prev.as_slice(),
+            cmx: &candidate.cand_cmx,
+            nullifier: nullifier.as_bytes(),
+            txid: candidate.txid.as_slice(),
+            tx_index: law.tx_index as i64,
+            action_index: candidate.action_index as i64,
+            memo: candidate.memo,
+        },
+    )
 }
 
 /// The columns of one admitted candidate, written to the event log and the
