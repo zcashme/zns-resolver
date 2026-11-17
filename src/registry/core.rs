@@ -12,9 +12,7 @@ use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::{BlockHeight, Parameters as _};
 use zns_verify::{Action, Memo, NameNote, Tip};
 
-use super::anchor_lineage::{
-    keeps_anchor_note, Adoption, Lineage, Position, Retirement, TxAnchorFacts,
-};
+use super::anchor_lineage::{Adoption, Lineage, Position, Retirement, TxAnchorFacts};
 use super::nf::{AnchorNf, TipNf};
 use super::notes;
 use super::{Event, Registration};
@@ -297,10 +295,10 @@ pub(crate) fn apply_batch(
                 tx_index,
                 height,
                 facts: TxAnchorFacts {
-                    // The keygen transaction's notes, or a claim's one
-                    // successor. A zero-value note in any other transaction
-                    // does not join.
-                    adoptions: if keeps_anchor_note(adoptions.len(), name_notes, shape) {
+                    // The birthday block's notes, or a claim's one
+                    // successor. A zero-value note anywhere else does not
+                    // join.
+                    adoptions: if lineage.keeps_anchor_note(height, shape) {
                         adoptions
                     } else {
                         Vec::new()
@@ -467,11 +465,12 @@ fn row_u32(value: i64) -> rusqlite::Result<u32> {
 /// adoption at its own position, each spent zero-value note a retirement at
 /// its spending position. The candidate count marks the accept path, and
 /// `claim_successor` marks a claim whose only registry output is that note.
-pub(crate) fn fold_lineage(mut events: Vec<(Position, FactEvent)>) -> Lineage {
+/// The notes adopted in the `birthday` block are the starting anchors.
+pub(crate) fn fold_lineage(birthday: u32, mut events: Vec<(Position, FactEvent)>) -> Lineage {
     events.sort_by_key(|(pos, _)| *pos);
 
     // Group by transaction, in canonical order.
-    let mut lineage = Lineage::new();
+    let mut lineage = Lineage::new(birthday);
     for group in events.chunk_by(|a, b| (a.0.height, a.0.tx_index) == (b.0.height, b.0.tx_index)) {
         let height = group[0].0.height;
         let mut facts = TxAnchorFacts::default();
@@ -491,13 +490,12 @@ pub(crate) fn fold_lineage(mut events: Vec<(Position, FactEvent)>) -> Lineage {
         }
         lineage.step_tx(height, &facts);
     }
-    // An empty lineage past the ceremony height means the scan began after
-    // the keygen ceremony: every claim will be rejected (fail closed).
+    // An empty lineage past the birthday means the birthday block held no
+    // anchors: every claim will be rejected (fail closed).
     tracing::debug!(
         anchors = lineage.len(),
         empty = lineage.is_empty(),
-        adoption_closed = lineage.adoption_closed(),
-        established = lineage.established(),
+        birthday,
         "anchor lineage folded from facts"
     );
     lineage
@@ -1568,16 +1566,15 @@ mod tests {
         )
         .unwrap();
 
-        let lineage = fold_lineage(lineage_facts(&conn).unwrap());
+        let lineage = fold_lineage(10, lineage_facts(&conn).unwrap());
         assert_eq!(lineage.len(), 40);
-        assert!(lineage.adoption_closed());
         assert_eq!(ironwood_nullifiers(&conn).unwrap().len(), 40);
     }
 
-    /// One stored zero-value note is not the keygen transaction, so the
-    /// fold does not adopt it.
+    /// A stored zero-value note outside the birthday block is not a starting
+    /// anchor, so the fold does not adopt it.
     #[test]
-    fn a_stored_note_outside_the_keygen_transaction_does_not_join() {
+    fn a_stored_note_outside_the_birthday_block_does_not_join() {
         let conn = database();
         conn.execute(
             "INSERT INTO anchor_facts (nullifier, value, height, tx_index, action_index, name_note_candidates, spent_height)
@@ -1586,15 +1583,14 @@ mod tests {
         )
         .unwrap();
 
-        let lineage = fold_lineage(lineage_facts(&conn).unwrap());
+        let lineage = fold_lineage(9, lineage_facts(&conn).unwrap());
         assert!(lineage.is_empty());
-        assert!(!lineage.adoption_closed());
     }
 
     /// A stored adoption, the spend that retires it, and the successor note
-    /// fold to the pool the batch would keep. The pool is already full, so
-    /// the successor enters only because the stored row says it is a claim
-    /// successor.
+    /// fold to the pool the batch would keep. The successor is outside the
+    /// birthday block, so it enters only because the stored row says it is a
+    /// claim successor.
     #[test]
     fn lineage_facts_replay_a_spent_anchor_and_its_successor() {
         let conn = database();
@@ -1625,9 +1621,8 @@ mod tests {
         )
         .unwrap();
 
-        let lineage = fold_lineage(lineage_facts(&conn).unwrap());
+        let lineage = fold_lineage(10, lineage_facts(&conn).unwrap());
 
-        assert!(lineage.adoption_closed());
         assert_eq!(lineage.len(), 40);
         assert!(lineage.contains(&AnchorNf::from_bytes(&successor)));
         assert!(!lineage.contains(&AnchorNf::from_bytes(&spent)));
@@ -2488,11 +2483,11 @@ mod admission {
         assert_eq!(action, "update", "the mint accepted the renewal");
     }
 
-    /// A batch with one received zero-value note is not the keygen
-    /// transaction, so that note is not stored. A payment and a note this
-    /// account sent are not stored either.
+    /// A received zero-value note after the birthday block that is not a
+    /// claim's successor is not stored. A payment and a note this account
+    /// sent are not stored either.
     #[test]
-    fn a_batch_skips_a_note_outside_the_keygen_transaction_and_a_payment() {
+    fn a_batch_skips_a_note_outside_the_birthday_block_and_a_payment() {
         use orchard::keys::Scope;
         use orchard::note::{Nullifier, RandomSeed, Rho};
         use orchard::value::NoteValue;
@@ -2585,7 +2580,7 @@ mod admission {
             },
             &[tx],
             &fvk(),
-            Lineage::new(),
+            Lineage::new(1),
         )
         .unwrap();
 
@@ -2593,11 +2588,19 @@ mod admission {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM anchor_facts"), 0);
     }
 
+    /// A lineage whose birthday block holds the anchors `anchors`.
     fn seeded_lineage(anchors: &[u8]) -> Lineage {
-        let mut lineage = Lineage::new();
-        for seed in anchors {
-            lineage.adopt(0, nf(*seed));
-        }
+        let mut lineage = Lineage::new(0);
+        lineage.step_tx(
+            0,
+            &TxAnchorFacts {
+                adoptions: anchors
+                    .iter()
+                    .map(|seed| Adoption { nf: nf(*seed) })
+                    .collect(),
+                ..TxAnchorFacts::default()
+            },
+        );
         lineage
     }
 }
