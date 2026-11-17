@@ -313,7 +313,6 @@ pub(crate) fn apply_batch(
                             nf: AnchorNf::from_scan(s.nf),
                         })
                         .collect(),
-                    has_single_name_note: name_notes == 1,
                     name_notes,
                     // The output shape; the verdict narrows it.
                     claim_successor: shape,
@@ -484,7 +483,6 @@ pub(crate) fn fold_lineage(mut events: Vec<(Position, FactEvent)>) -> Lineage {
                     name_note_candidates,
                     claim_successor,
                 } => {
-                    facts.has_single_name_note = name_note_candidates == 1;
                     facts.name_notes = usize::try_from(name_note_candidates).unwrap_or(usize::MAX);
                     facts.claim_successor = claim_successor;
                     facts.adoptions.push(Adoption { nf });
@@ -558,8 +556,7 @@ fn apply_transaction(
     // The accept path is exactly one candidate. Every other transaction —
     // candidate-free, or two or more — takes follow_spends: the binding of
     // every live name it spent ends.
-    let candidate = tx_facts
-        .has_single_name_note
+    let candidate = (tx_facts.name_notes == 1)
         .then(|| candidates.iter().find(|c| c.txid == law.txid))
         .flatten();
     let Some(candidate) = candidate else {
@@ -628,26 +625,7 @@ fn apply_transaction(
             };
 
             let nullifier = TipNf::from_scan(candidate.nf);
-            if record_admission(
-                db_tx,
-                &AdmissionRow {
-                    name: candidate.name(),
-                    height: height as i64,
-                    action: note.action().as_str(),
-                    ua: note.ua().as_str(),
-                    expires_at: &note
-                        .expires_at()
-                        .map(|e| e.field_bytes().to_string())
-                        .unwrap_or_else(|| "none".to_string()),
-                    prev: expected_prev.as_slice(),
-                    cmx: &candidate.cand_cmx,
-                    nullifier: nullifier.as_bytes(),
-                    txid: candidate.txid.as_slice(),
-                    tx_index: law.tx_index as i64,
-                    action_index: candidate.action_index as i64,
-                    memo: candidate.memo,
-                },
-            )? {
+            if record_candidate(db_tx, candidate, law, &expected_prev, &nullifier)? {
                 live_names.insert(nullifier);
             }
             Ok(true)
@@ -709,26 +687,7 @@ fn apply_transaction(
             //             so this tip follows the mint's ledger.
             // A sale, list, auction, or delist stays live on those gates.
             let nullifier = TipNf::from_scan(candidate.nf);
-            if record_admission(
-                db_tx,
-                &AdmissionRow {
-                    name: candidate.name(),
-                    height: height as i64,
-                    action: note.action().as_str(),
-                    ua: note.ua().as_str(),
-                    expires_at: &note
-                        .expires_at()
-                        .map(|e| e.field_bytes().to_string())
-                        .unwrap_or_else(|| "none".to_string()),
-                    prev: expected_prev.as_slice(),
-                    cmx: &candidate.cand_cmx,
-                    nullifier: nullifier.as_bytes(),
-                    txid: candidate.txid.as_slice(),
-                    tx_index: law.tx_index as i64,
-                    action_index: candidate.action_index as i64,
-                    memo: candidate.memo,
-                },
-            )? {
+            if record_candidate(db_tx, candidate, law, &expected_prev, &nullifier)? {
                 if let Some(live) = binding.as_ref() {
                     live_names.remove(&live.nullifier);
                 }
@@ -776,12 +735,15 @@ fn mark_released_spent(
             )
             .optional()?
             .ok_or_else(|| invariant_failure("live-name set does not match the names table"))?;
-        live_names.remove(&nf);
-        db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
-        db_tx.execute(
-            "INSERT OR IGNORE INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![name, height as i64, txid, tx_index as i64, action_index as i64, nf.as_bytes()],
+        end_binding_implicitly(
+            db_tx,
+            live_names,
+            &name,
+            height,
+            txid,
+            tx_index,
+            action_index,
+            &nf,
         )?;
     }
     Ok(())
@@ -815,6 +777,43 @@ fn end_binding_implicitly(
         ],
     )?;
     Ok(())
+}
+
+/// A Name Note's `expires_at` as the registry stores and serves it: the
+/// memo field, or `"none"`.
+fn expires_field(note: &NameNote<'_>) -> String {
+    note.expires_at()
+        .map(|e| e.field_bytes().to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+/// Records `candidate` as the admitted successor of `expected_prev`. Returns
+/// whether this call inserted the event.
+fn record_candidate(
+    db_tx: &Transaction<'_>,
+    candidate: &Candidate<'_>,
+    law: &TxLaw,
+    expected_prev: &[u8; 32],
+    nullifier: &TipNf,
+) -> rusqlite::Result<bool> {
+    let note = &candidate.note;
+    record_admission(
+        db_tx,
+        &AdmissionRow {
+            name: candidate.name(),
+            height: law.height as i64,
+            action: note.action().as_str(),
+            ua: note.ua().as_str(),
+            expires_at: &expires_field(note),
+            prev: expected_prev.as_slice(),
+            cmx: &candidate.cand_cmx,
+            nullifier: nullifier.as_bytes(),
+            txid: candidate.txid.as_slice(),
+            tx_index: law.tx_index as i64,
+            action_index: candidate.action_index as i64,
+            memo: candidate.memo,
+        },
+    )
 }
 
 /// The columns of one admitted candidate, written to the event log and the
@@ -913,10 +912,7 @@ pub(crate) fn rewind(conn: &Connection, to: Cursor) -> rusqlite::Result<()> {
     }
 
     // Keep the hash so a restart resumes after `to`, not at the birthday.
-    tx.execute(
-        "UPDATE registry_account SET sync_height = ?1, sync_hash = ?2 WHERE id = 0",
-        params![kept, to.hash.0.as_slice()],
-    )?;
+    set_checkpoint_in_tx(&tx, &to)?;
 
     tx.commit()?;
     Ok(())
@@ -1141,10 +1137,7 @@ pub(crate) fn events(
                 txid,
                 height: height as u32,
                 action_index: action_index as usize,
-                expires_at: note
-                    .expires_at()
-                    .map(|e| e.field_bytes().to_string())
-                    .unwrap_or_else(|| "none".to_string()),
+                expires_at: expires_field(&note),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1348,10 +1341,7 @@ fn registration_from_row(r: &Row<'_>) -> rusqlite::Result<Registration> {
     Ok(Registration {
         name: note.name().as_str().to_string(),
         ua: note.ua().as_str().to_string(),
-        expires_at: note
-            .expires_at()
-            .map(|e| e.field_bytes().to_string())
-            .unwrap_or_else(|| "none".to_string()),
+        expires_at: expires_field(&note),
         txid,
         height: height as u32,
         last_action: Action::from_bytes(action.as_bytes()).ok_or(corrupt_record())?,
@@ -1729,7 +1719,6 @@ mod tests {
             retirements: vec![Retirement {
                 nf: AnchorNf::from_bytes(&nf),
             }],
-            has_single_name_note: false,
             name_notes: 0,
             claim_successor: false,
         };
@@ -2102,9 +2091,9 @@ mod admission {
         height: u32,
         adoptions: Vec<Adoption>,
         retirements: Vec<Retirement>,
-        has_single_name_note: bool,
+        name_notes: usize,
     ) -> TxLaw {
-        let claim_successor = has_single_name_note && adoptions.len() == 1;
+        let claim_successor = name_notes == 1 && adoptions.len() == 1;
         TxLaw {
             txid,
             tx_index: 0,
@@ -2112,8 +2101,7 @@ mod admission {
             facts: TxAnchorFacts {
                 adoptions,
                 retirements,
-                has_single_name_note,
-                name_notes: usize::from(has_single_name_note),
+                name_notes,
                 claim_successor,
             },
         }
@@ -2144,7 +2132,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
 
@@ -2172,7 +2160,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
         assert!(apply_transaction(&tx, &first, &first_law, &lineage, &mut live_names).unwrap());
@@ -2194,7 +2182,7 @@ mod admission {
             101,
             vec![Adoption { nf: nf(201) }],
             vec![Retirement { nf: nf(200) }],
-            true,
+            1,
         );
         // The name is already live, so the successor stays out. The anchor
         // it spent still retires.
@@ -2246,7 +2234,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            true,
+            1,
         );
         apply_transaction(&tx, &candidates, &release, &seeded, &mut live_names).unwrap();
 
@@ -2255,7 +2243,7 @@ mod admission {
             200,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         claim.tx_index = 1;
         assert!(apply_transaction(&tx, &candidates, &claim, &seeded, &mut live_names).unwrap());
@@ -2279,7 +2267,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::new();
         assert!(apply_transaction(&tx, &claim, &claim_law, &lineage, &mut live_names).unwrap());
@@ -2314,7 +2302,7 @@ mod admission {
                 },
                 Retirement { nf: nf(200) },
             ],
-            true,
+            1,
         );
         apply_transaction(&tx, &update, &update_law, &lineage, &mut live_names).unwrap();
 
@@ -2345,7 +2333,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&tip),
             }],
-            true,
+            1,
         );
         apply_transaction(&tx, &list, &law, &lineage, &mut live_names).unwrap();
         lineage.step_tx(101, &law.facts);
@@ -2377,7 +2365,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&tip),
             }],
-            true,
+            1,
         );
         apply_transaction(&tx, &sale, &law, &lineage, &mut live_names).unwrap();
 
@@ -2430,7 +2418,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         let mut live_names = HashSet::new();
         assert!(apply_transaction(tx, &claim, &law, &lineage, &mut live_names).unwrap());
@@ -2474,7 +2462,6 @@ mod admission {
             facts: TxAnchorFacts {
                 adoptions: vec![Adoption { nf: nf(200) }],
                 retirements: vec![Retirement { nf: nf(1) }],
-                has_single_name_note: true,
                 name_notes: 1,
                 claim_successor: false,
             },
@@ -2512,7 +2499,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }],
-            true,
+            1,
         );
         let mut live_names = HashSet::new();
 
@@ -2541,7 +2528,7 @@ mod admission {
             100,
             vec![Adoption { nf: nf(200) }],
             vec![Retirement { nf: nf(1) }, Retirement { nf: nf(9) }],
-            true,
+            1,
         );
         let mut live_names = HashSet::new();
 
@@ -2572,7 +2559,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[9; 32]),
             }],
-            true,
+            1,
         );
         let mut live_names = HashSet::new();
 
@@ -2608,7 +2595,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
@@ -2661,7 +2648,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            true,
+            1,
         );
         let release_law = tx_law_for(
             [2; 32],
@@ -2670,7 +2657,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(nullifier_u.as_bytes()),
             }],
-            true,
+            1,
         );
 
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
@@ -2729,7 +2716,7 @@ mod admission {
                 },
                 Retirement { nf: nf(9) },
             ],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
@@ -2778,7 +2765,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            false, // two candidates: follow_spends
+            2, // two candidates: follow_spends
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
@@ -2814,7 +2801,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            false,
+            0,
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
@@ -2853,7 +2840,7 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            true,
+            1,
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
