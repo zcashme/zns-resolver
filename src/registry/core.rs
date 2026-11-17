@@ -782,6 +782,14 @@ fn end_binding_implicitly(
     Ok(())
 }
 
+/// A Name Note's `expires_at` as the registry stores and serves it: the
+/// memo field, or `"none"`.
+fn expires_field(note: &NameNote<'_>) -> String {
+    note.expires_at()
+        .map(|e| e.field_bytes().to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
 /// Records `candidate` as the admitted successor of `expected_prev`. Returns
 /// whether this call inserted the event.
 fn record_candidate(
@@ -799,10 +807,7 @@ fn record_candidate(
             height: law.height as i64,
             action: note.action().as_str(),
             ua: note.ua().as_str(),
-            expires_at: &note
-                .expires_at()
-                .map(|e| e.field_bytes().to_string())
-                .unwrap_or_else(|| "none".to_string()),
+            expires_at: &expires_field(note),
             prev: expected_prev.as_slice(),
             cmx: &candidate.cand_cmx,
             nullifier: nullifier.as_bytes(),
@@ -1138,10 +1143,7 @@ pub(crate) fn events(
                 txid,
                 height: height as u32,
                 action_index: action_index as usize,
-                expires_at: note
-                    .expires_at()
-                    .map(|e| e.field_bytes().to_string())
-                    .unwrap_or_else(|| "none".to_string()),
+                expires_at: expires_field(&note),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1345,10 +1347,7 @@ fn registration_from_row(r: &Row<'_>) -> rusqlite::Result<Registration> {
     Ok(Registration {
         name: note.name().as_str().to_string(),
         ua: note.ua().as_str().to_string(),
-        expires_at: note
-            .expires_at()
-            .map(|e| e.field_bytes().to_string())
-            .unwrap_or_else(|| "none".to_string()),
+        expires_at: expires_field(&note),
         txid,
         height: height as u32,
         last_action: Action::from_bytes(action.as_bytes()).ok_or(corrupt_record())?,
