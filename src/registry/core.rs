@@ -256,7 +256,6 @@ pub(crate) fn apply_batch(
             let txid = *tx.txid.as_ref();
             let tx_index = tx.tx_index;
             let name_notes = candidates.iter().filter(|c| c.txid == txid).count();
-            let shape = claim_successor_output(tx, &candidates);
 
             // Spends are recorded whatever the verdict: a later transaction
             // can retire an anchor this one did not create.
@@ -294,14 +293,9 @@ pub(crate) fn apply_batch(
                 tx_index,
                 height,
                 facts: TxAnchorFacts {
-                    // The birthday block's notes, or a claim's one
-                    // successor. A zero-value note anywhere else does not
-                    // join.
-                    adoptions: if lineage.keeps_anchor_note(height, shape) {
-                        adoptions
-                    } else {
-                        Vec::new()
-                    },
+                    // Every zero-value registry note the transaction
+                    // created. A claim must create at least one.
+                    adoptions,
                     retirements: tx
                         .ironwood_spends
                         .iter()
@@ -310,14 +304,13 @@ pub(crate) fn apply_batch(
                         })
                         .collect(),
                     name_notes,
-                    // The output shape; the verdict narrows it.
-                    claim_successor: shape,
+                    claim_successor: false,
                 },
             };
             let seated = apply_transaction(&db_tx, &candidates, &law, &lineage, &mut live_names)?;
-            // A rejected claim's zero-value note is not a successor: the
-            // fold would seat it later.
-            if shape && !seated {
+            // Only the birthday block's notes and an admitted claim's new
+            // anchors join. A zero-value note anywhere else is not stored.
+            if !lineage.keeps_anchor_note(height, seated) {
                 law.facts.adoptions.clear();
             }
             law.facts.claim_successor = seated;
@@ -408,8 +401,7 @@ pub(crate) fn lineage_facts(conn: &Connection) -> rusqlite::Result<Vec<(Position
 }
 
 /// The transaction's registry outputs other than its name notes: the notes
-/// that can be anchors. The mint's `apply_block` takes a claim's successor
-/// from the same set.
+/// that can be anchors.
 fn anchor_outputs<'t>(
     tx: &'t WalletTx,
     candidates: &[Candidate<'_>],
@@ -423,26 +415,6 @@ fn anchor_outputs<'t>(
     tx.ironwood_outputs
         .iter()
         .filter(move |output| !name_notes.contains(&output.index))
-}
-
-/// The mint's successor output: one registry output besides the name note,
-/// zero-value and received, and the transaction's one name note is a
-/// claim. A sent note is not stored as an adoption, so it cannot be the
-/// successor the fold seats.
-fn claim_successor_output(tx: &WalletTx, candidates: &[Candidate<'_>]) -> bool {
-    let outputs: Vec<&OrchardOutput> = anchor_outputs(tx, candidates).collect();
-    let [output] = outputs.as_slice() else {
-        return false;
-    };
-    if output.is_sent || output.note.value().inner() != 0 || output.nf.is_none() {
-        return false;
-    }
-    let txid = *tx.txid.as_ref();
-    let mut notes = candidates.iter().filter(|candidate| candidate.txid == txid);
-    let Some(candidate) = notes.next() else {
-        return false;
-    };
-    notes.next().is_none() && candidate.note.action() == Action::Claim
 }
 
 fn row_u32(value: i64) -> rusqlite::Result<u32> {
@@ -563,11 +535,11 @@ fn apply_transaction(
             // name note are separate actions — fee inputs sit between
             // them — so the name note's own nullifier is not the anchor.
             // Spending a live anchor proves the mint made the claim. The
-            // transaction must also spend no live name, and its registry
-            // outputs must be the one zero-value successor of a claim.
+            // transaction must also spend no live name, and create at least
+            // one new anchor.
             let law_ok = lineage.spends_live_anchor(tx_facts)
                 && !spent_a_live_name
-                && tx_facts.claim_successor;
+                && !tx_facts.adoptions.is_empty();
             if !law_ok {
                 log_orphaned_tip_spends(db_tx, live_names, tx_facts, height, &candidate.txid)?;
                 return Ok(false);
@@ -2067,10 +2039,10 @@ mod admission {
         )
     }
 
-    /// A second registry output means the mint's successor is absent, so
-    /// the claim does not bind even though one zero-value note is present.
+    /// A claim that creates no new anchor does not bind, even though it
+    /// spends a live anchor.
     #[test]
-    fn claim_with_an_extra_registry_output_does_not_bind() {
+    fn a_claim_that_creates_no_anchor_does_not_bind() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
 
@@ -2084,7 +2056,7 @@ mod admission {
             tx_index: 0,
             height: 100,
             facts: TxAnchorFacts {
-                adoptions: vec![Adoption { nf: nf(200) }],
+                adoptions: vec![],
                 retirements: vec![Retirement { nf: nf(1) }],
                 name_notes: 1,
                 claim_successor: false,

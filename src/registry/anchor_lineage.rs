@@ -43,11 +43,8 @@ pub(crate) struct TxAnchorFacts {
     pub(crate) retirements: Vec<Retirement>,
     /// Name notes in this transaction.
     pub(crate) name_notes: usize,
-    /// The resolver admits this claim's successor. The output shape is one
-    /// zero-value note, at least one live anchor retired, the transaction
-    /// spent no name note, and the name was free. A duplicate on a live
-    /// name, or a claim that also spends a name note, leaves this false:
-    /// the anchor still retires, and the successor stays out.
+    /// Whether this transaction is an admitted claim, whose zero-value
+    /// registry notes join the pool as new anchors.
     pub(crate) claim_successor: bool,
 }
 
@@ -68,9 +65,9 @@ impl Lineage {
     }
 
     /// Whether a zero-value registry note at `height` is an anchor fact: a
-    /// starting anchor, or a claim's successor.
-    pub(crate) fn keeps_anchor_note(&self, height: u32, claim_successor: bool) -> bool {
-        claim_successor || self.is_birthday(height)
+    /// starting anchor, or a new anchor from an admitted claim.
+    pub(crate) fn keeps_anchor_note(&self, height: u32, admitted_claim: bool) -> bool {
+        admitted_claim || self.is_birthday(height)
     }
 
     /// Whether `height` is the birthday block, whose zero-value registry
@@ -79,11 +76,11 @@ impl Lineage {
         height == self.birthday
     }
 
-    /// Advances the lineage across one transaction: the birthday block's
-    /// notes, then retirements (facts follow the chain whatever the verdict),
-    /// then the admitted claim's successor.
+    /// Advances the lineage across one transaction: the zero-value notes of
+    /// the birthday block or an admitted claim join, then every spent anchor
+    /// leaves, whatever the verdict.
     pub(crate) fn step_tx(&mut self, height: u32, facts: &TxAnchorFacts) {
-        if self.is_birthday(height) {
+        if self.is_birthday(height) || facts.claim_successor {
             for adoption in &facts.adoptions {
                 self.live.insert(adoption.nf);
             }
@@ -91,12 +88,6 @@ impl Lineage {
 
         for retirement in &facts.retirements {
             self.live.remove(&retirement.nf);
-        }
-
-        // An admitted claim's successor joins. Admission already required a
-        // live anchor spent, so authority is only ever succeeded.
-        if facts.claim_successor && facts.adoptions.len() == 1 {
-            self.live.insert(facts.adoptions[0].nf);
         }
     }
 
@@ -214,11 +205,10 @@ mod tests {
         assert!(lineage.contains(&nf(200)));
     }
 
-    /// After the birthday block, a zero-value note seats only as a claim's
-    /// successor. An update or release that spends one anchor, and a claim
-    /// with a second registry output, are both stored with the flag clear.
+    /// After the birthday block, a zero-value note seats only as an admitted
+    /// claim's new anchor. Any other transaction's note does not join.
     #[test]
-    fn a_note_without_the_claim_shape_does_not_seat() {
+    fn a_note_outside_an_admitted_claim_does_not_seat() {
         let mut lineage = started();
         lineage.step_tx(
             BIRTHDAY + 1,
