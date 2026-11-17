@@ -2,8 +2,8 @@
 //!
 //! The lineage is never maintained — it is recomputed from chain facts.
 //! The starting anchors are every zero-value registry note received in the
-//! birthday block. A zero-value note in a later block joins only as an
-//! admitted claim's successor. A spent anchor leaves, whatever its
+//! birthday block. A zero-value note in a later block joins only as one of
+//! an admitted claim's new anchors. A spent anchor leaves, whatever its
 //! transaction.
 //!
 //! Because the fold is a pure function of facts, reorg correctness is
@@ -35,8 +35,8 @@ pub(crate) struct Retirement {
     pub(crate) nf: AnchorNf,
 }
 
-/// One transaction's anchor facts: its zero-value registry notes kept as
-/// anchor facts, and its spends.
+/// One transaction's anchor facts: its zero-value registry notes, and its
+/// spends.
 #[derive(Debug, Default)]
 pub(crate) struct TxAnchorFacts {
     pub(crate) adoptions: Vec<Adoption>,
@@ -80,7 +80,7 @@ impl Lineage {
     /// the birthday block or an admitted claim join, then every spent anchor
     /// leaves, whatever the verdict.
     pub(crate) fn step_tx(&mut self, height: u32, facts: &TxAnchorFacts) {
-        if self.is_birthday(height) || facts.claim_successor {
+        if self.keeps_anchor_note(height, facts.claim_successor) {
             for adoption in &facts.adoptions {
                 self.live.insert(adoption.nf);
             }
@@ -155,7 +155,7 @@ mod tests {
 
     /// The birthday block's zero-value notes are the starting anchors,
     /// however many there are. A zero-value note in any later block joins
-    /// only as a claim's successor.
+    /// only as an admitted claim's new anchor.
     #[test]
     fn only_the_birthday_block_starts_the_pool() {
         let lineage = Lineage::new(BIRTHDAY);
@@ -224,8 +224,8 @@ mod tests {
         assert_eq!(lineage.len(), usize::from(STARTING_ANCHORS) - 1);
     }
 
-    /// Two zero-value outputs after the birthday block are not a claim's
-    /// successor, so neither joins. The retirement still follows the chain.
+    /// Two zero-value outputs from a transaction that is not an admitted
+    /// claim do not join. The retirement still follows the chain.
     #[test]
     fn multi_adoption_tx_gets_no_successor_insert() {
         let mut lineage = Lineage::new(BIRTHDAY);
