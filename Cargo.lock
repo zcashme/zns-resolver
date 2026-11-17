@@ -1710,9 +1710,9 @@ dependencies = [
 
 [[package]]
 name = "seer-sync"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98d6718c5c985e0a52c8d87045dbc1bb070852e2056574fe239b161aeaced583"
+checksum = "547cb8ace491e39169bbd8eb77b44fbb236b21066f1c6427988534fddeae38f3"
 dependencies = [
  "futures-util",
  "http",

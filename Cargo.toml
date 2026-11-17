@@ -22,7 +22,7 @@ mainnet = []
 testnet = []
 
 [dependencies]
-seer-sync = { version = "0.8", default-features = false }
+seer-sync = { version = "0.9", default-features = false }
 zns-verify = "0.3.0"
 zcash_address = "0.14"
 orchard = { version = "0.16", default-features = false, features = ["std"] }
