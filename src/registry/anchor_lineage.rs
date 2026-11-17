@@ -158,20 +158,9 @@ impl Lineage {
         self.live.contains(nf)
     }
 
-    /// How many of the transaction's retirements hit live anchors — the
-    /// mint's `spent.len()` in `accept_claim` (must be exactly one).
-    pub(crate) fn live_retirements(&self, facts: &TxAnchorFacts) -> usize {
-        facts
-            .retirements
-            .iter()
-            .filter(|r| self.live.contains(&r.nf))
-            .count()
-    }
-
-    /// Whether any of the transaction's retirements hits a live anchor —
-    /// the mint's `predecessor_spent` guard: an update or release whose
-    /// transaction also spends an anchor is malformed.
-    pub(crate) fn touches_live_anchor(&self, facts: &TxAnchorFacts) -> bool {
+    /// Whether the transaction spends a live anchor: a registry note only the
+    /// mint can spend, so a claim's proof that the mint made it.
+    pub(crate) fn spends_live_anchor(&self, facts: &TxAnchorFacts) -> bool {
         facts.retirements.iter().any(|r| self.live.contains(&r.nf))
     }
 
