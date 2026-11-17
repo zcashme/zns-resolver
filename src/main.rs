@@ -78,7 +78,7 @@ async fn main() {
 
     // --- The registry key is decoded before anything persists it: a bad key
     // --- panics here and never poisons the registry_account row. ---
-    UnifiedFullViewingKey::decode(&NETWORK, UFVK)
+    let _ = UnifiedFullViewingKey::decode(&NETWORK, UFVK)
         .expect("registry UFVK decodes")
         .orchard()
         .expect("registry UFVK has an orchard component");

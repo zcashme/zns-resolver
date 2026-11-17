@@ -16,8 +16,8 @@ use super::nf::{AnchorNf, TipNf};
 use super::notes;
 use super::{Event, Registration};
 
-/// One candidate: a registry output whose memo decodes to a name note that
-/// binds to its published commitment.
+/// One candidate: a note the registry received whose memo decodes to a name
+/// note that binds to its published commitment.
 /// Parsed and verified once at triage; every stage reads this form.
 /// Flattened from the scan output so the admission boundary is
 /// constructible in tests.
@@ -158,6 +158,13 @@ pub(crate) fn apply_batch(
                 let action_index = output.index as usize;
                 let cand_note = &output.note;
 
+                // Gate: a note the registry received, the only kind with a
+                // nullifier to watch. The scan also recovers outgoing outputs,
+                // which have none.
+                let Some(nf) = output.nf else {
+                    candidate_dropped("not a received registry note", &txid, action_index);
+                    continue;
+                };
                 let Some(memo) = &output.memo else {
                     candidate_dropped("missing memo", &txid, action_index);
                     continue;
@@ -196,12 +203,6 @@ pub(crate) fn apply_batch(
                     candidate_dropped("ua is not revision 0", &txid, action_index);
                     continue;
                 }
-
-                // The scan derives every registry note's nullifier from the
-                // full viewing key.
-                let nf = output
-                    .nf
-                    .ok_or_else(|| invariant_failure("registry output has no nullifier"))?;
 
                 memos.push(zns_memo);
                 sources.push(Source {
@@ -2515,6 +2516,66 @@ mod admission {
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM anchor_facts"), 0);
+    }
+
+    /// An output the scan recovers with the registry's outgoing viewing key
+    /// has no nullifier. Even with a binding Name Note memo it is not a
+    /// candidate: the batch applies and admits nothing.
+    #[test]
+    fn a_recovered_outgoing_name_note_is_not_a_candidate() {
+        use orchard::keys::Scope;
+        use seer_sync::sync::scan::WalletTx;
+        use seer_sync::Cursor;
+        use zcash_primitives::block::BlockHash;
+        use zcash_protocol::consensus::BlockHeight;
+        use zcash_protocol::TxId;
+
+        let conn = db();
+        let prev = [0u8; 32];
+        let text = format!("ZNS:claim:alice:{}:none:{}", test_ua(), hex(&prev));
+        let mut raw = [0u8; 512];
+        raw[..text.len()].copy_from_slice(text.as_bytes());
+        let memo = Memo::from_bytes(&raw).expect("memo");
+        let note = NameNote::parse(&memo).expect("name note");
+        let bound = note_with_rseed(name_note_rseed(memo.fields().expect("fields"), &prev));
+        assert!(notes::binds(&memo, &note, &bound));
+
+        let tx = WalletTx {
+            txid: TxId::from_bytes([1; 32]),
+            height: BlockHeight::from_u32(10),
+            tx_index: 0,
+            sapling_outputs: vec![],
+            sapling_spends: vec![],
+            orchard_outputs: vec![],
+            orchard_spends: vec![],
+            ironwood_outputs: vec![seer_sync::sync::scan::OrchardOutput {
+                index: 0,
+                note: bound,
+                recipient: bound.recipient(),
+                nf: None,
+                position: 0,
+                scope: Scope::External,
+                memo: Some(raw),
+                is_sent: true,
+                is_change: false,
+            }],
+            ironwood_spends: vec![],
+            transparent_outputs: vec![],
+            transparent_spends: vec![],
+        };
+        apply_batch(
+            &conn,
+            Cursor {
+                height: BlockHeight::from_u32(10),
+                hash: BlockHash([2; 32]),
+            },
+            &[tx],
+            Lineage::new(1),
+        )
+        .unwrap();
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM name_events"), 0);
     }
 
     /// A lineage whose birthday block holds the anchors `anchors`.
