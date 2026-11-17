@@ -1581,10 +1581,11 @@ mod tests {
 mod admission {
     use super::*;
     use crate::registry::storage::SCHEMA_SQL;
-    use orchard::keys::{FullViewingKey, SpendingKey};
+    use orchard::keys::{FullViewingKey, Scope, SpendingKey};
     use orchard::note::{Note, NoteVersion};
     use zcash_address::unified;
     use zcash_protocol::consensus::Parameters;
+    use zcash_protocol::TxId;
     use zns_verify::{name_note_rseed, PrevCmx};
 
     const RAW_ADDR: [u8; 43] = [
@@ -1641,6 +1642,11 @@ mod admission {
 
     /// A zero-value note to the test recipient with the given rseed.
     fn note_with_rseed(rseed: [u8; 32]) -> Note {
+        note(0, rseed)
+    }
+
+    /// A note of `zatoshis` to the test recipient with the given rseed.
+    fn note(zatoshis: u64, rseed: [u8; 32]) -> Note {
         use orchard::note::{RandomSeed, Rho};
         use orchard::value::NoteValue;
         let recipient = orchard::Address::from_raw_address_bytes(&RAW_ADDR)
@@ -1650,9 +1656,67 @@ mod admission {
         let rseed = RandomSeed::from_bytes(rseed, &rho)
             .into_option()
             .expect("rseed");
-        Note::from_parts(recipient, NoteValue::ZERO, rho, rseed, NoteVersion::V3)
-            .into_option()
-            .expect("note")
+        Note::from_parts(
+            recipient,
+            NoteValue::from_raw(zatoshis),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .into_option()
+        .expect("note")
+    }
+
+    /// A scanned registry output: received, with a nullifier, or recovered
+    /// with the outgoing viewing key, with none.
+    fn scanned(index: u32, note: Note, memo: Option<[u8; 512]>, received: bool) -> OrchardOutput {
+        OrchardOutput {
+            index,
+            note,
+            recipient: note.recipient(),
+            nf: received.then(|| note.nullifier(&fvk())),
+            position: u64::from(index),
+            scope: Scope::External,
+            memo,
+            is_sent: !received,
+            is_change: false,
+        }
+    }
+
+    /// A 512-byte claim memo for `name`, and a note whose rseed it binds.
+    fn bound_claim(name: &str) -> ([u8; 512], Note) {
+        let prev = [0u8; 32];
+        let text = format!("ZNS:claim:{name}:{}:none:{}", test_ua(), hex(&prev));
+        let mut raw = [0u8; 512];
+        raw[..text.len()].copy_from_slice(text.as_bytes());
+        let memo = Memo::from_bytes(&raw).expect("memo");
+        let bound = note_with_rseed(name_note_rseed(memo.fields().expect("fields"), &prev));
+        let parsed = NameNote::parse(&memo).expect("name note");
+        assert!(notes::binds(&memo, &parsed, &bound));
+        (raw, bound)
+    }
+
+    /// Applies one transaction's registry outputs as a batch at height 10,
+    /// after a birthday at height 1.
+    fn apply_outputs(conn: &Connection, outputs: Vec<OrchardOutput>) {
+        let tx = WalletTx {
+            txid: TxId::from_bytes([1; 32]),
+            height: BlockHeight::from_u32(10),
+            tx_index: 0,
+            sapling_outputs: vec![],
+            sapling_spends: vec![],
+            orchard_outputs: vec![],
+            orchard_spends: vec![],
+            ironwood_outputs: outputs,
+            ironwood_spends: vec![],
+            transparent_outputs: vec![],
+            transparent_spends: vec![],
+        };
+        let at = Cursor {
+            height: BlockHeight::from_u32(10),
+            hash: BlockHash([2; 32]),
+        };
+        apply_batch(conn, at, &[tx], Lineage::new(1)).unwrap();
     }
 
     /// Builds a verified candidate the same way triage does.
@@ -2414,165 +2478,33 @@ mod admission {
         assert_eq!(action, "update", "the mint accepted the renewal");
     }
 
-    /// A received zero-value note after the birthday block, outside an
-    /// admitted claim, is not stored. A payment and a note this account sent
-    /// are not stored either.
+    /// After the birthday block and outside an admitted claim, nothing is
+    /// stored: not a received zero-value note, a payment, or a note this
+    /// account sent.
     #[test]
     fn a_batch_skips_a_note_outside_the_birthday_block_and_a_payment() {
-        use orchard::keys::Scope;
-        use orchard::note::{Nullifier, RandomSeed, Rho};
-        use orchard::value::NoteValue;
-        use orchard::Address;
-        use seer_sync::sync::scan::WalletTx;
-        use seer_sync::Cursor;
-        use zcash_primitives::block::BlockHash;
-        use zcash_protocol::consensus::BlockHeight;
-        use zcash_protocol::TxId;
-
         let conn = db();
-        conn.execute(
-            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
-            [],
-        )
-        .unwrap();
-
-        let rho = Rho::from_bytes(&[9u8; 32]).into_option().expect("rho");
-        let rseed = RandomSeed::from_bytes([4u8; 32], &rho)
-            .into_option()
-            .expect("rseed");
-        let recipient = Address::from_raw_address_bytes(&RAW_ADDR)
-            .into_option()
-            .expect("address");
-        let payment = Note::from_parts(
-            recipient,
-            NoteValue::from_raw(1),
-            rho,
-            rseed,
-            orchard::note::NoteVersion::V3,
-        )
-        .into_option()
-        .expect("payment note");
-        let zero = test_note();
-        let nf_bytes = [9u8; 32];
-        let nullifier = Option::from(Nullifier::from_bytes(&nf_bytes)).expect("nullifier");
-
-        let tx = WalletTx {
-            txid: TxId::from_bytes([1; 32]),
-            height: BlockHeight::from_u32(10),
-            tx_index: 0,
-            sapling_outputs: vec![],
-            sapling_spends: vec![],
-            orchard_outputs: vec![],
-            orchard_spends: vec![],
-            ironwood_outputs: vec![
-                seer_sync::sync::scan::OrchardOutput {
-                    index: 0,
-                    note: zero,
-                    recipient,
-                    nf: Some(nullifier),
-                    position: 0,
-                    scope: Scope::External,
-                    memo: None,
-                    is_sent: false,
-                    is_change: false,
-                },
-                seer_sync::sync::scan::OrchardOutput {
-                    index: 1,
-                    note: payment,
-                    recipient,
-                    nf: Some(nullifier),
-                    position: 1,
-                    scope: Scope::External,
-                    memo: None,
-                    is_sent: false,
-                    is_change: false,
-                },
-                seer_sync::sync::scan::OrchardOutput {
-                    index: 2,
-                    note: zero,
-                    recipient,
-                    nf: Some(nullifier),
-                    position: 2,
-                    scope: Scope::External,
-                    memo: None,
-                    is_sent: true,
-                    is_change: false,
-                },
-            ],
-            ironwood_spends: vec![],
-            transparent_outputs: vec![],
-            transparent_spends: vec![],
-        };
-        apply_batch(
+        apply_outputs(
             &conn,
-            Cursor {
-                height: BlockHeight::from_u32(10),
-                hash: BlockHash([2; 32]),
-            },
-            &[tx],
-            Lineage::new(1),
-        )
-        .unwrap();
+            vec![
+                scanned(0, test_note(), None, true),
+                scanned(1, note(1, [4u8; 32]), None, true),
+                scanned(2, test_note(), None, false),
+            ],
+        );
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM anchor_facts"), 0);
     }
 
-    /// An output the scan recovers with the registry's outgoing viewing key
-    /// has no nullifier. Even with a binding Name Note memo it is not a
-    /// candidate: the batch applies and admits nothing.
+    /// An output recovered with the registry's outgoing viewing key has no
+    /// nullifier, so it is not a candidate even with a binding Name Note
+    /// memo: the batch applies and admits nothing.
     #[test]
     fn a_recovered_outgoing_name_note_is_not_a_candidate() {
-        use orchard::keys::Scope;
-        use seer_sync::sync::scan::WalletTx;
-        use seer_sync::Cursor;
-        use zcash_primitives::block::BlockHash;
-        use zcash_protocol::consensus::BlockHeight;
-        use zcash_protocol::TxId;
-
         let conn = db();
-        let prev = [0u8; 32];
-        let text = format!("ZNS:claim:alice:{}:none:{}", test_ua(), hex(&prev));
-        let mut raw = [0u8; 512];
-        raw[..text.len()].copy_from_slice(text.as_bytes());
-        let memo = Memo::from_bytes(&raw).expect("memo");
-        let note = NameNote::parse(&memo).expect("name note");
-        let bound = note_with_rseed(name_note_rseed(memo.fields().expect("fields"), &prev));
-        assert!(notes::binds(&memo, &note, &bound));
-
-        let tx = WalletTx {
-            txid: TxId::from_bytes([1; 32]),
-            height: BlockHeight::from_u32(10),
-            tx_index: 0,
-            sapling_outputs: vec![],
-            sapling_spends: vec![],
-            orchard_outputs: vec![],
-            orchard_spends: vec![],
-            ironwood_outputs: vec![seer_sync::sync::scan::OrchardOutput {
-                index: 0,
-                note: bound,
-                recipient: bound.recipient(),
-                nf: None,
-                position: 0,
-                scope: Scope::External,
-                memo: Some(raw),
-                is_sent: true,
-                is_change: false,
-            }],
-            ironwood_spends: vec![],
-            transparent_outputs: vec![],
-            transparent_spends: vec![],
-        };
-        apply_batch(
-            &conn,
-            Cursor {
-                height: BlockHeight::from_u32(10),
-                hash: BlockHash([2; 32]),
-            },
-            &[tx],
-            Lineage::new(1),
-        )
-        .unwrap();
+        let (memo, note) = bound_claim("alice");
+        apply_outputs(&conn, vec![scanned(0, note, Some(memo), false)]);
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM names"), 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM name_events"), 0);
