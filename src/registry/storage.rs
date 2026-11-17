@@ -89,10 +89,14 @@ CREATE INDEX IF NOT EXISTS idx_anchor_facts_value ON anchor_facts (value);
 -- term and liveness clocks alone (issue #61). Mark the schema only
 -- after all tables have been created.
 PRAGMA application_id = 1515082545; -- ZNS1
-PRAGMA user_version = 3;
+PRAGMA user_version = 1;
 "#;
 
-/// Opens only this schema. An older database must be removed by the operator
+/// The one schema version. It never changes: a schema change keeps 1, and the
+/// operator removes the old SQLite file and rescans from the birthday.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Opens only this schema. Any other database must be removed by the operator
 /// and rebuilt by scanning from the birthday; no old checkpoint is reused.
 pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CONNECTION_SQL)?;
@@ -106,7 +110,7 @@ pub(crate) fn install_schema(conn: &Connection) -> rusqlite::Result<()> {
     if objects == 0 && version == 0 && application_id == 0 {
         return conn.execute_batch(SCHEMA_SQL);
     }
-    if version == 3 && application_id == 1515082545 {
+    if version == SCHEMA_VERSION && application_id == 1515082545 {
         return Ok(());
     }
     tracing::error!(
