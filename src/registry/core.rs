@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 
-use orchard::keys::{FullViewingKey, Scope};
 use orchard::note::{ExtractedNoteCommitment, Nullifier};
 use rusqlite::{self as rusqlite, params, Connection, OptionalExtension, Row, Transaction};
 use seer_sync::sync::scan::{OrchardOutput, WalletTx};
@@ -17,9 +16,8 @@ use super::nf::{AnchorNf, TipNf};
 use super::notes;
 use super::{Event, Registration};
 
-/// One authenticated candidate: a registry output whose memo decodes to a
-/// name note that binds to its published commitment, is zero-valued, and
-/// is addressed to the registry — the mint's `decrypt_name_notes` gates.
+/// One candidate: a registry output whose memo decodes to a name note that
+/// binds to its published commitment.
 /// Parsed and verified once at triage; every stage reads this form.
 /// Flattened from the scan output so the admission boundary is
 /// constructible in tests.
@@ -136,7 +134,6 @@ pub(crate) fn apply_batch(
     conn: &Connection,
     scanned: Cursor,
     transactions: &[WalletTx],
-    fvk: &FullViewingKey,
     mut lineage: Lineage,
 ) -> rusqlite::Result<()> {
     let db_tx = conn.unchecked_transaction()?;
@@ -150,12 +147,9 @@ pub(crate) fn apply_batch(
     for block in transactions.chunk_by(|a, b| a.height == b.height) {
         let height = u32::from(block[0].height);
 
-        // Triage. The gates are the mint's `decrypt_name_notes`, so the
-        // accept-path count is mint-exact: the memo decodes to a NameNote, its
-        // record gives the note's rseed, the note is zero-valued, and it is
-        // addressed to the registry. Each survivor's memo is parsed once, into
-        // a per-block arena the candidates borrow.
-        let registry_recipient = fvk.to_ivk(Scope::External).address_at(0u32);
+        // Triage: the memo decodes to a NameNote, and its record gives the
+        // note's rseed. Each survivor's memo is parsed once, into a per-block
+        // arena the candidates borrow.
         let mut memos: Vec<Memo> = Vec::new();
         let mut sources: Vec<Source> = Vec::new();
         for tx in block {
@@ -181,15 +175,6 @@ pub(crate) fn apply_batch(
                 // Gate: binding — the record gives the note's rseed.
                 if !notes::binds(&zns_memo, &note, cand_note) {
                     candidate_dropped("commitment does not bind", &txid, action_index);
-                    continue;
-                }
-                // Gate: shape — zero value, registry recipient.
-                if cand_note.value().inner() != 0 {
-                    candidate_dropped("value is not zero", &txid, action_index);
-                    continue;
-                }
-                if cand_note.recipient() != registry_recipient {
-                    candidate_dropped("recipient is not the registry", &txid, action_index);
                     continue;
                 }
                 // Gate: the bound UA must decode as a Unified Address on this
@@ -1595,7 +1580,7 @@ mod tests {
 mod admission {
     use super::*;
     use crate::registry::storage::SCHEMA_SQL;
-    use orchard::keys::SpendingKey;
+    use orchard::keys::{FullViewingKey, SpendingKey};
     use orchard::note::{Note, NoteVersion};
     use zcash_address::unified;
     use zcash_protocol::consensus::Parameters;
@@ -2524,7 +2509,6 @@ mod admission {
                 hash: BlockHash([2; 32]),
             },
             &[tx],
-            &fvk(),
             Lineage::new(1),
         )
         .unwrap();
