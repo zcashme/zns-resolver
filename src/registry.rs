@@ -28,7 +28,6 @@ impl Db {
             Network::TestNetwork => "test",
         };
         core::install_registry_config(&conn, ufvk, net_str, birthday)?;
-        core::drop_payment_notes(&conn)?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
 

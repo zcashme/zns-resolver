@@ -119,16 +119,6 @@ fn config_refused(detail: &str) -> rusqlite::Error {
     )
 }
 
-/// Removes payment notes from the fact table. They are not part of the fold,
-/// and a database opened before that rule may still be holding them.
-pub(crate) fn drop_payment_notes(conn: &Connection) -> rusqlite::Result<usize> {
-    let removed = conn.execute("DELETE FROM anchor_facts WHERE value != 0", [])?;
-    if removed > 0 {
-        tracing::info!(removed, "dropped anchor rows that are not zero-value notes");
-    }
-    Ok(removed)
-}
-
 /// One triage survivor, pre-verification: everything `Candidate` needs
 /// except the parse, which borrows the per-block memo arena.
 struct Source<'a> {
@@ -1847,11 +1837,6 @@ mod tests {
         assert_eq!(lineage.len(), 40);
         assert!(lineage.adoption_closed());
         assert_eq!(ironwood_nullifiers(&conn).unwrap().len(), 40);
-        assert_eq!(drop_payment_notes(&conn).unwrap(), 1);
-        let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM anchor_facts", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(left, 40);
     }
 
     /// One stored zero-value note is not the keygen transaction, so the
