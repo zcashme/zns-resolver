@@ -53,11 +53,10 @@ const DB_PATH: &str = "zns.sqlite";
 #[cfg(feature = "testnet")]
 const DB_PATH: &str = "zns-testnet.sqlite";
 
-/// The mint's ceremony height — the registry's first notes are the
-/// ceremony anchors, so scanning starts there and never before: the
-/// height of the ceremony's anchor transaction. A stored
-/// registry_account row keeps its own birthday; this constant only seeds
-/// a first sync.
+/// The block holding the mint's anchor transaction. Scanning starts here,
+/// and this block's zero-value registry notes are the starting claim
+/// anchors. A stored registry_account row keeps its own birthday; this
+/// constant only seeds a first sync.
 #[cfg(feature = "mainnet")]
 const MINT_BIRTHDAY: u32 = 3_575_820;
 #[cfg(feature = "testnet")]

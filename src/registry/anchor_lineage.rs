@@ -1,16 +1,10 @@
 //! The anchor lineage, derived: a pure fold over position-ordered facts.
 //!
 //! The lineage is never maintained — it is recomputed from chain facts.
-//! The rules follow the mint's claim anchors (`zns-mint` `AnchorPool` /
-//! `apply_block`), as far as admission needs them. The keygen ceremony is one
-//! transaction: all 40 zero-value registry notes, and no name note. A
-//! zero-value note in any other transaction does not join the pool.
-//! Spending an anchor later leaves one fewer in the pool, and a new note
-//! does not replace it. A revealed nullifier retires whatever the rest of
-//! its transaction turned out to be; a successor joins one-for-one —
-//! including while the pool is short — only for a claim whose registry
-//! outputs are exactly one zero-value note, and only when it spent at
-//! least one live anchor.
+//! The starting anchors are every zero-value registry note received in the
+//! birthday block. A zero-value note in a later block joins only as an
+//! admitted claim's successor. A spent anchor leaves, whatever its
+//! transaction.
 //!
 //! Because the fold is a pure function of facts, reorg correctness is
 //! inherited from the fact tables' rewind semantics: folding the facts
@@ -19,29 +13,6 @@
 use std::collections::BTreeSet;
 
 use super::nf::AnchorNf;
-
-/// Standing size of the anchor lineage pool; mirrors keygen's `NUM_ANCHORS`
-/// and the mint's `ANCHOR_POOL_SIZE`.
-pub(crate) const ANCHOR_POOL_SIZE: usize = 40;
-
-/// The keygen ceremony is one transaction: the whole standing set of
-/// zero-value registry outputs, and no name note. A note outside that
-/// transaction does not join the pool.
-pub(crate) fn is_ceremony_fill(zero_value_outputs: usize, name_notes: usize) -> bool {
-    zero_value_outputs == ANCHOR_POOL_SIZE && name_notes == 0
-}
-
-/// A zero-value note is kept when it belongs to the keygen transaction,
-/// or when it is a claim's successor. The scan and the in-memory batch
-/// use the same check, so a replay of stored facts matches the batch
-/// that wrote them.
-pub(crate) fn keeps_anchor_note(
-    zero_value_notes: usize,
-    name_notes: usize,
-    claim_successor: bool,
-) -> bool {
-    claim_successor || is_ceremony_fill(zero_value_notes, name_notes)
-}
 
 /// Canonical chain position of a fact: block height, transaction index
 /// within the block, action index within the transaction.
@@ -64,15 +35,13 @@ pub(crate) struct Retirement {
     pub(crate) nf: AnchorNf,
 }
 
-/// One transaction's anchor facts, in canonical order. Adoptions and
-/// retirements are grouped per transaction because the mint's semantics
-/// are per-transaction: ceremony adoptions run before any verdict, and the
-/// one-for-one successor rule reads the transaction's output shape.
+/// One transaction's anchor facts: its zero-value registry notes kept as
+/// anchor facts, and its spends.
 #[derive(Debug, Default)]
 pub(crate) struct TxAnchorFacts {
     pub(crate) adoptions: Vec<Adoption>,
     pub(crate) retirements: Vec<Retirement>,
-    /// Name notes in this transaction. The keygen ceremony has none.
+    /// Name notes in this transaction.
     pub(crate) name_notes: usize,
     /// The resolver admits this claim's successor. The output shape is one
     /// zero-value note, at least one live anchor retired, the transaction
@@ -82,54 +51,41 @@ pub(crate) struct TxAnchorFacts {
     pub(crate) claim_successor: bool,
 }
 
-/// The set of nullifiers that currently confer claim authority, plus the
-/// block where ceremony adoption first reached standing size.
-#[derive(Debug, Default, Clone)]
+/// The set of nullifiers that currently confer claim authority, and the
+/// birthday block whose zero-value registry notes started it.
+#[derive(Debug, Clone)]
 pub(crate) struct Lineage {
     live: BTreeSet<AnchorNf>,
-    /// Block where ceremony adoption first reached standing size.
-    /// Later ordinary outputs do not refill a shrunken pool. Cleared
-    /// only when a rewind removes that block from the fact stream.
-    established: Option<u32>,
+    birthday: u32,
 }
 
 impl Lineage {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Whether ceremony adoption has already reached standing size.
-    pub(crate) fn adoption_closed(&self) -> bool {
-        self.established.is_some()
-    }
-
-    /// Block where ceremony adoption first reached standing size.
-    pub(crate) fn established(&self) -> Option<u32> {
-        self.established
-    }
-
-    /// One note from a ceremony the caller has already accepted. This is
-    /// the mint's `adopt`: the note joins until the pool first reaches
-    /// standing size. The scan does not call this for an arbitrary note.
-    /// `step_tx` calls it for each note of the keygen transaction. The
-    /// canon fixture's `adopt_anchor` events call it directly, the same
-    /// way the mint's fixture does.
-    pub(crate) fn adopt(&mut self, height: u32, nf: AnchorNf) {
-        if self.adoption_closed() || self.live.len() >= ANCHOR_POOL_SIZE {
-            return;
-        }
-        if self.live.insert(nf) && self.live.len() == ANCHOR_POOL_SIZE {
-            self.established = Some(height);
+    pub(crate) fn new(birthday: u32) -> Self {
+        Self {
+            live: BTreeSet::new(),
+            birthday,
         }
     }
 
-    /// Advances the lineage across one transaction, in the mint's order:
-    /// the keygen transaction's notes, then retirements (facts follow the
-    /// chain whatever the verdict), then the admitted claim's successor.
+    /// Whether a zero-value registry note at `height` is an anchor fact: a
+    /// starting anchor, or a claim's successor.
+    pub(crate) fn keeps_anchor_note(&self, height: u32, claim_successor: bool) -> bool {
+        claim_successor || self.is_birthday(height)
+    }
+
+    /// Whether `height` is the birthday block, whose zero-value registry
+    /// notes are the starting anchors.
+    fn is_birthday(&self, height: u32) -> bool {
+        height == self.birthday
+    }
+
+    /// Advances the lineage across one transaction: the birthday block's
+    /// notes, then retirements (facts follow the chain whatever the verdict),
+    /// then the admitted claim's successor.
     pub(crate) fn step_tx(&mut self, height: u32, facts: &TxAnchorFacts) {
-        if is_ceremony_fill(facts.adoptions.len(), facts.name_notes) {
+        if self.is_birthday(height) {
             for adoption in &facts.adoptions {
-                self.adopt(height, adoption.nf);
+                self.live.insert(adoption.nf);
             }
         }
 
@@ -138,8 +94,7 @@ impl Lineage {
         }
 
         // An admitted claim's successor joins. Admission already required a
-        // live anchor spent, so authority is only ever succeeded. This insert
-        // is independent of ceremony close.
+        // live anchor spent, so authority is only ever succeeded.
         if facts.claim_successor && facts.adoptions.len() == 1 {
             self.live.insert(facts.adoptions[0].nf);
         }
@@ -185,98 +140,52 @@ mod tests {
         Retirement { nf: nf(seed) }
     }
 
-    fn ceremony_adopt(seed: u8) -> TxAnchorFacts {
+    /// The birthday block the tests' lineages start from.
+    const BIRTHDAY: u32 = 1;
+
+    /// How many starting anchors the tests' birthday block holds.
+    const STARTING_ANCHORS: u8 = 40;
+
+    fn zero_value_notes(seeds: impl IntoIterator<Item = u8>) -> TxAnchorFacts {
         TxAnchorFacts {
-            adoptions: vec![adopt(seed)],
+            adoptions: seeds.into_iter().map(adopt).collect(),
             retirements: vec![],
             name_notes: 0,
             claim_successor: false,
         }
     }
 
-    fn keygen_ceremony() -> TxAnchorFacts {
-        TxAnchorFacts {
-            adoptions: (1..=ANCHOR_POOL_SIZE)
-                .map(|seed| adopt(seed as u8))
-                .collect(),
-            retirements: vec![],
-            name_notes: 0,
-            claim_successor: false,
-        }
+    /// A lineage started from the birthday block's anchors `1..=STARTING_ANCHORS`.
+    fn started() -> Lineage {
+        let mut lineage = Lineage::new(BIRTHDAY);
+        lineage.step_tx(BIRTHDAY, &zero_value_notes(1..=STARTING_ANCHORS));
+        lineage
     }
 
-    fn fill_to_standing_size(lineage: &mut Lineage, height: u32) {
-        lineage.step_tx(height, &keygen_ceremony());
-    }
-
-    /// The keygen transaction is the only ceremony. One note, 39 notes,
-    /// 41 notes, or 40 notes that share the transaction with a name note
-    /// do not join. The 40-note transaction with no name note fills the
-    /// pool and closes it.
+    /// The birthday block's zero-value notes are the starting anchors,
+    /// however many there are. A zero-value note in any later block joins
+    /// only as a claim's successor.
     #[test]
-    fn only_the_keygen_transaction_fills_the_pool() {
-        assert!(is_ceremony_fill(ANCHOR_POOL_SIZE, 0));
-        assert!(!is_ceremony_fill(1, 0));
-        assert!(!is_ceremony_fill(ANCHOR_POOL_SIZE - 1, 0));
-        assert!(!is_ceremony_fill(ANCHOR_POOL_SIZE + 1, 0));
-        assert!(!is_ceremony_fill(ANCHOR_POOL_SIZE, 1));
-        assert!(keeps_anchor_note(1, 1, true));
-        assert!(!keeps_anchor_note(1, 0, false));
-        assert!(keeps_anchor_note(ANCHOR_POOL_SIZE, 0, false));
-        assert!(!keeps_anchor_note(ANCHOR_POOL_SIZE, 1, false));
+    fn only_the_birthday_block_starts_the_pool() {
+        let lineage = Lineage::new(BIRTHDAY);
+        assert!(lineage.keeps_anchor_note(BIRTHDAY, false));
+        assert!(!lineage.keeps_anchor_note(BIRTHDAY + 1, false));
+        assert!(lineage.keeps_anchor_note(BIRTHDAY + 1, true));
 
-        let mut one = Lineage::new();
-        one.step_tx(1, &ceremony_adopt(1));
-        assert!(one.is_empty());
-        assert!(!one.adoption_closed());
-
-        let mut short = Lineage::new();
-        let mut facts = keygen_ceremony();
-        facts.adoptions.pop();
-        short.step_tx(1, &facts);
-        assert!(short.is_empty());
-
-        let mut with_name = Lineage::new();
-        let mut facts = keygen_ceremony();
-        facts.name_notes = 1;
-        with_name.step_tx(1, &facts);
-        assert!(with_name.is_empty());
-
-        let mut extra = Lineage::new();
-        let mut facts = keygen_ceremony();
-        facts.adoptions.push(adopt(0xF0));
-        extra.step_tx(1, &facts);
-        assert!(extra.is_empty());
-
-        let mut lineage = Lineage::new();
-        lineage.step_tx(1, &keygen_ceremony());
-        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
-        assert!(lineage.adoption_closed());
-        assert_eq!(lineage.established(), Some(1));
-    }
-
-    /// Ceremony filling stops at standing size. A note after the keygen
-    /// transaction does not join.
-    #[test]
-    fn adoption_is_capped_at_standing_size() {
-        let mut lineage = Lineage::new();
-        fill_to_standing_size(&mut lineage, 1);
-        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
-        assert!(lineage.adoption_closed());
-        assert_eq!(lineage.established(), Some(1));
-
-        lineage.step_tx(2, &ceremony_adopt(u8::MAX));
-        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
-        assert!(!lineage.contains(&nf(u8::MAX)));
+        let mut lineage = started();
+        assert_eq!(lineage.len(), usize::from(STARTING_ANCHORS));
+        lineage.step_tx(BIRTHDAY + 1, &zero_value_notes(101..=140));
+        assert_eq!(lineage.len(), usize::from(STARTING_ANCHORS));
+        assert!(!lineage.contains(&nf(101)));
     }
 
     /// A revealed nullifier retires whatever the transaction was.
     #[test]
     fn retirement_follows_the_chain_fact() {
-        let mut lineage = Lineage::new();
-        lineage.adopt(1, nf(1));
+        let mut lineage = Lineage::new(BIRTHDAY);
+        lineage.step_tx(BIRTHDAY, &zero_value_notes([1]));
         lineage.step_tx(
-            2,
+            BIRTHDAY + 1,
             &TxAnchorFacts {
                 adoptions: vec![],
                 retirements: vec![retire(1)],
@@ -287,16 +196,12 @@ mod tests {
         assert!(lineage.is_empty());
     }
 
-    /// A backed claim's successor joins one-for-one, past standing size.
+    /// An admitted claim's successor takes the place of the anchor it spent.
     #[test]
-    fn successor_joins_past_standing_size() {
-        let mut lineage = Lineage::new();
-        fill_to_standing_size(&mut lineage, 1);
-        // A backed claim: exactly one name-note candidate (the accept path),
-        // spends one live anchor, creates one zero-value output. The
-        // successor takes the retired anchor's seat.
+    fn a_claims_successor_joins() {
+        let mut lineage = started();
         lineage.step_tx(
-            2,
+            BIRTHDAY + 1,
             &TxAnchorFacts {
                 adoptions: vec![adopt(200)],
                 retirements: vec![retire(1)],
@@ -304,20 +209,19 @@ mod tests {
                 claim_successor: true,
             },
         );
-        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
+        assert_eq!(lineage.len(), usize::from(STARTING_ANCHORS));
         assert!(!lineage.contains(&nf(1)));
         assert!(lineage.contains(&nf(200)));
     }
 
-    /// After ceremony close, a zero-value note seats only as a claim's
+    /// After the birthday block, a zero-value note seats only as a claim's
     /// successor. An update or release that spends one anchor, and a claim
     /// with a second registry output, are both stored with the flag clear.
     #[test]
     fn a_note_without_the_claim_shape_does_not_seat() {
-        let mut lineage = Lineage::new();
-        fill_to_standing_size(&mut lineage, 1);
+        let mut lineage = started();
         lineage.step_tx(
-            2,
+            BIRTHDAY + 1,
             &TxAnchorFacts {
                 adoptions: vec![adopt(200)],
                 retirements: vec![retire(1)],
@@ -327,18 +231,17 @@ mod tests {
         );
         assert!(!lineage.contains(&nf(200)));
         assert!(!lineage.contains(&nf(1)));
-        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE - 1);
+        assert_eq!(lineage.len(), usize::from(STARTING_ANCHORS) - 1);
     }
 
-    /// Two zero-value outputs are not the keygen transaction, so neither
-    /// joins. The retirement still follows the chain. There is no
-    /// successor insert: the output shape is not exactly one.
+    /// Two zero-value outputs after the birthday block are not a claim's
+    /// successor, so neither joins. The retirement still follows the chain.
     #[test]
     fn multi_adoption_tx_gets_no_successor_insert() {
-        let mut lineage = Lineage::new();
-        lineage.adopt(1, nf(1));
+        let mut lineage = Lineage::new(BIRTHDAY);
+        lineage.step_tx(BIRTHDAY, &zero_value_notes([1]));
         lineage.step_tx(
-            2,
+            BIRTHDAY + 1,
             &TxAnchorFacts {
                 adoptions: vec![adopt(2), adopt(3)],
                 retirements: vec![retire(1)],
@@ -352,18 +255,15 @@ mod tests {
         assert!(lineage.is_empty());
     }
 
-    /// Within one transaction the mint's order is: ceremony adoptions
-    /// (capped), then retirements, then the successor. At the cap boundary
-    /// this order is observable: the successor's seat opens only after the
-    /// retirement, and the uncapped insert lands it anyway.
+    /// Within one transaction, the spent anchor retires before the successor
+    /// joins, so a claim that spends one anchor keeps the pool's size.
     #[test]
-    fn within_tx_order_adopts_then_retires_then_successor() {
-        let mut lineage = Lineage::new();
-        fill_to_standing_size(&mut lineage, 1);
+    fn within_tx_order_retires_then_successor() {
+        let mut lineage = started();
         let before = lineage.len();
 
         lineage.step_tx(
-            2,
+            BIRTHDAY + 1,
             &TxAnchorFacts {
                 adoptions: vec![adopt(200)],
                 retirements: vec![retire(7)],
@@ -377,78 +277,16 @@ mod tests {
         assert!(!lineage.contains(&nf(7)));
     }
 
-    /// Ceremony close is one-time: a later shrink does not reopen filling.
-    /// A one-for-one successor still enters while the pool is short.
-    /// Folding facts that survive a rewind drops the close only when the
-    /// completion block itself is gone.
-    #[test]
-    fn ceremony_adoption_stays_closed_after_the_pool_shrinks() {
-        let mut lineage = Lineage::new();
-        fill_to_standing_size(&mut lineage, 100);
-        assert!(lineage.adoption_closed());
-        assert_eq!(lineage.established(), Some(100));
-
-        // Candidate-free Registry spend: both anchors leave, no successor.
-        lineage.step_tx(
-            101,
-            &TxAnchorFacts {
-                adoptions: vec![],
-                retirements: vec![retire(1), retire(2)],
-                name_notes: 0,
-                claim_successor: false,
-            },
-        );
-        lineage.step_tx(102, &ceremony_adopt(0xF0));
-        assert!(!lineage.contains(&nf(0xF0)));
-        // A second keygen-shaped transaction does not refill the pool.
-        lineage.step_tx(102, &keygen_ceremony());
-        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE - 2);
-        assert!(lineage.adoption_closed());
-
-        // A backed successor still replaces the one anchor it spends.
-        lineage.step_tx(
-            103,
-            &TxAnchorFacts {
-                adoptions: vec![adopt(201)],
-                retirements: vec![retire(3)],
-                name_notes: 1,
-                claim_successor: true,
-            },
-        );
-        assert!(lineage.contains(&nf(201)));
-        lineage.step_tx(104, &ceremony_adopt(202));
-        assert!(!lineage.contains(&nf(202)));
-
-        // Rewind to the completion block: still closed, all 40 restored.
-        let mut at_completion = Lineage::new();
-        fill_to_standing_size(&mut at_completion, 100);
-        assert!(at_completion.adoption_closed());
-        assert_eq!(at_completion.len(), ANCHOR_POOL_SIZE);
-        at_completion.step_tx(100, &ceremony_adopt(203));
-        assert!(!at_completion.contains(&nf(203)));
-
-        // Before the keygen transaction, adopt() still takes a note. A
-        // one-note transaction does not.
-        let mut before = Lineage::new();
-        assert!(!before.adoption_closed());
-        assert_eq!(before.len(), 0);
-        before.adopt(100, nf(1));
-        assert!(before.contains(&nf(1)));
-        assert!(!before.adoption_closed());
-        before.step_tx(100, &ceremony_adopt(2));
-        assert!(!before.contains(&nf(2)));
-    }
-
     /// The reorg property: folding the facts that survive a rewind equals
     /// folding the winning chain from scratch. Rewind deletes facts above
     /// the fork and un-spends spends above it; the fold needs no code of
     /// its own to be reorg-correct.
     #[test]
     fn fold_over_rewound_facts_equals_fold_over_winning_chain() {
-        // Winning chain: anchor 1 adopted at h10, retired at h12 by a claim
-        // whose successor is anchor 2.
-        let mut lineage = Lineage::new();
-        lineage.adopt(10, nf(1));
+        // Winning chain: anchor 1 adopted at the birthday h10, retired at h12
+        // by a claim whose successor is anchor 2.
+        let mut lineage = Lineage::new(10);
+        lineage.step_tx(10, &zero_value_notes([1]));
 
         let facts = TxAnchorFacts {
             adoptions: vec![adopt(2)],
@@ -462,18 +300,19 @@ mod tests {
         // A rewind below h12 un-spends the retirement: the surviving fact
         // stream is just the adoption of anchor 1. Folding it from scratch
         // must match a lineage rebuilt only from surviving facts.
-        let mut rewound = Lineage::new();
-        rewound.adopt(10, nf(1));
+        let mut rewound = Lineage::new(10);
+        rewound.step_tx(10, &zero_value_notes([1]));
         assert!(rewound.contains(&nf(1)));
         assert_eq!(rewound.len(), 1);
         assert!(!rewound.contains(&nf(2)));
     }
 }
 
-/// The resolver folds the same chain facts the mint folds; the vendored
-/// canon fixture is the executable cross-repo contract. Every scenario is
-/// replayed into the fold; the live set and `adoption_closed` must equal
-/// the mint's recorded snapshot after every event.
+/// Replays the vendored canon fixture, the mint's recorded anchor-pool
+/// snapshots, through the fold. Each scenario's first adoption block is its
+/// birthday, and the live set must equal the snapshot after every event. The
+/// scenarios in `CEREMONY_SCENARIOS` adopt anchors across several blocks and
+/// are not replayed.
 #[cfg(test)]
 mod canon {
     use super::*;
@@ -481,10 +320,12 @@ mod canon {
 
     const FIXTURE: &str = include_str!("../../tests/fixtures/canon-vectors-v1.json");
 
+    /// Scenarios that adopt anchors across several blocks.
+    const CEREMONY_SCENARIOS: [&str; 2] = ["ceremony_closes_once", "ceremony_fill"];
+
     #[derive(Deserialize)]
     struct Fixture {
         version: String,
-        anchor_pool_size: usize,
         scenarios: Vec<Scenario>,
     }
 
@@ -534,7 +375,6 @@ mod canon {
     #[derive(Deserialize)]
     struct Trace {
         anchor_pool: Vec<String>,
-        adoption_closed: bool,
     }
 
     fn hex32(s: &str) -> AnchorNf {
@@ -550,23 +390,14 @@ mod canon {
         height: u32,
         tx_index: u32,
         facts: TxAnchorFacts,
-        /// `adopt_anchor` is the mint's `adopt()` call. The scan never
-        /// sets this; it only steps a keygen transaction.
-        adopt: bool,
     }
 
-    fn fold(applied: &[Applied]) -> Lineage {
+    fn fold(birthday: u32, applied: &[Applied]) -> Lineage {
         let mut order: Vec<&Applied> = applied.iter().collect();
         order.sort_by_key(|a| (a.height, a.tx_index));
-        let mut lineage = Lineage::new();
+        let mut lineage = Lineage::new(birthday);
         for applied in order {
-            if applied.adopt {
-                for adoption in &applied.facts.adoptions {
-                    lineage.adopt(applied.height, adoption.nf);
-                }
-            } else {
-                lineage.step_tx(applied.height, &applied.facts);
-            }
+            lineage.step_tx(applied.height, &applied.facts);
         }
         lineage
     }
@@ -576,19 +407,12 @@ mod canon {
         for hex in &trace.anchor_pool {
             assert!(lineage.contains(&hex32(hex)), "missing anchor {hex}");
         }
-        assert_eq!(
-            lineage.adoption_closed(),
-            trace.adoption_closed,
-            "adoption_closed"
-        );
     }
 
     #[test]
     fn canon_vectors_pin_the_fold() {
         let fixture: Fixture = serde_json::from_str(FIXTURE).expect("fixture parses");
         assert_eq!(fixture.version, "canon-vectors-v1");
-        // The fixture pins the standing size across repos.
-        assert_eq!(fixture.anchor_pool_size, ANCHOR_POOL_SIZE);
 
         // The exact scenario set — a count alone would let a fixture edit
         // silently drop the security regression vector.
@@ -609,11 +433,23 @@ mod canon {
         );
 
         for scenario in &fixture.scenarios {
+            if CEREMONY_SCENARIOS.contains(&scenario.name.as_str()) {
+                continue;
+            }
+            // The scenario's anchors are adopted in one block: its birthday.
+            let birthday = scenario
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    CanonEvent::AdoptAnchor { height, .. } => Some(*height),
+                    _ => None,
+                })
+                .expect("a scenario adopts its starting anchors");
             let mut applied: Vec<Applied> = Vec::new();
             for (i, event) in scenario.events.iter().enumerate() {
-                let (height, facts, adopt) = match event {
-                    // The fixture calls the mint's adopt() once per note.
-                    // The keygen check lives in step_tx, not in these events.
+                let (height, facts) = match event {
+                    // The fixture calls the mint's adopt() once per note, all
+                    // in the birthday block, where step_tx takes them.
                     CanonEvent::AdoptAnchor { height, nullifier } => (
                         *height,
                         TxAnchorFacts {
@@ -624,7 +460,6 @@ mod canon {
                             name_notes: 0,
                             claim_successor: false,
                         },
-                        true,
                     ),
                     CanonEvent::Retire { height, spent } => (
                         *height,
@@ -637,7 +472,6 @@ mod canon {
                             name_notes: 0,
                             claim_successor: false,
                         },
-                        false,
                     ),
                     CanonEvent::Claim {
                         height,
@@ -659,7 +493,6 @@ mod canon {
                             // verdict; the scan computes the same one.
                             claim_successor: expect == "accepted",
                         },
-                        false,
                     ),
                     CanonEvent::UnbackedClaim { height, spent } => (
                         *height,
@@ -672,7 +505,6 @@ mod canon {
                             name_notes: 1,
                             claim_successor: false,
                         },
-                        false,
                     ),
                     CanonEvent::Update {
                         height,
@@ -691,11 +523,10 @@ mod canon {
                             name_notes: 1,
                             claim_successor: false,
                         },
-                        false,
                     ),
                     CanonEvent::Rewind { to_height } => {
                         applied.retain(|a| a.height <= *to_height);
-                        let lineage = fold(&applied);
+                        let lineage = fold(birthday, &applied);
                         assert_snapshot(&lineage, &scenario.trace[i]);
                         continue;
                     }
@@ -704,9 +535,8 @@ mod canon {
                     height,
                     tx_index: i as u32,
                     facts,
-                    adopt,
                 });
-                let lineage = fold(&applied);
+                let lineage = fold(birthday, &applied);
                 assert_snapshot(&lineage, &scenario.trace[i]);
             }
         }

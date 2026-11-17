@@ -115,11 +115,11 @@ impl Account for Registry {
         // Fold the snapshot without the connection so a name query is not
         // stuck behind the replay. The indexer is the only writer, so the
         // snapshot still matches the batch.
-        let facts = {
+        let (birthday, facts) = {
             let conn = self.db.lock();
-            core::lineage_facts(&conn)?
+            (core::birthday(&conn)?, core::lineage_facts(&conn)?)
         };
-        let lineage = core::fold_lineage(facts);
+        let lineage = core::fold_lineage(u32::from(birthday), facts);
         let conn = self.db.lock();
         core::apply_batch(&conn, at, transactions, &self.fvk, lineage)?;
         Ok(())
