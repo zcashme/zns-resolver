@@ -557,7 +557,7 @@ fn apply_transaction(
         .then(|| candidates.iter().find(|c| c.txid == law.txid))
         .flatten();
     let Some(candidate) = candidate else {
-        log_orphaned_tip_spends(db_tx, live_names, tx_facts, &law.txid)?;
+        log_orphaned_tip_spends(db_tx, live_names, tx_facts, height, &law.txid)?;
         return Ok(false);
     };
 
@@ -590,7 +590,7 @@ fn apply_transaction(
                 && !spent_a_live_name
                 && tx_facts.claim_successor;
             if !law_ok {
-                log_orphaned_tip_spends(db_tx, live_names, tx_facts, &candidate.txid)?;
+                log_orphaned_tip_spends(db_tx, live_names, tx_facts, height, &candidate.txid)?;
                 return Ok(false);
             }
 
@@ -624,7 +624,7 @@ fn apply_transaction(
                 live_names.contains(&nf) && tip_nf != Some(nf)
             });
             if !tip_consumed || spent_other_live || lineage.touches_live_anchor(tx_facts) {
-                log_orphaned_tip_spends(db_tx, live_names, tx_facts, &candidate.txid)?;
+                log_orphaned_tip_spends(db_tx, live_names, tx_facts, height, &candidate.txid)?;
                 return Ok(false);
             }
 
@@ -633,8 +633,7 @@ fn apply_transaction(
             let Some(expected_prev) =
                 notes::check_chain_rule(binding.as_ref().map(|b| &b.tip), note)
             else {
-                admission_dropped("chain rule", candidate.name(), &candidate.txid, height);
-                log_orphaned_tip_spends(db_tx, live_names, tx_facts, &candidate.txid)?;
+                log_orphaned_tip_spends(db_tx, live_names, tx_facts, height, &candidate.txid)?;
                 return Ok(false);
             };
 
@@ -678,6 +677,7 @@ fn log_orphaned_tip_spends(
     db_tx: &Transaction<'_>,
     live_names: &HashSet<TipNf>,
     facts: &TxAnchorFacts,
+    height: u32,
     txid: &[u8],
 ) -> rusqlite::Result<()> {
     for retirement in &facts.retirements {
@@ -695,7 +695,9 @@ fn log_orphaned_tip_spends(
             .ok_or_else(|| invariant_failure("live-name set does not match the names table"))?;
         tracing::error!(
             name,
+            height,
             txid = ?txid,
+            nullifier = ?nf.as_bytes(),
             "a name's registry note was spent without a valid successor; the name keeps its last address and can no longer change"
         );
     }
@@ -1474,7 +1476,7 @@ mod tests {
             claim_successor: false,
         };
 
-        let error = log_orphaned_tip_spends(&tx, &live_names, &facts, &[1; 32]).unwrap_err();
+        let error = log_orphaned_tip_spends(&tx, &live_names, &facts, 100, &[1; 32]).unwrap_err();
 
         assert!(
             error
@@ -1922,7 +1924,7 @@ mod admission {
     }
 
     /// An update that also spends a live anchor does not renew the name.
-    /// The spent tip ends the binding.
+    /// The update is not admitted, and the name keeps its binding.
     #[test]
     fn an_update_that_spends_an_anchor_keeps_the_binding() {
         let conn = db();
