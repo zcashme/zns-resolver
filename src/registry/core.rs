@@ -776,12 +776,15 @@ fn mark_released_spent(
             )
             .optional()?
             .ok_or_else(|| invariant_failure("live-name set does not match the names table"))?;
-        live_names.remove(&nf);
-        db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
-        db_tx.execute(
-            "INSERT OR IGNORE INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![name, height as i64, txid, tx_index as i64, action_index as i64, nf.as_bytes()],
+        end_binding_implicitly(
+            db_tx,
+            live_names,
+            &name,
+            height,
+            txid,
+            tx_index,
+            action_index,
+            &nf,
         )?;
     }
     Ok(())
