@@ -104,7 +104,6 @@ fn scan_has_started(conn: &Connection) -> rusqlite::Result<bool> {
             OR EXISTS(SELECT 1 FROM anchor_facts)
             OR EXISTS(SELECT 1 FROM name_events)
             OR EXISTS(SELECT 1 FROM names)
-            OR EXISTS(SELECT 1 FROM implicit_releases)
          FROM registry_account WHERE id = 0",
         [],
         |row| row.get(0),
@@ -131,7 +130,7 @@ struct Source<'a> {
 
 /// The main write path: triage and anchor-fact bookkeeping, then candidate
 /// admission in canonical transaction order. Admission applies the chain rule,
-/// commitment binding, consumption proof, and implicit-release behavior.
+/// commitment binding and consumption proof.
 /// All work runs in one transaction, so readers see pre-batch or post-batch
 /// state, never partial. `lineage` is the fold of the facts at the start of
 /// the batch. The connection lock makes this the sole mutator; tip reads and
@@ -540,10 +539,9 @@ fn live_name_nullifiers(conn: &Connection) -> rusqlite::Result<HashSet<TipNf>> {
 /// every earlier verdict in the block. Returns whether a claim seated its
 /// successor.
 ///
-/// A transaction that consumes the live tip without a valid successor ends
-/// that binding (the mint's `release_predecessor`), and a transaction that
-/// spends any other live name tip ends that binding too (the mint's
-/// `mark_released`) — both recorded as implicit releases.
+/// A transaction that spends a live name's tip without being its one valid
+/// successor is logged and otherwise ignored: the name keeps its last
+/// binding. See [`log_orphaned_tip_spends`].
 fn apply_transaction(
     db_tx: &Transaction<'_>,
     candidates: &[Candidate],
@@ -554,21 +552,12 @@ fn apply_transaction(
     let height = law.height;
     let tx_facts = &law.facts;
     // The accept path is exactly one candidate. Every other transaction —
-    // candidate-free, or two or more — takes follow_spends: the binding of
-    // every live name it spent ends.
+    // candidate-free, or two or more — admits nothing.
     let candidate = (tx_facts.name_notes == 1)
         .then(|| candidates.iter().find(|c| c.txid == law.txid))
         .flatten();
     let Some(candidate) = candidate else {
-        mark_released_spent(
-            db_tx,
-            live_names,
-            tx_facts,
-            height,
-            &law.txid,
-            law.tx_index,
-            0,
-        )?;
+        log_orphaned_tip_spends(db_tx, live_names, tx_facts, height, &law.txid)?;
         return Ok(false);
     };
 
@@ -601,17 +590,7 @@ fn apply_transaction(
                 && !spent_a_live_name
                 && tx_facts.claim_successor;
             if !law_ok {
-                // The mint's mark_released: every live name this
-                // transaction spent ends its binding.
-                mark_released_spent(
-                    db_tx,
-                    live_names,
-                    tx_facts,
-                    height,
-                    &candidate.txid,
-                    law.tx_index,
-                    candidate.action_index,
-                )?;
+                log_orphaned_tip_spends(db_tx, live_names, tx_facts, height, &candidate.txid)?;
                 return Ok(false);
             }
 
@@ -639,43 +618,22 @@ fn apply_transaction(
             // Gate: predecessor — the transaction must consume this
             // name's live tip, only this name's, and no anchor. A sale,
             // list, auction, and delist spend the tip the way an update
-            // does. Anything else ends every live name it spent.
+            // does. Anything else admits nothing.
             let spent_other_live = tx_facts.retirements.iter().any(|r| {
                 let nf = TipNf::from_revealed(&r.nf);
                 live_names.contains(&nf) && tip_nf != Some(nf)
             });
             if !tip_consumed || spent_other_live || lineage.touches_live_anchor(tx_facts) {
-                mark_released_spent(
-                    db_tx,
-                    live_names,
-                    tx_facts,
-                    height,
-                    &candidate.txid,
-                    law.tx_index,
-                    candidate.action_index,
-                )?;
+                log_orphaned_tip_spends(db_tx, live_names, tx_facts, height, &candidate.txid)?;
                 return Ok(false);
             }
 
             // The tip was consumed: a valid successor advances an update
-            // or lands a proper release; an invalid one ends the binding
-            // — the mint's release_predecessor.
+            // or lands a proper release. An invalid one admits nothing.
             let Some(expected_prev) =
                 notes::check_chain_rule(binding.as_ref().map(|b| &b.tip), note)
             else {
-                admission_dropped("chain rule", candidate.name(), &candidate.txid, height);
-                if let Some(consumed) = tip_nf {
-                    end_binding_implicitly(
-                        db_tx,
-                        live_names,
-                        candidate.name(),
-                        height,
-                        &candidate.txid,
-                        law.tx_index,
-                        candidate.action_index,
-                        &consumed,
-                    )?;
-                }
+                log_orphaned_tip_spends(db_tx, live_names, tx_facts, height, &candidate.txid)?;
                 return Ok(false);
             };
 
@@ -711,16 +669,16 @@ fn admission_dropped(reason: &'static str, name: &str, txid: &[u8; 32], height: 
     tracing::warn!(reason, name, txid = ?txid, height, "admission dropped");
 }
 
-/// The mint's `mark_released`: every live name whose tip this transaction
-/// spent ends its binding, recorded as an implicit release.
-fn mark_released_spent(
+/// Logs every live name whose tip this transaction spent without being its
+/// valid successor. The mint never builds such a spend, so one means a mint
+/// bug or a leaked registry key. Nothing else changes: the name keeps its last
+/// binding, and since its tip is spent, no later note can succeed it.
+fn log_orphaned_tip_spends(
     db_tx: &Transaction<'_>,
-    live_names: &mut HashSet<TipNf>,
+    live_names: &HashSet<TipNf>,
     facts: &TxAnchorFacts,
     height: u32,
     txid: &[u8],
-    tx_index: u32,
-    action_index: usize,
 ) -> rusqlite::Result<()> {
     for retirement in &facts.retirements {
         let nf = TipNf::from_revealed(&retirement.nf);
@@ -735,47 +693,14 @@ fn mark_released_spent(
             )
             .optional()?
             .ok_or_else(|| invariant_failure("live-name set does not match the names table"))?;
-        end_binding_implicitly(
-            db_tx,
-            live_names,
-            &name,
-            height,
-            txid,
-            tx_index,
-            action_index,
-            &nf,
-        )?;
-    }
-    Ok(())
-}
-
-/// The mint's `release_predecessor`: the tip was consumed without a valid
-/// successor, so the binding ends — recorded as an implicit release.
-#[allow(clippy::too_many_arguments)]
-fn end_binding_implicitly(
-    db_tx: &Transaction<'_>,
-    live_names: &mut HashSet<TipNf>,
-    name: &str,
-    height: u32,
-    txid: &[u8],
-    tx_index: u32,
-    action_index: usize,
-    consumed: &TipNf,
-) -> rusqlite::Result<()> {
-    live_names.remove(consumed);
-    db_tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
-    db_tx.execute(
-        "INSERT OR IGNORE INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
+        tracing::error!(
             name,
-            height as i64,
-            txid,
-            tx_index as i64,
-            action_index as i64,
-            consumed.as_bytes()
-        ],
-    )?;
+            height,
+            txid = ?txid,
+            nullifier = ?nf.as_bytes(),
+            "a name's registry note was spent without a valid successor; the name keeps its last address and can no longer change"
+        );
+    }
     Ok(())
 }
 
@@ -884,21 +809,13 @@ pub(crate) fn rewind(conn: &Connection, to: Cursor) -> rusqlite::Result<()> {
     // `to` is the last surviving block; rows above it are the discarded chain.
     let kept = i64::from(u32::from(to.height));
 
-    let mut stmt = tx.prepare(
-        "SELECT name FROM name_events WHERE height > ?1
-         UNION
-         SELECT name FROM implicit_releases WHERE height > ?1",
-    )?;
+    let mut stmt = tx.prepare("SELECT DISTINCT name FROM name_events WHERE height > ?1")?;
     let affected: Vec<String> = stmt
         .query_map(params![kept], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
 
     tx.execute("DELETE FROM name_events WHERE height > ?1", params![kept])?;
-    tx.execute(
-        "DELETE FROM implicit_releases WHERE height > ?1",
-        params![kept],
-    )?;
     tx.execute("DELETE FROM anchor_facts WHERE height > ?1", params![kept])?;
     tx.execute(
         "UPDATE anchor_facts
@@ -1059,27 +976,6 @@ pub(crate) fn events(
     limit: u32,
     offset: u32,
 ) -> rusqlite::Result<(Vec<Event>, u64)> {
-    // An implicit release has no memo of its own. It is served as a release
-    // of the binding it ended, and its id is the negation of its rowid so it
-    // cannot collide with a name_events rowid.
-    const LOG: &str = "
-        SELECT id, name, action, ua, txid, height, action_index, memo, tx_index
-        FROM (
-            SELECT rowid AS id, name, action, ua, txid, height, action_index, memo, tx_index
-            FROM name_events
-            UNION ALL
-            SELECT -ir.rowid, ir.name, 'release', pred.ua, ir.txid, ir.height,
-                   ir.action_index, pred.memo, ir.tx_index
-            FROM implicit_releases AS ir
-            JOIN name_events AS pred ON pred.rowid = (
-                SELECT rowid FROM name_events
-                WHERE name = ir.name
-                  AND (height, tx_index, action_index)
-                      < (ir.height, ir.tx_index, ir.action_index)
-                ORDER BY height DESC, tx_index DESC, action_index DESC
-                LIMIT 1
-            )
-        )";
     const WHERE: &str = "WHERE (?1 IS NULL OR name = ?1)
                          AND (?2 IS NULL OR action = ?2)
                          AND (?3 IS NULL OR height > ?3)";
@@ -1091,30 +987,15 @@ pub(crate) fn events(
         offset
     ];
 
-    let unmatched: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM implicit_releases AS ir
-         WHERE NOT EXISTS (
-             SELECT 1 FROM name_events
-             WHERE name = ir.name
-               AND (height, tx_index, action_index) < (ir.height, ir.tx_index, ir.action_index)
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    if unmatched != 0 {
-        return Err(corrupt_record());
-    }
-
     let total: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM ({LOG}) {WHERE}"),
+        &format!("SELECT COUNT(*) FROM name_events {WHERE}"),
         &p[..3],
         |r| r.get(0),
     )?;
-    // One spend can end several names at the same height, tx, and action.
-    // `id` is unique, so a page cannot skip or repeat a tied row.
+    // `rowid` is unique, so a page cannot skip or repeat a tied row.
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, name, action, ua, txid, height, action_index, memo FROM ({LOG}) {WHERE}
-         ORDER BY height DESC, tx_index DESC, action_index DESC, id DESC LIMIT ?4 OFFSET ?5"
+        "SELECT rowid, name, action, ua, txid, height, action_index, memo FROM name_events {WHERE}
+         ORDER BY height DESC, tx_index DESC, action_index DESC, rowid DESC LIMIT ?4 OFFSET ?5"
     ))?;
     let events = stmt
         .query_map(p, |row| {
@@ -1195,17 +1076,6 @@ fn set_checkpoint_in_tx(tx: &Transaction<'_>, scanned: &Cursor) -> rusqlite::Res
 /// memo must still parse and agree with its columns — a corrupt record fails
 /// the rewind loudly.
 fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
-    // The tip is the latest record across BOTH streams — explicit events and
-    // implicit releases — in canonical order. An implicit release ends the
-    // binding just as a proper release event does.
-    let latest_implicit: Option<(i64, i64, i64)> = tx
-        .query_row(
-            "SELECT height, tx_index, action_index FROM implicit_releases WHERE name = ?1
-             ORDER BY height DESC, tx_index DESC, action_index DESC LIMIT 1",
-            params![name],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
     let row = tx
         .query_row(
             "SELECT action, memo, txid, height, tx_index, action_index, ua, expires_at, prev, cmx, nullifier
@@ -1247,13 +1117,6 @@ fn rebuild_name_tip(tx: &Transaction<'_>, name: &str) -> rusqlite::Result<()> {
     else {
         return Ok(());
     };
-    if let Some(implicit) = latest_implicit {
-        // An implicit release at or after the last event ends the binding.
-        if implicit >= (height, tx_index, action_index) {
-            return Ok(());
-        }
-    }
-
     // The restored record must still parse and agree with its columns.
     let zns_memo = Memo::from_bytes(&memo).map_err(|_| corrupt_record())?;
     if parse_stored_record(&zns_memo, name, &ua_b).is_none() {
@@ -1390,116 +1253,6 @@ mod tests {
         assert_eq!(listed.len(), 601);
         assert_eq!(listed.first().map(String::as_str), Some("0a"));
         assert_eq!(listed, expected);
-    }
-
-    /// A rewound implicit release restores the binding it ended: the name
-    /// returns to its last surviving event's state.
-    #[test]
-    fn rewound_implicit_release_restores_the_binding() {
-        let conn = database();
-        conn.execute(
-            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
-            [],
-        )
-        .unwrap();
-        insert_checkpoint(&conn, 42, 7);
-        // z: claim event at 90; implicit release at 100.
-        let memo =
-            b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
-        conn.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'04', x'5a', x'06', 0, 0, ?1)",
-            params![&memo[..]],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'04', x'5a', x'06', 0, 0, ?1)",
-            params![&memo[..]],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
-             VALUES ('z', 100, x'06', 0, 0, x'5a')",
-            [],
-        )
-        .unwrap();
-        // The implicit release had deleted the binding.
-        conn.execute("DELETE FROM names WHERE name = 'z'", [])
-            .unwrap();
-
-        rewind(&conn, kept(94)).unwrap();
-
-        let tip: Option<String> = conn
-            .query_row("SELECT action FROM names WHERE name = 'z'", [], |r| {
-                r.get(0)
-            })
-            .optional()
-            .unwrap();
-        assert_eq!(tip.as_deref(), Some("claim"));
-        let remaining: i64 = conn
-            .query_row("SELECT COUNT(*) FROM implicit_releases", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(remaining, 0);
-    }
-
-    /// A surviving implicit release keeps the binding ended: a re-claim
-    /// above the fork is rewound away, and the rebuild does not resurrect
-    /// the pre-release event.
-    #[test]
-    fn surviving_implicit_release_keeps_the_binding_ended() {
-        let conn = database();
-        conn.execute(
-            "INSERT INTO registry_account (id, ufvk, network, birthday) VALUES (0, 'ufvk', 'test', 1)",
-            [],
-        )
-        .unwrap();
-        insert_checkpoint(&conn, 42, 7);
-        let memo =
-            b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
-        conn.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'04', x'5a', x'06', 0, 0, ?1)",
-            params![&memo[..]],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
-             VALUES ('z', 95, x'06', 0, 0, x'5a')",
-            [],
-        )
-        .unwrap();
-        // A re-claim above the fork: rewinding past it must not resurrect
-        // the pre-release event.
-        conn.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 100, 'claim', 'u', 'none', x'00', x'04', x'5b', x'08', 0, 0, x'09')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO names (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 100, 'claim', 'u', 'none', x'00', x'04', x'5b', x'08', 0, 0, x'09')",
-            [],
-        )
-        .unwrap();
-
-        rewind(&conn, kept(96)).unwrap();
-
-        let z: i64 = conn
-            .query_row("SELECT COUNT(*) FROM names WHERE name = 'z'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(z, 0, "the surviving implicit release keeps z ended");
-        let events: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM name_events WHERE name = 'z'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(events, 1, "only the pre-release event survives");
     }
 
     /// The current schema preserves its checkpoint on a second open.
@@ -1709,11 +1462,11 @@ mod tests {
     /// The live-name set claimed a nullifier the names table does not have.
     /// That used to panic under the database lock.
     #[test]
-    fn mark_released_errors_when_the_names_row_is_missing() {
+    fn an_orphaned_tip_spend_errors_when_the_names_row_is_missing() {
         let conn = database();
         let tx = conn.unchecked_transaction().unwrap();
         let nf = [0x5a_u8; 32];
-        let mut live_names = HashSet::from([TipNf::from_bytes(&nf)]);
+        let live_names = HashSet::from([TipNf::from_bytes(&nf)]);
         let facts = TxAnchorFacts {
             adoptions: vec![],
             retirements: vec![Retirement {
@@ -1723,8 +1476,7 @@ mod tests {
             claim_successor: false,
         };
 
-        let error =
-            mark_released_spent(&tx, &mut live_names, &facts, 100, &[1; 32], 0, 0).unwrap_err();
+        let error = log_orphaned_tip_spends(&tx, &live_names, &facts, 100, &[1; 32]).unwrap_err();
 
         assert!(
             error
@@ -1732,13 +1484,6 @@ mod tests {
                 .contains("live-name set does not match the names table"),
             "{error}"
         );
-        assert!(live_names.contains(&TipNf::from_bytes(&nf)));
-        let releases: i64 = tx
-            .query_row("SELECT COUNT(*) FROM implicit_releases", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(releases, 0);
     }
 
     fn account(conn: &Connection) -> (String, String, i64) {
@@ -1902,77 +1647,6 @@ mod tests {
             error.to_string().contains("registry record is corrupt"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn events_include_an_implicit_release() {
-        let conn = database();
-        let memo =
-            b"ZNS:claim:z:u:none:0000000000000000000000000000000000000000000000000000000000000000";
-        conn.execute(
-            "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
-             VALUES ('z', 90, 'claim', 'u', 'none', x'00', x'04', x'5a', ?1, 0, 0, ?2)",
-            params![vec![6u8; 32], &memo[..]],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
-             VALUES ('z', 100, ?1, 1, 2, x'5a')",
-            params![vec![7u8; 32]],
-        )
-        .unwrap();
-
-        let (log, total) = events(&conn, None, None, None, 10, 0).unwrap();
-        assert_eq!(total, 2);
-        assert_eq!(log[0].action, Action::Release);
-        assert_eq!(log[0].height, 100);
-        assert_eq!(log[0].action_index, 2);
-        assert_eq!(log[0].name, "z");
-        assert_eq!(log[0].ua, "u");
-        assert_eq!(log[0].expires_at, "none");
-        assert!(log[0].id < 0);
-        assert_eq!(log[0].txid, [7u8; 32]);
-        assert_eq!(log[1].action, Action::Claim);
-        assert_eq!(log[1].height, 90);
-
-        let (claims, claim_total) =
-            events(&conn, Some("z"), Some(Action::Claim), None, 10, 0).unwrap();
-        assert_eq!(claim_total, 1);
-        assert_eq!(claims[0].action, Action::Claim);
-    }
-
-    #[test]
-    fn tied_implicit_releases_page_by_id() {
-        let conn = database();
-        let prev = "0000000000000000000000000000000000000000000000000000000000000000";
-        for name in ["a", "b"] {
-            let memo = format!("ZNS:claim:{name}:u:none:{prev}");
-            conn.execute(
-                "INSERT INTO name_events (name, height, action, ua, expires_at, prev, cmx, nullifier, txid, tx_index, action_index, memo)
-                 VALUES (?1, 90, 'claim', 'u', 'none', x'00', x'04', ?2, ?3, 0, 0, ?4)",
-                params![name, name.as_bytes(), vec![6u8; 32], memo.as_bytes()],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO implicit_releases (name, height, txid, tx_index, action_index, nullifier)
-                 VALUES (?1, 100, ?2, 1, 2, ?3)",
-                params![name, vec![7u8; 32], name.as_bytes()],
-            )
-            .unwrap();
-        }
-
-        let mut paged = Vec::new();
-        for offset in 0..4 {
-            let (page, total) = events(&conn, None, None, None, 1, offset).unwrap();
-            assert_eq!(total, 4);
-            assert_eq!(page.len(), 1);
-            paged.push(page[0].id);
-        }
-        let (all, _) = events(&conn, None, None, None, 4, 0).unwrap();
-        assert_eq!(paged, all.iter().map(|event| event.id).collect::<Vec<_>>());
-        assert_eq!(all[0].height, 100);
-        assert_eq!(all[1].height, 100);
-        assert!(all[0].id > all[1].id);
     }
 }
 
@@ -2140,7 +1814,6 @@ mod admission {
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
     }
 
     /// A second claim for a name that already has a live record does not
@@ -2251,9 +1924,9 @@ mod admission {
     }
 
     /// An update that also spends a live anchor does not renew the name.
-    /// The spent tip ends the binding.
+    /// The update is not admitted, and the name keeps its binding.
     #[test]
-    fn an_update_that_spends_an_anchor_ends_the_binding() {
+    fn an_update_that_spends_an_anchor_keeps_the_binding() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
 
@@ -2306,7 +1979,14 @@ mod admission {
         );
         apply_transaction(&tx, &update, &update_law, &lineage, &mut live_names).unwrap();
 
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
+        // The update is not admitted, and alice keeps her claim's binding.
+        assert_eq!(
+            count(
+                &tx,
+                "SELECT COUNT(*) FROM names WHERE name = 'alice' AND action = 'claim'"
+            ),
+            1
+        );
         assert_eq!(
             count(
                 &tx,
@@ -2314,7 +1994,6 @@ mod admission {
             ),
             0
         );
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
     }
 
     /// A list spends the live tip and leaves the name listed.
@@ -2339,7 +2018,6 @@ mod admission {
         lineage.step_tx(101, &law.facts);
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
         let action: String = tx
             .query_row("SELECT action FROM names WHERE name = 'alice'", [], |row| {
                 row.get(0)
@@ -2370,7 +2048,6 @@ mod admission {
         apply_transaction(&tx, &sale, &law, &lineage, &mut live_names).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
         let (action, ua): (String, String) = tx
             .query_row(
                 "SELECT action, ua FROM names WHERE name = 'alice'",
@@ -2566,14 +2243,13 @@ mod admission {
         assert!(!apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap());
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
     }
 
     /// Review finding 1, the flagged shape: a claim whose transaction spends
-    /// another name's live tip. The mint's mark_released ends that binding
-    /// and the claim is rejected.
+    /// another name's live tip. The claim is rejected and that name keeps
+    /// its binding.
     #[test]
-    fn claim_spending_a_live_name_tip_ends_that_binding() {
+    fn claim_spending_a_live_name_tip_keeps_that_binding() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
 
@@ -2601,24 +2277,16 @@ mod admission {
 
         assert!(!apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap());
 
-        // z's binding ended; the claim did not land.
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
-        let (rel_name, rel_nf): (String, Vec<u8>) = tx
-            .query_row("SELECT name, nullifier FROM implicit_releases", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(rel_name, "z");
-        assert_eq!(rel_nf, vec![0x5a; 32]);
+        // The claim did not land, and z keeps its binding.
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names WHERE name = 'z'"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
     }
 
     /// The update-then-release shape in canonical order: the update lands,
-    /// and a stale-predecessor release ends the binding (the mint's
-    /// release_predecessor) — the ordering the release-first partition used
-    /// to emulate.
+    /// and a release naming the stale predecessor is not admitted, so the
+    /// update stays the binding.
     #[test]
-    fn update_then_stale_release_ends_the_binding() {
+    fn update_then_stale_release_keeps_the_update() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
 
@@ -2666,17 +2334,15 @@ mod admission {
         apply_transaction(&tx, &candidates, &update_law, &seeded, &mut live_names).unwrap();
         apply_transaction(&tx, &candidates, &release_law, &seeded, &mut live_names).unwrap();
 
-        // The update admitted; the stale release ended the binding.
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+        // The update admitted; the stale release did not.
+        assert_eq!(
+            count(
+                &tx,
+                "SELECT COUNT(*) FROM names WHERE name = 'z' AND action = 'update'"
+            ),
+            1
+        );
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 1);
-        let (rel_name, rel_nf): (String, Vec<u8>) = tx
-            .query_row("SELECT name, nullifier FROM implicit_releases", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(rel_name, "z");
-        assert_eq!(rel_nf.as_slice(), nullifier_u.as_bytes());
     }
 
     /// The mint spends the live tip in one action and writes the release
@@ -2723,7 +2389,6 @@ mod admission {
         apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap();
 
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
         assert_eq!(
             tx.query_row(
                 "SELECT action FROM name_events WHERE name = 'jesuschrist' ORDER BY height DESC LIMIT 1",
@@ -2735,10 +2400,10 @@ mod admission {
         );
     }
 
-    /// A transaction with two candidates takes follow_spends: nothing is
-    /// admitted, and spent live names end their bindings.
+    /// A transaction with two candidates admits nothing, and the live name
+    /// it spent keeps its binding.
     #[test]
-    fn multi_candidate_tx_takes_follow_spends() {
+    fn multi_candidate_tx_admits_nothing() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
 
@@ -2765,23 +2430,22 @@ mod admission {
             vec![Retirement {
                 nf: AnchorNf::from_bytes(&[0x5a; 32]),
             }],
-            2, // two candidates: follow_spends
+            2, // two candidates: nothing is admitted
         );
         let mut live_names: HashSet<TipNf> = HashSet::from([TipNf::from_bytes(&[0x5a; 32])]);
 
         apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap();
 
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+        // Neither claim lands, and z keeps its binding.
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names WHERE name = 'z'"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 1);
         assert_eq!(count(&tx, "SELECT COUNT(*) FROM name_events"), 0);
     }
 
-    /// A candidate-free transaction that spends a live tip takes
-    /// follow_spends: the binding ends even though no candidate existed to
-    /// reject. The mint applies this to every transaction that is not
-    /// exactly-one-candidate.
+    /// A candidate-free transaction that spends a live tip admits nothing:
+    /// the name keeps its last binding.
     #[test]
-    fn candidate_free_tx_spending_a_live_tip_ends_the_binding() {
+    fn candidate_free_tx_spending_a_live_tip_keeps_the_binding() {
         let conn = db();
         let tx = conn.unchecked_transaction().unwrap();
 
@@ -2808,8 +2472,7 @@ mod admission {
         let candidates: Vec<Candidate> = vec![];
         apply_transaction(&tx, &candidates, &law, &seeded, &mut live_names).unwrap();
 
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names"), 0);
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 1);
+        assert_eq!(count(&tx, "SELECT COUNT(*) FROM names WHERE name = 'z'"), 1);
     }
 
     /// Issue #61: the mint owns the term and liveness clocks (§4.5). Its
@@ -2852,7 +2515,6 @@ mod admission {
             })
             .unwrap();
         assert_eq!(action, "update", "the mint accepted the renewal");
-        assert_eq!(count(&tx, "SELECT COUNT(*) FROM implicit_releases"), 0);
     }
 
     /// A batch with one received zero-value note is not the keygen
