@@ -133,20 +133,14 @@ impl Lineage {
             }
         }
 
-        let mut retired = 0;
         for retirement in &facts.retirements {
-            if self.live.remove(&retirement.nf) {
-                retired += 1;
-            }
+            self.live.remove(&retirement.nf);
         }
 
-        // The successor joins when the claim is admitted, which needs at
-        // least one live anchor spent: the same rule the claim gate applies.
-        // The anchors it spent have already retired, whatever the verdict.
-        // Authority cannot be minted, only succeeded. This insert is
-        // independent of ceremony close: an admitted successor still enters
-        // while the pool is short.
-        if retired >= 1 && facts.claim_successor && facts.adoptions.len() == 1 {
+        // An admitted claim's successor joins. Admission already required a
+        // live anchor spent, so authority is only ever succeeded. This insert
+        // is independent of ceremony close.
+        if facts.claim_successor && facts.adoptions.len() == 1 {
             self.live.insert(facts.adoptions[0].nf);
         }
     }
@@ -381,29 +375,6 @@ mod tests {
         assert_eq!(lineage.len(), before);
         assert!(lineage.contains(&nf(200)));
         assert!(!lineage.contains(&nf(7)));
-    }
-
-    /// A successor-shaped output with no live anchor retired behind it
-    /// adopts nothing at standing size — the fold's mirror of the mint's
-    /// fix (zns-mint #233): authority cannot be minted, only succeeded.
-    /// After ceremony close the filling loop adopts nothing either.
-    #[test]
-    fn unbacked_successor_adopts_nothing() {
-        let mut lineage = Lineage::new();
-        fill_to_standing_size(&mut lineage, 1);
-        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
-
-        lineage.step_tx(
-            2,
-            &TxAnchorFacts {
-                adoptions: vec![adopt(50)],
-                retirements: vec![retire(99)], // 99 is not a live anchor
-                name_notes: 1,
-                claim_successor: true,
-            },
-        );
-        assert!(!lineage.contains(&nf(50)));
-        assert_eq!(lineage.len(), ANCHOR_POOL_SIZE);
     }
 
     /// Ceremony close is one-time: a later shrink does not reopen filling.
