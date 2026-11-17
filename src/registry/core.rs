@@ -313,7 +313,6 @@ pub(crate) fn apply_batch(
                             nf: AnchorNf::from_scan(s.nf),
                         })
                         .collect(),
-                    has_single_name_note: name_notes == 1,
                     name_notes,
                     // The output shape; the verdict narrows it.
                     claim_successor: shape,
@@ -484,7 +483,6 @@ pub(crate) fn fold_lineage(mut events: Vec<(Position, FactEvent)>) -> Lineage {
                     name_note_candidates,
                     claim_successor,
                 } => {
-                    facts.has_single_name_note = name_note_candidates == 1;
                     facts.name_notes = usize::try_from(name_note_candidates).unwrap_or(usize::MAX);
                     facts.claim_successor = claim_successor;
                     facts.adoptions.push(Adoption { nf });
@@ -558,8 +556,7 @@ fn apply_transaction(
     // The accept path is exactly one candidate. Every other transaction —
     // candidate-free, or two or more — takes follow_spends: the binding of
     // every live name it spent ends.
-    let candidate = tx_facts
-        .has_single_name_note
+    let candidate = (tx_facts.name_notes == 1)
         .then(|| candidates.iter().find(|c| c.txid == law.txid))
         .flatten();
     let Some(candidate) = candidate else {
@@ -1722,7 +1719,6 @@ mod tests {
             retirements: vec![Retirement {
                 nf: AnchorNf::from_bytes(&nf),
             }],
-            has_single_name_note: false,
             name_notes: 0,
             claim_successor: false,
         };
@@ -2105,7 +2101,6 @@ mod admission {
             facts: TxAnchorFacts {
                 adoptions,
                 retirements,
-                has_single_name_note,
                 name_notes: usize::from(has_single_name_note),
                 claim_successor,
             },
@@ -2467,7 +2462,6 @@ mod admission {
             facts: TxAnchorFacts {
                 adoptions: vec![Adoption { nf: nf(200) }],
                 retirements: vec![Retirement { nf: nf(1) }],
-                has_single_name_note: true,
                 name_notes: 1,
                 claim_successor: false,
             },

@@ -72,9 +72,6 @@ pub(crate) struct Retirement {
 pub(crate) struct TxAnchorFacts {
     pub(crate) adoptions: Vec<Adoption>,
     pub(crate) retirements: Vec<Retirement>,
-    /// Whether the transaction presented exactly one name-note candidate —
-    /// the accept path. Transactions without it take `follow_spends`.
-    pub(crate) has_single_name_note: bool,
     /// Name notes in this transaction. The keygen ceremony has none.
     pub(crate) name_notes: usize,
     /// The mint admits this claim's successor. The output shape is one
@@ -209,7 +206,6 @@ mod tests {
         TxAnchorFacts {
             adoptions: vec![adopt(seed)],
             retirements: vec![],
-            has_single_name_note: false,
             name_notes: 0,
             claim_successor: false,
         }
@@ -221,7 +217,6 @@ mod tests {
                 .map(|seed| adopt(seed as u8))
                 .collect(),
             retirements: vec![],
-            has_single_name_note: false,
             name_notes: 0,
             claim_successor: false,
         }
@@ -302,7 +297,6 @@ mod tests {
             &TxAnchorFacts {
                 adoptions: vec![],
                 retirements: vec![retire(1)],
-                has_single_name_note: false,
                 name_notes: 0,
                 claim_successor: false,
             },
@@ -323,7 +317,6 @@ mod tests {
             &TxAnchorFacts {
                 adoptions: vec![adopt(200)],
                 retirements: vec![retire(1)],
-                has_single_name_note: true,
                 name_notes: 1,
                 claim_successor: true,
             },
@@ -345,7 +338,6 @@ mod tests {
             &TxAnchorFacts {
                 adoptions: vec![adopt(200)],
                 retirements: vec![retire(1)],
-                has_single_name_note: true,
                 name_notes: 1,
                 claim_successor: false,
             },
@@ -367,7 +359,6 @@ mod tests {
             &TxAnchorFacts {
                 adoptions: vec![adopt(2), adopt(3)],
                 retirements: vec![retire(1)],
-                has_single_name_note: true,
                 name_notes: 1,
                 claim_successor: false,
             },
@@ -393,7 +384,6 @@ mod tests {
             &TxAnchorFacts {
                 adoptions: vec![adopt(200)],
                 retirements: vec![retire(7)],
-                has_single_name_note: true,
                 name_notes: 1,
                 claim_successor: true,
             },
@@ -419,7 +409,6 @@ mod tests {
             &TxAnchorFacts {
                 adoptions: vec![adopt(50)],
                 retirements: vec![retire(99)], // 99 is not a live anchor
-                has_single_name_note: true,
                 name_notes: 1,
                 claim_successor: true,
             },
@@ -445,7 +434,6 @@ mod tests {
             &TxAnchorFacts {
                 adoptions: vec![],
                 retirements: vec![retire(1), retire(2)],
-                has_single_name_note: false,
                 name_notes: 0,
                 claim_successor: false,
             },
@@ -463,7 +451,6 @@ mod tests {
             &TxAnchorFacts {
                 adoptions: vec![adopt(201)],
                 retirements: vec![retire(3)],
-                has_single_name_note: true,
                 name_notes: 1,
                 claim_successor: true,
             },
@@ -506,7 +493,6 @@ mod tests {
         let facts = TxAnchorFacts {
             adoptions: vec![adopt(2)],
             retirements: vec![retire(1)],
-            has_single_name_note: true,
             name_notes: 1,
             claim_successor: true,
         };
@@ -675,7 +661,6 @@ mod canon {
                                 nf: hex32(nullifier),
                             }],
                             retirements: vec![],
-                            has_single_name_note: false,
                             name_notes: 0,
                             claim_successor: false,
                         },
@@ -689,7 +674,6 @@ mod canon {
                                 .iter()
                                 .map(|s| Retirement { nf: hex32(s) })
                                 .collect(),
-                            has_single_name_note: false,
                             name_notes: 0,
                             claim_successor: false,
                         },
@@ -709,7 +693,6 @@ mod canon {
                             retirements: vec![Retirement {
                                 nf: hex32(spent_anchor),
                             }],
-                            has_single_name_note: true,
                             name_notes: 1,
                             // A rejected claim retires its anchor and leaves
                             // the successor out. The fixture records that
@@ -726,7 +709,6 @@ mod canon {
                                 .iter()
                                 .map(|s| Retirement { nf: hex32(s) })
                                 .collect(),
-                            has_single_name_note: true,
                             name_notes: 1,
                             claim_successor: false,
                         },
@@ -746,7 +728,6 @@ mod canon {
                             retirements: vec![Retirement {
                                 nf: hex32(prev_nullifier),
                             }],
-                            has_single_name_note: true,
                             name_notes: 1,
                             claim_successor: false,
                         },
