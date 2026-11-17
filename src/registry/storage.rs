@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS anchor_facts (
     tx_index           INTEGER NOT NULL,
     action_index       INTEGER NOT NULL,
     name_note_candidates INTEGER NOT NULL,
-    -- 1 when this note is a claim's only registry output and it is zero-value.
+    -- 1 when this note's transaction is an admitted claim.
     claim_successor    INTEGER NOT NULL DEFAULT 0,
     spent_height       INTEGER,
     spent_tx_index     INTEGER,
