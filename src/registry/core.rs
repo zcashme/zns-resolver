@@ -999,6 +999,8 @@ pub(crate) fn ironwood_nullifiers(conn: &Connection) -> rusqlite::Result<Vec<[u8
     rows.collect()
 }
 
+/// The SQL answer `Snapshot` reproduces; the snapshot test compares the two.
+#[cfg(test)]
 pub(crate) fn resolve_by_name(
     conn: &Connection,
     name: &str,
@@ -1011,6 +1013,8 @@ pub(crate) fn resolve_by_name(
     .optional()
 }
 
+/// The SQL answer `Snapshot` reproduces; the snapshot test compares the two.
+#[cfg(test)]
 pub(crate) fn registrations_by_ua(
     conn: &Connection,
     ua: &str,
@@ -1040,6 +1044,8 @@ pub(crate) fn all_registrations(conn: &Connection) -> rusqlite::Result<Vec<Regis
     rows.collect()
 }
 
+/// The SQL answer `Snapshot` reproduces; the snapshot test compares the two.
+#[cfg(test)]
 pub(crate) fn list_registrations(
     conn: &Connection,
     limit: u32,

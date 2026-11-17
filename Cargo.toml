@@ -29,6 +29,8 @@ orchard = { version = "0.16", default-features = false, features = ["std"] }
 zcash_protocol = { version = "0.11", default-features = false, features = ["std"] }
 zcash_primitives = { version = "0.31", default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# The read side: the writer publishes an immutable snapshot after each commit.
+arc-swap = "1.9"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

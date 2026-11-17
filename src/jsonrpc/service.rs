@@ -7,7 +7,6 @@ use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use zns_verify::Action;
 
-use crate::registry::core;
 use crate::registry::Db;
 use crate::sync::ChainTip;
 
@@ -97,14 +96,11 @@ impl JsonRpcApi {
 
 /// Categorizes handler failures for the wire.
 ///
-/// `InvalidParams` → JSON-RPC `-32602`; `Internal` → `-32603` + a log line.
-/// The underlying SQLite error is never serialized to the client.
+/// `InvalidParams` → JSON-RPC `-32602`.
 #[derive(thiserror::Error, Debug)]
 enum RpcError {
     #[error("invalid params: {0}")]
     InvalidParams(String),
-    #[error("internal error")]
-    Internal(#[from] rusqlite::Error),
 }
 
 impl From<RpcError> for ErrorObjectOwned {
@@ -112,10 +108,6 @@ impl From<RpcError> for ErrorObjectOwned {
         match e {
             RpcError::InvalidParams(msg) => {
                 ErrorObjectOwned::owned(-32602, "Invalid params", Some(msg))
-            }
-            RpcError::Internal(inner) => {
-                tracing::error!(error = %inner, "rpc handler failed");
-                ErrorObjectOwned::owned(-32603, "Internal error", None::<()>)
             }
         }
     }
@@ -193,22 +185,23 @@ impl ZnsApiServer for JsonRpcApi {
         let class = classify_request(query.as_deref(), limit, offset)?;
         let query = query.unwrap_or_default();
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
-        let conn = self.db.lock();
+        let snapshot = self.db.snapshot();
 
         match class {
             // No query: every registered name in one response, the same
             // request from every client.
-            QueryClass::All => {
-                let regs = core::all_registrations(&conn).map_err(RpcError::from)?;
-                Ok(ResolveResult::Many(
-                    regs.into_iter().map(NameRecord::from).collect(),
-                ))
-            }
+            QueryClass::All => Ok(ResolveResult::Many(
+                snapshot
+                    .names()
+                    .iter()
+                    .cloned()
+                    .map(NameRecord::from)
+                    .collect(),
+            )),
             // The empty query lists all registrations — the page-through form
             // explorers and sitemaps build on.
             QueryClass::List => {
-                let (regs, _) = core::list_registrations(&conn, limit_u32, offset_u32)
-                    .map_err(RpcError::from)?;
+                let (regs, _) = snapshot.list(limit_u32, offset_u32);
                 Ok(ResolveResult::Many(
                     regs.into_iter().map(NameRecord::from).collect(),
                 ))
@@ -218,13 +211,12 @@ impl ZnsApiServer for JsonRpcApi {
             }
             // 1–63 lowercase letters or digits, the shape the mint accepts.
             QueryClass::Name => {
-                let reg = core::resolve_by_name(&conn, &query).map_err(RpcError::from)?;
+                let reg = snapshot.name(&query).cloned();
                 Ok(ResolveResult::Exact(reg.map(NameRecord::from)))
             }
             // Any other Zcash address queries the names currently bound to it.
             QueryClass::Address => {
-                let (regs, _) = core::registrations_by_ua(&conn, &query, limit_u32, offset_u32)
-                    .map_err(RpcError::from)?;
+                let (regs, _) = snapshot.by_address(&query, limit_u32, offset_u32);
                 Ok(ResolveResult::Many(
                     regs.into_iter().map(NameRecord::from).collect(),
                 ))
@@ -239,9 +231,7 @@ impl ZnsApiServer for JsonRpcApi {
         offset: Option<u64>,
     ) -> RpcResult<Paginated<NameRecord>> {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
-        let conn = self.db.lock();
-        let (regs, total) =
-            core::list_registrations(&conn, limit_u32, offset_u32).map_err(RpcError::from)?;
+        let (regs, total) = self.db.snapshot().list(limit_u32, offset_u32);
         let items = regs.into_iter().map(NameRecord::from).collect();
         Ok(Paginated {
             items,
@@ -259,9 +249,10 @@ impl ZnsApiServer for JsonRpcApi {
         offset: Option<u64>,
     ) -> RpcResult<Paginated<NameRecord>> {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
-        let conn = self.db.lock();
-        let (regs, total) = core::registrations_by_ua(&conn, &address, limit_u32, offset_u32)
-            .map_err(RpcError::from)?;
+        let (regs, total) = self
+            .db
+            .snapshot()
+            .by_address(&address, limit_u32, offset_u32);
         let items = regs.into_iter().map(NameRecord::from).collect();
         Ok(Paginated {
             items,
@@ -272,7 +263,7 @@ impl ZnsApiServer for JsonRpcApi {
     }
 
     async fn status(&self) -> RpcResult<Status> {
-        let position = core::checkpoint(&self.db.lock()).map_err(RpcError::from)?;
+        let position = self.db.snapshot().checkpoint();
         let tip = *self.tip.borrow();
 
         // The verdict needs both facts: our durable position and the network's
@@ -310,10 +301,10 @@ impl ZnsApiServer for JsonRpcApi {
         let (limit_u32, offset_u32) = clamp_pagination(limit, offset);
         let since = since_height.map(|h| h.min(u32::MAX as u64) as u32);
 
-        let conn = self.db.lock();
         let (events, total) =
-            core::events(&conn, name.as_deref(), action, since, limit_u32, offset_u32)
-                .map_err(RpcError::from)?;
+            self.db
+                .snapshot()
+                .events(name.as_deref(), action, since, limit_u32, offset_u32);
 
         let events = events.into_iter().map(NameEvent::from).collect();
 
