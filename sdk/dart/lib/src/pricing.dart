@@ -5,7 +5,7 @@
 /// deployment config. The mint remains the only charging authority: it
 /// computes the authoritative ZEC amount at payment time.
 ///
-/// Prices are USD. Converting to zats for display needs the oracle's daily
+/// Prices are USD. Converting to zats for display needs the mint's current
 /// zats-per-USD rate (see [quoteZats]); no rate is baked in here.
 library;
 
