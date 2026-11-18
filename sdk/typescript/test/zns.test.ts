@@ -21,15 +21,12 @@ const answer = (result: unknown) => ({ ok: true, json: async () => ({ result }) 
  * and per-name `resolve`. Every request body is kept in `bodies`.
  */
 function stubResolver(names: Array<Record<string, unknown>> = []) {
-  const state = { names, height: 1, listFails: false, statusFails: false };
+  const state = { names, listFails: false };
   const bodies: Array<{ method: string; params: Record<string, unknown> }> = [];
   const fetchMock = vi.fn(async (_url: string, init: { body: string }) => {
     const body = JSON.parse(init.body);
     bodies.push(body);
-    if (body.method === "status") {
-      if (state.statusFails) throw new TypeError("fetch failed");
-      return answer({ synced_height: state.height, viewing_key: "uview-x" });
-    }
+    if (body.method === "status") return answer({ synced_height: 1, viewing_key: "uview-x" });
     if (body.method === "resolve" && Object.keys(body.params).length === 0) {
       if (state.listFails) throw new TypeError("fetch failed");
       return answer(state.names);
@@ -145,10 +142,10 @@ describe("ZNS", () => {
       }
     });
 
-    it("throws on an action the resolver does not send", async () => {
+    it("refuses a list with an action the resolver does not send", async () => {
       stubResolver([record("alice", VALID_TESTNET_UA, "buy")]);
       const z = new ZNS({ url: "https://resolver.example" });
-      await expect(z.resolveName("alice")).rejects.toThrow(/unknown action/);
+      await expect(z.resolveName("alice")).rejects.toThrow(/could not be downloaded/);
     });
 
     it("resolves a name longer than 32 characters to null, as the resolver does", async () => {
@@ -171,9 +168,7 @@ describe("ZNS", () => {
       expect(await z.isAvailable("carol")).toBe(true);
       expect(await z.isAvailable("alice")).toBe(false);
 
-      expect(bodies.filter(isNameRequest)).toEqual([]);
-      expect(bodies.map((b) => b.method)).toEqual(["status", "resolve"]);
-      expect(bodies[1].params).toEqual({});
+      expect(bodies).toEqual([{ jsonrpc: "2.0", id: 1, method: "resolve", params: {} }]);
     });
 
     it("downloads the list once for lookups that arrive together", async () => {
@@ -181,53 +176,43 @@ describe("ZNS", () => {
       const z = new ZNS({ url: "https://resolver.example" });
       const regs = await Promise.all(Array.from({ length: 10 }, () => z.resolveName("alice")));
       expect(regs.every((reg) => reg?.name === "alice")).toBe(true);
-      expect(bodies.filter((b) => b.method === "resolve")).toHaveLength(1);
+      expect(bodies).toHaveLength(1);
     });
 
-    it("downloads the list again only when the resolver has a new block", async () => {
+    it("downloads the list again every 30 seconds", async () => {
       vi.useFakeTimers();
       const { state, bodies } = stubResolver([record("alice")]);
       const z = new ZNS({ url: "https://resolver.example" });
       expect((await z.resolveName("alice"))?.address).toBe(VALID_TESTNET_UA);
 
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(bodies.filter((b) => b.method === "resolve")).toHaveLength(1);
-
-      state.height = 2;
       state.names = [record("alice", VALID_MAINNET_UA, "update")];
       await vi.advanceTimersByTimeAsync(30_000);
-      expect(bodies.filter((b) => b.method === "resolve")).toHaveLength(2);
+      expect(bodies).toHaveLength(2);
       expect((await z.resolveName("alice"))?.address).toBe(VALID_MAINNET_UA);
       expect(bodies.filter(isNameRequest)).toEqual([]);
     });
 
-    it("refuses a list that has not been refreshed for 2 minutes", async () => {
+    it("throws after a failed download, and never asks for the name", async () => {
       vi.useFakeTimers();
       const { state, bodies } = stubResolver([record("alice")]);
       const z = new ZNS({ url: "https://resolver.example" });
-      await z.resolveName("alice");
-
-      state.statusFails = true;
-      await vi.advanceTimersByTimeAsync(120_000);
       expect((await z.resolveName("alice"))?.name).toBe("alice");
 
-      await vi.advanceTimersByTimeAsync(1_000);
-      await expect(z.resolveName("alice")).rejects.toThrow(/not been refreshed for 2 minutes/);
+      state.listFails = true;
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(z.resolveName("alice")).rejects.toThrow(/could not be downloaded/);
       expect(bodies.filter(isNameRequest)).toEqual([]);
 
-      // A successful refresh makes the list usable again.
-      state.statusFails = false;
+      // The next successful download makes lookups work again.
+      state.listFails = false;
       await vi.advanceTimersByTimeAsync(30_000);
       expect((await z.resolveName("alice"))?.name).toBe("alice");
     });
 
-    it("throws when the list cannot be downloaded, and never asks for the name", async () => {
+    it("throws when the first download fails", async () => {
       const { state, bodies } = stubResolver([record("alice")]);
       state.listFails = true;
       const z = new ZNS({ url: "https://resolver.example" });
-      // While the download is in flight, the lookup waits for it and gets its failure.
-      await expect(z.resolveName("alice")).rejects.toThrow(/fetch failed/);
-      // Afterwards, the lookup reports the missing list without a request.
       await expect(z.resolveName("alice")).rejects.toThrow(/could not be downloaded/);
       expect(bodies.filter(isNameRequest)).toEqual([]);
     });
