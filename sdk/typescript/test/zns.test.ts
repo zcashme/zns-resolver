@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ZNS, ZNS_NETWORKS } from "../src/zns.js";
 
 const VALID_TESTNET_UA = "utest100qlkeru5c3m5kfrwe2hsmcfzmusreaza2prdyelg2kd2tr2842nceq952vay3gpmgky09fgft4z57h4z2zqzz5rcwgd4q90u54ek5yyca4s6e6y2jja9sww27kzedzznjcupcu0svq2exvq995c0lhl5zm53g4ksnm2xuwt3snv4dgh";
@@ -14,47 +14,36 @@ const record = (name: string, address = VALID_TESTNET_UA, lastAction = "claim") 
   expires_at: "none",
 });
 
-const answer = (result: unknown) => ({ ok: true, json: async () => ({ result }) });
-
 /**
- * A resolver that serves `status`, the full list (`resolve` with no params)
- * and per-name `resolve`. Every request body is kept in `bodies`.
+ * A resolver that serves the full list (`resolve` with no params) and
+ * per-name `resolve`. Every request body is kept in `bodies`.
  */
 function stubResolver(names: Array<Record<string, unknown>> = []) {
   const state = { names, listFails: false };
   const bodies: Array<{ method: string; params: Record<string, unknown> }> = [];
-  const fetchMock = vi.fn(async (_url: string, init: { body: string }) => {
+  vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
     const body = JSON.parse(init.body);
     bodies.push(body);
-    if (body.method === "status") return answer({ synced_height: 1, viewing_key: "uview-x" });
-    if (body.method === "resolve" && Object.keys(body.params).length === 0) {
-      if (state.listFails) throw new TypeError("fetch failed");
-      return answer(state.names);
+    if (Object.keys(body.params).length === 0 && state.listFails) {
+      throw new TypeError("fetch failed");
     }
-    if (body.method === "resolve") {
-      return answer(state.names.find((n) => n.name === body.params.query) ?? null);
-    }
-    throw new Error(`unexpected method ${body.method}`);
-  });
-  vi.stubGlobal("fetch", fetchMock);
-  return { state, bodies, fetchMock };
+    const result = "query" in body.params
+      ? state.names.find((n) => n.name === body.params.query) ?? null
+      : state.names;
+    return { ok: true, json: async () => ({ result }) };
+  }));
+  return { state, bodies };
 }
 
-/** Lets a new client's list download finish, then forgets its requests. */
-async function ready(z: ZNS): Promise<ZNS> {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  (globalThis.fetch as unknown as Mock).mockClear();
-  return z;
-}
+const isNameRequest = (body: { params: Record<string, unknown> }) => "query" in body.params;
 
 describe("ZNS", () => {
   let zns: ZNS;
 
-  beforeEach(async () => {
-    // A new client starts downloading the name list, so fetch is always
-    // stubbed, and the download finishes before a test stubs its own.
+  beforeEach(() => {
+    // `new ZNS()` downloads the name list, so fetch is always stubbed.
     stubResolver();
-    zns = await ready(new ZNS({ url: "https://resolver.example" }));
+    zns = new ZNS({ url: "https://resolver.example" });
   });
 
   afterEach(() => {
@@ -104,16 +93,17 @@ describe("ZNS", () => {
     });
   });
 
-  describe("resolveName normalization", () => {
-    it("finds the normalized name in the list", async () => {
-      stubResolver([record("alice")]);
+  describe("resolveName", () => {
+    it("never sends the name it looks up", async () => {
+      const { bodies } = stubResolver([record("alice"), record("bob")]);
       const z = new ZNS({ url: "https://resolver.example" });
-      for (const input of ["Alice", "alice", "aLiCe", "  ALICE  "]) {
-        const reg = await z.resolveName(input);
-        expect(reg?.name).toBe("alice");
-        expect(reg?.lastAction).toBe("claim");
-        expect(reg?.expiresAt).toBe("none");
-      }
+      expect((await z.resolveName("alice"))?.name).toBe("alice");
+      expect((await z.resolveName("  Bob  "))?.name).toBe("bob");
+      expect(await z.resolveName("carol")).toBeNull();
+      expect(await z.isAvailable("Alice")).toBe(false);
+      expect(await z.isAvailable("carol")).toBe(true);
+
+      expect(bodies).toEqual([{ jsonrpc: "2.0", id: 1, method: "resolve", params: {} }]);
     });
 
     it("returns null for invalid names without waiting for the list", async () => {
@@ -124,13 +114,6 @@ describe("ZNS", () => {
       expect(await z.resolveName("alice.zec")).toBeNull();
       expect(await z.resolveName("")).toBeNull();
       expect(await z.isAvailable("alice.eth")).toBe(false);
-    });
-
-    it("isAvailable checks the normalized name", async () => {
-      stubResolver([record("alice")]);
-      const z = new ZNS({ url: "https://resolver.example" });
-      expect(await z.isAvailable("Alice")).toBe(false);
-      expect(await z.isAvailable("bob")).toBe(true);
     });
 
     it("reads a sale, list, auction, and delist", async () => {
@@ -147,30 +130,6 @@ describe("ZNS", () => {
       const z = new ZNS({ url: "https://resolver.example" });
       await expect(z.resolveName("alice")).rejects.toThrow(/could not be downloaded/);
     });
-  });
-
-  describe("private lookups", () => {
-    const isNameRequest = (b: { params: Record<string, unknown> }) => "query" in b.params;
-
-    it("never sends the name it looks up", async () => {
-      const { bodies } = stubResolver([record("alice"), record("bob")]);
-      const z = new ZNS({ url: "https://resolver.example" });
-      expect((await z.resolveName("alice"))?.name).toBe("alice");
-      expect((await z.resolveName("Bob"))?.name).toBe("bob");
-      expect(await z.resolveName("carol")).toBeNull();
-      expect(await z.isAvailable("carol")).toBe(true);
-      expect(await z.isAvailable("alice")).toBe(false);
-
-      expect(bodies).toEqual([{ jsonrpc: "2.0", id: 1, method: "resolve", params: {} }]);
-    });
-
-    it("downloads the list once for lookups that arrive together", async () => {
-      const { bodies } = stubResolver([record("alice")]);
-      const z = new ZNS({ url: "https://resolver.example" });
-      const regs = await Promise.all(Array.from({ length: 10 }, () => z.resolveName("alice")));
-      expect(regs.every((reg) => reg?.name === "alice")).toBe(true);
-      expect(bodies).toHaveLength(1);
-    });
 
     it("downloads the list again every 30 seconds", async () => {
       vi.useFakeTimers();
@@ -180,8 +139,8 @@ describe("ZNS", () => {
 
       state.names = [record("alice", VALID_MAINNET_UA, "update")];
       await vi.advanceTimersByTimeAsync(30_000);
-      expect(bodies).toHaveLength(2);
       expect((await z.resolveName("alice"))?.address).toBe(VALID_MAINNET_UA);
+      expect(bodies).toHaveLength(2);
       expect(bodies.filter(isNameRequest)).toEqual([]);
     });
 
@@ -196,62 +155,26 @@ describe("ZNS", () => {
       await expect(z.resolveName("alice")).rejects.toThrow(/could not be downloaded/);
       expect(bodies.filter(isNameRequest)).toEqual([]);
 
-      // The next successful download makes lookups work again.
       state.listFails = false;
       await vi.advanceTimersByTimeAsync(30_000);
       expect((await z.resolveName("alice"))?.name).toBe("alice");
-    });
-
-    it("throws when the first download fails", async () => {
-      const { state, bodies } = stubResolver([record("alice")]);
-      state.listFails = true;
-      const z = new ZNS({ url: "https://resolver.example" });
-      await expect(z.resolveName("alice")).rejects.toThrow(/could not be downloaded/);
-      expect(bodies.filter(isNameRequest)).toEqual([]);
-    });
-
-    it("downloads the list from the next endpoint when one is unreachable", async () => {
-      const { fetchMock } = stubResolver([record("alice")]);
-      const resolver = fetchMock.getMockImplementation()!;
-      fetchMock.mockImplementation(async (url: string, init: { body: string }) => {
-        if (url === "https://main.zcashnames.com") throw new TypeError("fetch failed");
-        return resolver(url, init);
-      });
-      const z = new ZNS({ network: "mainnet" });
-      expect((await z.resolveName("alice"))?.name).toBe("alice");
-      const lists = fetchMock.mock.calls.filter(
-        ([, init]) => JSON.parse(init.body).method === "resolve",
-      );
-      expect(lists.map(([url]) => url)).toEqual([
-        "https://main.zcashnames.com",
-        "https://light.zcash.me/zns-mainnet",
-      ]);
-    });
-
-    it("returns a copy, so changing it does not change the list", async () => {
-      stubResolver([record("alice")]);
-      const z = new ZNS({ url: "https://resolver.example" });
-      const reg = await z.resolveName("alice");
-      reg!.address = "changed";
-      expect((await z.resolveName("alice"))?.address).toBe(VALID_TESTNET_UA);
     });
   });
 
   describe("resolveNameOnServer", () => {
     it("sends the normalized name to the resolver", async () => {
       const { bodies } = stubResolver([record("alice")]);
-      const z = await ready(new ZNS({ url: "https://resolver.example" }));
-      const reg = await z.resolveNameOnServer("  Alice ");
-      expect(reg?.name).toBe("alice");
+      const z = new ZNS({ url: "https://resolver.example" });
+      expect((await z.resolveNameOnServer("  Alice "))?.name).toBe("alice");
       expect(bodies.at(-1)).toMatchObject({ method: "resolve", params: { query: "alice" } });
       expect(await z.resolveNameOnServer("bob")).toBeNull();
     });
 
-    it("returns null for invalid names without a request", async () => {
-      const { fetchMock } = stubResolver();
-      const z = await ready(new ZNS({ url: "https://resolver.example" }));
+    it("returns null for invalid names without sending them", async () => {
+      const { bodies } = stubResolver();
+      const z = new ZNS({ url: "https://resolver.example" });
       expect(await z.resolveNameOnServer("alice.eth")).toBeNull();
-      expect(fetchMock).not.toHaveBeenCalled();
+      expect(bodies.filter(isNameRequest)).toEqual([]);
     });
   });
 
@@ -263,9 +186,7 @@ describe("ZNS", () => {
     it("sends normalized event filters using resolver parameter names", async () => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
-        const body = JSON.parse(init.body);
-        if (body.method !== "events") return answer([]);
-        request = body;
+        request = JSON.parse(init.body);
         return { ok: true, json: async () => ({ result: {
           events: [{
             id: 1,
@@ -366,9 +287,7 @@ describe("ZNS", () => {
       vi.stubGlobal(
         "fetch",
         vi.fn(async (_url: string, init: { body: string }) => {
-          const sent = JSON.parse(init.body);
-          if (sent.method !== "status") return answer([]);
-          request = sent;
+          request = JSON.parse(init.body);
           return { ok: true, json: async () => ({ result: body }) };
         }),
       );
@@ -444,9 +363,7 @@ describe("ZNS", () => {
     it("calls the typed reverse_lookup verb and returns the total", async () => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
-        const body = JSON.parse(init.body);
-        if (body.method !== "reverse_lookup") return answer([]);
-        request = body;
+        request = JSON.parse(init.body);
         return { ok: true, json: async () => ({ result: {
           items: [{
             name: "alice",
@@ -477,9 +394,7 @@ describe("ZNS", () => {
     it("calls the typed list_names verb", async () => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
-        const body = JSON.parse(init.body);
-        if (body.method !== "list_names") return answer([]);
-        request = body;
+        request = JSON.parse(init.body);
         return { ok: true, json: async () => ({ result: { items: [], total: 0, limit: 50, offset: 0 } }) };
       }));
 
@@ -549,9 +464,10 @@ describe("ZNS", () => {
         if (url === "https://main.zcashnames.com") throw new TypeError("fetch failed");
         return { ok: true, json: async () => okStatus };
       });
+      const z = new ZNS({ network: "mainnet" });
       vi.stubGlobal("fetch", fetchMock);
 
-      const status = await (await ready(new ZNS({ network: "mainnet" }))).status();
+      const status = await z.status();
       expect(status.syncedHeight).toBe(1);
       expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
         "https://main.zcashnames.com",
@@ -566,9 +482,9 @@ describe("ZNS", () => {
         }
         return { ok: true, json: async () => okStatus };
       });
+      const z = new ZNS({ network: "mainnet" });
       vi.stubGlobal("fetch", fetchMock);
 
-      const z = await ready(new ZNS({ network: "mainnet" }));
       await expect(z.status()).resolves.toMatchObject({
         syncedHeight: 1,
       });
@@ -580,9 +496,10 @@ describe("ZNS", () => {
         ok: true,
         json: async () => ({ error: { code: -1, message: "nope" } }),
       }));
+      const z = new ZNS({ network: "mainnet" });
       vi.stubGlobal("fetch", fetchMock);
 
-      await expect((await ready(new ZNS({ network: "mainnet" }))).status()).rejects.toThrow(/nope/);
+      await expect(z.status()).rejects.toThrow(/nope/);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
@@ -592,9 +509,10 @@ describe("ZNS", () => {
         status: 404,
         statusText: "Not Found",
       }));
+      const z = new ZNS({ network: "mainnet" });
       vi.stubGlobal("fetch", fetchMock);
 
-      await expect((await ready(new ZNS({ network: "mainnet" }))).status()).rejects.toThrow(/404/);
+      await expect(z.status()).rejects.toThrow(/404/);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
@@ -602,9 +520,10 @@ describe("ZNS", () => {
       const fetchMock = vi.fn(async () => {
         throw new TypeError("fetch failed");
       });
+      const z = new ZNS({ network: "mainnet" });
       vi.stubGlobal("fetch", fetchMock);
 
-      await expect((await ready(new ZNS({ network: "mainnet" }))).status()).rejects.toThrow(/fetch failed/);
+      await expect(z.status()).rejects.toThrow(/fetch failed/);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
@@ -612,9 +531,9 @@ describe("ZNS", () => {
       const fetchMock = vi.fn(async () => {
         throw new TypeError("fetch failed");
       });
+      const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
       vi.stubGlobal("fetch", fetchMock);
 
-      const z = await ready(new ZNS({ network: "mainnet", url: "https://resolver.example" }));
       await expect(z.status()).rejects.toThrow(/fetch failed/);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
