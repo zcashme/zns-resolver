@@ -247,10 +247,10 @@ describe("ZNS", () => {
   });
 
   describe("network presets", () => {
-    it("defaults to the testnet preset (fail safe)", () => {
+    it("defaults to the mainnet preset", () => {
       const z = new ZNS();
-      expect(z.network).toBe("testnet");
-      expect(z.url).toBe("https://light.zcash.me/zns-testnet");
+      expect(z.network).toBe("mainnet");
+      expect(z.url).toBe("https://main.zcashnames.com");
     });
 
     it("selects the mainnet preset by network", () => {
