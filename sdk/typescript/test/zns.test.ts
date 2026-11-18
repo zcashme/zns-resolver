@@ -19,13 +19,16 @@ const record = (name: string, address = VALID_TESTNET_UA, lastAction = "claim") 
  * per-name `resolve`. Every request body is kept in `bodies`.
  */
 function stubResolver(names: Array<Record<string, unknown>> = []) {
-  const state = { names, listFails: false };
+  const state = { names, listHangs: false };
   const bodies: Array<{ method: string; params: Record<string, unknown> }> = [];
-  vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
+  vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string; signal: AbortSignal }) => {
     const body = JSON.parse(init.body);
     bodies.push(body);
-    if (Object.keys(body.params).length === 0 && state.listFails) {
-      throw new TypeError("fetch failed");
+    if (Object.keys(body.params).length === 0 && state.listHangs) {
+      // A request that never answers, until it is aborted.
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
     }
     const result = "query" in body.params
       ? state.names.find((n) => n.name === body.params.query) ?? null
@@ -137,19 +140,20 @@ describe("ZNS", () => {
       expect(bodies.filter(isNameRequest)).toEqual([]);
     });
 
-    it("throws after a failed download, and never asks for the name", async () => {
+    it("gives up on a download that hangs, throws, and recovers", async () => {
       vi.useFakeTimers();
       const { state, bodies } = stubResolver([record("alice")]);
       const z = new ZNS({ url: "https://resolver.example" });
       expect((await z.resolveName("alice"))?.name).toBe("alice");
 
-      state.listFails = true;
-      await vi.advanceTimersByTimeAsync(30_000);
+      // The download at 30s hangs and is aborted at 60s, which clears the list.
+      state.listHangs = true;
+      await vi.advanceTimersByTimeAsync(60_000);
       await expect(z.resolveName("alice")).rejects.toThrow(/could not be downloaded/);
       expect(bodies.filter(isNameRequest)).toEqual([]);
 
-      state.listFails = false;
-      await vi.advanceTimersByTimeAsync(30_000);
+      state.listHangs = false;
+      await vi.advanceTimersByTimeAsync(60_000);
       expect((await z.resolveName("alice"))?.name).toBe("alice");
     });
   });
