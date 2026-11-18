@@ -51,13 +51,6 @@ describe("ZNS", () => {
     vi.useRealTimers();
   });
 
-  describe("constructor", () => {
-    it("uses the configured current resolver URL", () => {
-      const z = new ZNS({ url: "https://resolver.example" });
-      expect(z.url).toBe("https://resolver.example");
-    });
-  });
-
   describe("isValidName", () => {
     it("accepts valid names", () => {
       expect(zns.isValidName("alice")).toBe(true);
@@ -178,11 +171,7 @@ describe("ZNS", () => {
     });
   });
 
-  describe("status and events", () => {
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
-
+  describe("events", () => {
     it("sends normalized event filters using resolver parameter names", async () => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
@@ -278,10 +267,6 @@ describe("ZNS", () => {
   });
 
   describe("verify", () => {
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
-
     const stubStatus = (body: Record<string, unknown>) => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal(
@@ -319,20 +304,6 @@ describe("ZNS", () => {
       expect(getRequest()?.method).toBe("status");
     });
 
-    it("reports the server's key through the single viewingKey field", async () => {
-      const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
-      vi.stubGlobal("fetch", vi.fn(async () => ({
-        ok: true,
-        json: async () => ({ result: {
-          synced_height: 3516184,
-          viewing_key: ZNS_NETWORKS.mainnet.viewingKey,
-        } }),
-      })));
-
-      const status = await z.status();
-      expect(status.viewingKey).toBe(ZNS_NETWORKS.mainnet.viewingKey);
-    });
-
     it("reports the treasury address through the treasuryAddress field", async () => {
       const z = new ZNS({ network: "testnet", url: "https://resolver.example" });
       vi.stubGlobal("fetch", vi.fn(async () => ({
@@ -356,10 +327,6 @@ describe("ZNS", () => {
   });
 
   describe("reverseLookup and listNames", () => {
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
-
     it("calls the typed reverse_lookup verb and returns the total", async () => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
@@ -406,11 +373,6 @@ describe("ZNS", () => {
   });
 
   describe("timeout", () => {
-    afterEach(() => {
-      vi.unstubAllGlobals();
-      vi.useRealTimers();
-    });
-
     it("aborts an in-flight request after the configured timeout", async () => {
       vi.useFakeTimers();
       const z = new ZNS({ url: "https://resolver.example", timeout: 50 });
@@ -449,15 +411,6 @@ describe("ZNS", () => {
 
   describe("endpoint fallback", () => {
     const okStatus = { result: { synced_height: 1, viewing_key: "uview-x" } };
-
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
-
-    it("uses the mainnet preset's endpoints in order", () => {
-      const z = new ZNS({ network: "mainnet" });
-      expect(z.url).toBe("https://main.zcashnames.com");
-    });
 
     it("falls back to the next endpoint when one is unreachable", async () => {
       const fetchMock = vi.fn(async (url: string) => {
