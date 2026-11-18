@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { ZNS, ZNS_NETWORKS } from "../src/zns.js";
+import { ZNS, ZNS_NETWORKS, parseZip321Uri } from "../src/zns.js";
 
 const VALID_TESTNET_UA = "utest100qlkeru5c3m5kfrwe2hsmcfzmusreaza2prdyelg2kd2tr2842nceq952vay3gpmgky09fgft4z57h4z2zqzz5rcwgd4q90u54ek5yyca4s6e6y2jja9sww27kzedzznjcupcu0svq2exvq995c0lhl5zm53g4ksnm2xuwt3snv4dgh";
 const VALID_MAINNET_UA = "u1f68wxdxsrswjl04kcc397a9ljedg88rl8dgazrk8l9v8jx6t3gqsktvqyvmc3ypgf4pum03q4ftvy5s0fe803nrxm8kw6dgzlvnv83nv";
@@ -223,25 +223,25 @@ describe("ZNS", () => {
 
   describe("parseZip321Uri", () => {
     it("parses address and amount", () => {
-      const result = zns.parseZip321Uri("zcash:u1abc?amount=1.5&memo=abc123");
+      const result = parseZip321Uri("zcash:u1abc?amount=1.5&memo=abc123");
       expect(result.address).toBe("u1abc");
       expect(result.amount).toBe("1.5");
     });
 
     it("decodes base64url memo", () => {
-      const result = zns.parseZip321Uri("zcash:u1abc?memo=SGVsbG8");
+      const result = parseZip321Uri("zcash:u1abc?memo=SGVsbG8");
       expect(result.memoDecoded).toBe("Hello");
     });
 
     it("returns empty strings for missing fields", () => {
-      const result = zns.parseZip321Uri("zcash:u1abc");
+      const result = parseZip321Uri("zcash:u1abc");
       expect(result.amount).toBe("");
       expect(result.memoRaw).toBe("");
       expect(result.memoDecoded).toBe("");
     });
 
     it("handles zcash: prefix case-insensitively", () => {
-      const result = zns.parseZip321Uri("ZCASH:u1abc");
+      const result = parseZip321Uri("ZCASH:u1abc");
       expect(result.address).toBe("u1abc");
     });
   });

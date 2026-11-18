@@ -1,6 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
-  ZNS,
   buildClaimMemo,
   buildUpdateMemo,
   buildReleaseMemo,
@@ -13,6 +12,7 @@ import {
   parseBuyOtpMemo,
   buyPaymentZats,
   buildZip321Uri,
+  parseZip321Uri,
 } from "../src/zns.js";
 
 // zns-mint/src/mint.rs test vector: a mainnet UA with Orchard, Sapling and
@@ -155,15 +155,12 @@ describe("buildZip321Uri", () => {
     const memo = buildClaimMemo({ name: "alice", ua: UA, term: "forever" });
     const uri = buildZip321Uri({ address: TESTNET_UA, amount: "0.0123", memo });
     expect(uri).not.toMatch(/=$/);
-    // `new ZNS()` downloads the name list; this test needs no resolver.
-    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
-    expect(new ZNS().parseZip321Uri(uri)).toEqual({
+    expect(parseZip321Uri(uri)).toEqual({
       address: TESTNET_UA,
       amount: "0.0123",
       memoRaw: uri.split("memo=")[1],
       memoDecoded: memo,
     });
-    vi.unstubAllGlobals();
   });
 
   it("rejects an invalid amount", () => {

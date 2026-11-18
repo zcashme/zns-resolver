@@ -456,6 +456,37 @@ export function buildZip321Uri(input: {
     : `zcash:${input.address}`;
 }
 
+/** Parse a ZIP-321 URI into its components. */
+export function parseZip321Uri(uri: string): {
+  address: string;
+  amount: string;
+  memoRaw: string;
+  memoDecoded: string;
+} {
+  const withoutScheme = String(uri ?? "").replace(/^zcash:/i, "");
+  const [addressPart, queryPart = ""] = withoutScheme.split("?");
+  const address = addressPart.trim();
+  const params = new URLSearchParams(queryPart);
+  const amount = String(params.get("amount") ?? "").trim();
+  const memoRaw = String(params.get("memo") ?? "").trim();
+  const memoDecoded = memoRaw ? fromBase64Url(memoRaw) : "";
+  return { address, amount, memoRaw, memoDecoded };
+}
+
+/** Decodes a base64url memo to text, or "" when it is not base64url. */
+function fromBase64Url(value: string): string {
+  try {
+    const normalized = String(value).replace(/-/g, "+").replace(/_/g, "/");
+    const padLen = normalized.length % 4 === 0 ? 0 : 4 - (normalized.length % 4);
+    const padded = normalized + "=".repeat(padLen);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return "";
+  }
+}
+
 /** The ZNS networks. */
 export type Network = "mainnet" | "testnet";
 
@@ -710,23 +741,6 @@ export class ZNS {
     return eventsResult(raw);
   }
 
-  /** Parse a ZIP-321 URI into its components. */
-  parseZip321Uri(uri: string): {
-    address: string;
-    amount: string;
-    memoRaw: string;
-    memoDecoded: string;
-  } {
-    const withoutScheme = String(uri ?? "").replace(/^zcash:/i, "");
-    const [addressPart, queryPart = ""] = withoutScheme.split("?");
-    const address = addressPart.trim();
-    const params = new URLSearchParams(queryPart);
-    const amount = String(params.get("amount") ?? "").trim();
-    const memoRaw = String(params.get("memo") ?? "").trim();
-    const memoDecoded = memoRaw ? this.decodeBase64Url(memoRaw) : "";
-    return { address, amount, memoRaw, memoDecoded };
-  }
-
   // ── Private helpers ────────────────────────────────────────────────────────
 
   /**
@@ -749,20 +763,6 @@ export class ZNS {
         this.syncing = undefined;
       });
     return this.syncing;
-  }
-
-  private decodeBase64Url(value: string): string {
-    try {
-      const normalized = String(value).replace(/-/g, "+").replace(/_/g, "/");
-      const padLen =
-        normalized.length % 4 === 0 ? 0 : 4 - (normalized.length % 4);
-      const padded = normalized + "=".repeat(padLen);
-      const binary = atob(padded);
-      const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-      return new TextDecoder().decode(bytes);
-    } catch {
-      return "";
-    }
   }
 
   private async rpc<T>(
