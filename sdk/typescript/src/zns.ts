@@ -544,14 +544,14 @@ export class ZNS {
    * sees which name is looked up, or when.
    *
    * @param options.network - Network preset, selects the default endpoint
-   *   (defaults to "testnet" — fail safe)
+   *   (defaults to "mainnet")
    * @param options.url - Explicit resolver JSON-RPC endpoint; always wins
    *   over the network preset
    * @param options.timeout - Abort in-flight requests after this many
    *   milliseconds
    */
   constructor(options: { network?: Network; url?: string; timeout?: number } = {}) {
-    this.network = options.network ?? "testnet";
+    this.network = options.network ?? "mainnet";
     this.urls =
       options.url != null ? [options.url] : ZNS_NETWORKS[this.network].urls;
     this.url = this.urls[0];

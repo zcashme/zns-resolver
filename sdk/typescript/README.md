@@ -23,7 +23,7 @@ const available = await zns.isAvailable("bob");
 console.log(available);
 ```
 
-The default network is testnet. Set `network` to `"mainnet"` for mainnet names.
+The default network is mainnet. Set `network` to `"testnet"` for testnet names.
 
 ## Private lookups
 
