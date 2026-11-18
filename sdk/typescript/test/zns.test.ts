@@ -147,13 +147,6 @@ describe("ZNS", () => {
       const z = new ZNS({ url: "https://resolver.example" });
       await expect(z.resolveName("alice")).rejects.toThrow(/could not be downloaded/);
     });
-
-    it("resolves a name longer than 32 characters to null, as the resolver does", async () => {
-      const long = "a".repeat(33);
-      stubResolver([record(long)]);
-      const z = new ZNS({ url: "https://resolver.example" });
-      expect(await z.resolveName(long)).toBeNull();
-    });
   });
 
   describe("private lookups", () => {

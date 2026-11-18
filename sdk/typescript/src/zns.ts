@@ -493,9 +493,6 @@ class ZnsResponseError extends Error {}
 /** How often the client downloads the name list again. */
 const SYNC_INTERVAL_MS = 30_000;
 
-/** The longest name the resolver resolves; a longer one resolves to null. */
-const MAX_RESOLVED_NAME_LEN = 32;
-
 export class ZNS {
   /** The primary resolver JSON-RPC endpoint. */
   url: string;
@@ -583,9 +580,7 @@ export class ZNS {
     signal?: AbortSignal,
   ): Promise<Registration | null> {
     const normalized = normalizeName(name);
-    if (!isValidName(normalized) || normalized.length > MAX_RESOLVED_NAME_LEN) {
-      return null;
-    }
+    if (!isValidName(normalized)) return null;
     signal?.throwIfAborted();
     if (!this.names) await this.syncing;
     if (!this.names) throw new Error("ZNS: the name list could not be downloaded");
