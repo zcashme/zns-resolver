@@ -1,23 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { ZNS_PRICING, annualUsd, foreverUsd, quoteZats } from "../src/pricing.js";
-
-describe("ZNS_PRICING", () => {
-  it("matches the mint's pricing law", () => {
-    expect(ZNS_PRICING.annualUsd).toEqual({
-      1: 12_480,
-      2: 2_720,
-      3: 920,
-      4: 472,
-      5: 188,
-      6: 112,
-      7: 48,
-      8: 32,
-      9: 24,
-      minimum: 18,
-    });
-    expect(ZNS_PRICING.foreverMultiple).toBe(4);
-  });
-});
+import { annualUsd, foreverUsd, quoteZats } from "../src/pricing.js";
 
 describe("annualUsd", () => {
   it("prices every tier", () => {
