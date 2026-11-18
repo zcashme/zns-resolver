@@ -746,15 +746,10 @@ export class ZNS {
   /**
    * Downloads every registered name: `resolve` with no params, the same
    * request from every client. A failed download clears the list, so a
-   * lookup never answers from a list the resolver did not just send. A
-   * download still running when the next one is due is aborted, so a stuck
-   * request cannot freeze the list.
+   * lookup never answers from a list the resolver did not just send.
    */
   private sync(): Promise<void> {
-    if (this.syncing) return this.syncing;
-    const controller = new AbortController();
-    const deadline = setTimeout(() => controller.abort(), SYNC_INTERVAL_MS);
-    this.syncing = this.rpc<Record<string, unknown>[]>("resolve", {}, controller.signal)
+    this.syncing ??= this.rpc<Record<string, unknown>[]>("resolve", {})
       .then((raw) => {
         this.names = new Map(raw.map((r) => {
           const reg = registration(r);
@@ -765,7 +760,6 @@ export class ZNS {
         this.names = undefined;
       })
       .finally(() => {
-        clearTimeout(deadline);
         this.syncing = undefined;
       });
     return this.syncing;
