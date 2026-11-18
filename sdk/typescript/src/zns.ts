@@ -490,6 +490,44 @@ export const ZNS_NETWORKS = {
 /** A resolver answered, so its reply is final and is not retried elsewhere. */
 class ZnsResponseError extends Error {}
 
+/** How often the client checks the resolver for a new block. */
+const REFRESH_INTERVAL_MS = 30_000;
+
+/** How long a lookup trusts the name list without a successful refresh. */
+const MAX_LIST_AGE_MS = 120_000;
+
+/** The longest name the resolver resolves; a longer one resolves to null. */
+const MAX_RESOLVED_NAME_LEN = 32;
+
+/** Every registered name, as of one resolver height. */
+interface NameList {
+  byName: Map<string, Registration>;
+  /** The resolver's synced height when the list was downloaded. */
+  height: number;
+  /** When the list was last confirmed current, in `Date.now()` time. */
+  checkedAt: number;
+}
+
+function nameList(regs: Registration[], height: number): NameList {
+  const byName = new Map<string, Registration>();
+  for (const reg of regs) byName.set(reg.name, reg);
+  return { byName, height, checkedAt: Date.now() };
+}
+
+/** Rejects when `signal` aborts before `promise` settles. */
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  const aborted = () => signal.reason ?? new Error("ZNS: aborted");
+  if (signal.aborted) return Promise.reject(aborted());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(aborted());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
 export class ZNS {
   /** The primary resolver JSON-RPC endpoint. */
   url: string;
@@ -498,9 +536,21 @@ export class ZNS {
   private readonly urls: readonly string[];
   private rpcId = 0;
   private timeoutMs?: number;
+  /** Every registered name, once downloaded. Lookups answer from it. */
+  private list?: NameList;
+  /** The list download in flight, shared by every lookup waiting on it. */
+  private loading?: Promise<NameList>;
+  /** The refresh in flight, so a slow one is not run twice. */
+  private refreshing?: Promise<void>;
 
   /**
    * Creates a new ZNS client.
+   *
+   * The client downloads every registered name right away and checks for a
+   * new block every 30 seconds, downloading the list again when there is
+   * one. Name and address lookups answer from that list, so the resolver
+   * never sees what is looked up, or when.
+   *
    * @param options.network - Network preset, selects the default endpoint
    *   (defaults to "testnet" — fail safe)
    * @param options.url - Explicit resolver JSON-RPC endpoint; always wins
@@ -514,6 +564,17 @@ export class ZNS {
       options.url != null ? [options.url] : ZNS_NETWORKS[this.network].urls;
     this.url = this.urls[0];
     this.timeoutMs = options.timeout;
+
+    // A failed download is reported by the lookups that need the list; the
+    // timer below tries again.
+    this.load().catch(() => {});
+    const timer = setInterval(() => {
+      this.refreshing ??= this.refresh().finally(() => {
+        this.refreshing = undefined;
+      });
+    }, REFRESH_INTERVAL_MS);
+    // The refresh never keeps a Node process alive on its own.
+    (timer as { unref?: () => void }).unref?.();
   }
 
   /** Fetch current server status. */
@@ -547,12 +608,36 @@ export class ZNS {
 
   /** Resolve a ZNS name to its registration. Returns null if not registered.
    *
-   *  The name is trimmed and lowercased before querying, so `Alice` and
-   *  `alice` resolve the same name.
-   *  Returns null without hitting the server if the name is invalid after
-   *  normalization. Note the returned registration's `name` field is the
-   *  normalized form, not the raw input. */
+   *  Answers from the client's copy of every registered name, so no request
+   *  carries the name. The first lookup waits for that copy to download.
+   *
+   *  The name is trimmed and lowercased first, so `Alice` and `alice`
+   *  resolve the same name. Returns null at once if the name is invalid
+   *  after normalization. Note the returned registration's `name` field is
+   *  the normalized form, not the raw input.
+   *
+   *  @throws Error when the name list could not be downloaded, or has not
+   *    been refreshed for 2 minutes. It never asks the resolver for the name
+   *    instead. */
   async resolveName(
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<Registration | null> {
+    const normalized = normalizeName(name);
+    if (!isValidName(normalized) || normalized.length > MAX_RESOLVED_NAME_LEN) {
+      return null;
+    }
+    const reg = (await this.names(signal)).byName.get(normalized);
+    return reg ? { ...reg } : null;
+  }
+
+  /** Resolve a ZNS name by sending it to the resolver, so the resolver sees
+   *  which name is looked up. For servers and explorers where no user's
+   *  privacy is at stake; wallets use {@link resolveName}.
+   *
+   *  The name is normalized like {@link resolveName}. Returns null if not
+   *  registered. */
+  async resolveNameOnServer(
     name: string,
     signal?: AbortSignal,
   ): Promise<Registration | null> {
@@ -627,7 +712,9 @@ export class ZNS {
     return registrationPage(raw);
   }
 
-  /** Check if a name is available for registration.
+  /** Check if a name is available for registration. Answers from the
+   *  client's name list like {@link resolveName}, so no request carries the
+   *  name.
    *  The name is normalized like {@link resolveName} first, so
    *  `isAvailable("Alice")` checks "alice". Returns false immediately
    *  for names that are invalid after normalization, without hitting the
@@ -684,6 +771,59 @@ export class ZNS {
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
+
+  /**
+   * Downloads every registered name: `resolve` with no params, the same
+   * request from every client. The height comes first, so the list is at
+   * least as new as the height it is filed under.
+   */
+  private load(): Promise<NameList> {
+    this.loading ??= (async () => {
+      const { syncedHeight } = await this.status();
+      const raw = await this.rpc<Record<string, unknown>[]>("resolve", {});
+      const list = nameList(
+        raw.map((r) => registration(r)),
+        syncedHeight,
+      );
+      this.list = list;
+      return list;
+    })().finally(() => {
+      this.loading = undefined;
+    });
+    return this.loading;
+  }
+
+  /** Downloads the list again when the resolver has a new block. */
+  private async refresh(): Promise<void> {
+    try {
+      const list = this.list;
+      if (!list) {
+        await this.load();
+        return;
+      }
+      const { syncedHeight } = await this.status();
+      if (syncedHeight === list.height) list.checkedAt = Date.now();
+      else await this.load();
+    } catch {
+      // The next tick tries again; lookups refuse a list that grows too old.
+    }
+  }
+
+  /**
+   * The name list lookups answer from. Waits for a download in flight, and
+   * throws rather than answer from a list that is missing or too old. It
+   * sends nothing itself.
+   */
+  private async names(signal?: AbortSignal): Promise<NameList> {
+    const list = this.list;
+    if (list && Date.now() - list.checkedAt <= MAX_LIST_AGE_MS) return list;
+    if (this.loading) return abortable(this.loading, signal);
+    throw new Error(
+      list
+        ? "ZNS: the name list has not been refreshed for 2 minutes; the client retries every 30 seconds"
+        : "ZNS: the name list could not be downloaded; the client retries every 30 seconds",
+    );
+  }
 
   private decodeBase64Url(value: string): string {
     try {
