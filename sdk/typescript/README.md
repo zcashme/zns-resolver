@@ -27,7 +27,7 @@ The default network is testnet. Set `network` to `"mainnet"` for mainnet names.
 
 ## Private lookups
 
-`resolveName` and `isAvailable` never send the name. The client downloads every registered name when it is created, and again every 30 seconds, and looks names up in that list. If the latest download failed, `resolveName` throws.
+`resolveName` and `isAvailable` never send the name. The client downloads every registered name when it is created, and again every 30 seconds, and looks names up in that list. If the latest download failed, both throw.
 
 Create one client and reuse it.
 

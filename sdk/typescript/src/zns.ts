@@ -530,7 +530,6 @@ export class ZNS {
   /** The network preset in use. */
   network: Network;
   private readonly urls: readonly string[];
-  private rpcId = 0;
   private timeoutMs?: number;
   /** Every registered name, from the latest download. Lookups answer from it. */
   private names?: Map<string, Registration>;
@@ -612,7 +611,6 @@ export class ZNS {
   ): Promise<Registration | null> {
     const normalized = normalizeName(name);
     if (!isValidName(normalized)) return null;
-    signal?.throwIfAborted();
     if (!this.names) await this.syncing;
     if (!this.names) throw new Error("ZNS: the name list could not be downloaded");
     const reg = this.names.get(normalized);
@@ -706,7 +704,10 @@ export class ZNS {
    *  The name is normalized like {@link resolveName} first, so
    *  `isAvailable("Alice")` checks "alice". Returns false immediately
    *  for names that are invalid after normalization, without hitting the
-   *  server. */
+   *  server.
+   *
+   *  @throws Error when the latest download of the list failed, like
+   *    {@link resolveName}. */
   async isAvailable(name: string, signal?: AbortSignal): Promise<boolean> {
     const normalized = normalizeName(name);
     if (!isValidName(normalized)) return false;
@@ -745,10 +746,11 @@ export class ZNS {
 
   /**
    * Downloads every registered name: `resolve` with no params, the same
-   * request from every client. A failed download clears the list, so a
-   * lookup never answers from a list the resolver did not just send.
+   * request from every client. Runs at construction and every 30 seconds;
+   * a failed download clears the list, so lookups throw until the next one
+   * succeeds.
    */
-  private sync(): Promise<void> {
+  private sync(): void {
     this.syncing ??= this.rpc<Record<string, unknown>[]>("resolve", {})
       .then((raw) => {
         this.names = new Map(raw.map((r) => {
@@ -762,7 +764,6 @@ export class ZNS {
       .finally(() => {
         this.syncing = undefined;
       });
-    return this.syncing;
   }
 
   private async rpc<T>(
@@ -770,8 +771,9 @@ export class ZNS {
     params: Record<string, unknown> = {},
     signal?: AbortSignal,
   ): Promise<T> {
-    const id = ++this.rpcId;
-    const body = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    // A fixed id: each POST carries one request, and a counter would tell
+    // the resolver how many calls this client has made.
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
 
     // Endpoints are tried in preset order. Only a failure to get an answer
     // moves on to the next one; a resolver's own reply, even an error, is final.
