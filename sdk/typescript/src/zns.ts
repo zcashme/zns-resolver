@@ -456,6 +456,37 @@ export function buildZip321Uri(input: {
     : `zcash:${input.address}`;
 }
 
+/** Parse a ZIP-321 URI into its components. */
+export function parseZip321Uri(uri: string): {
+  address: string;
+  amount: string;
+  memoRaw: string;
+  memoDecoded: string;
+} {
+  const withoutScheme = String(uri ?? "").replace(/^zcash:/i, "");
+  const [addressPart, queryPart = ""] = withoutScheme.split("?");
+  const address = addressPart.trim();
+  const params = new URLSearchParams(queryPart);
+  const amount = String(params.get("amount") ?? "").trim();
+  const memoRaw = String(params.get("memo") ?? "").trim();
+  const memoDecoded = memoRaw ? fromBase64Url(memoRaw) : "";
+  return { address, amount, memoRaw, memoDecoded };
+}
+
+/** Decodes a base64url memo to text, or "" when it is not base64url. */
+function fromBase64Url(value: string): string {
+  try {
+    const normalized = String(value).replace(/-/g, "+").replace(/_/g, "/");
+    const padLen = normalized.length % 4 === 0 ? 0 : 4 - (normalized.length % 4);
+    const padded = normalized + "=".repeat(padLen);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return "";
+  }
+}
+
 /** The ZNS networks. */
 export type Network = "mainnet" | "testnet";
 
@@ -490,17 +521,28 @@ export const ZNS_NETWORKS = {
 /** A resolver answered, so its reply is final and is not retried elsewhere. */
 class ZnsResponseError extends Error {}
 
+/** How often the client downloads the name list again. */
+const SYNC_INTERVAL_MS = 30_000;
+
 export class ZNS {
   /** The primary resolver JSON-RPC endpoint. */
   url: string;
   /** The network preset in use. */
   network: Network;
   private readonly urls: readonly string[];
-  private rpcId = 0;
   private timeoutMs?: number;
+  /** Every registered name, from the latest download. Lookups answer from it. */
+  private names?: Map<string, Registration>;
+  /** The download in flight, which a lookup waits for when there is no list yet. */
+  private syncing?: Promise<void>;
 
   /**
    * Creates a new ZNS client.
+   *
+   * The client downloads every registered name right away and again every
+   * 30 seconds. `resolveName` answers from that list, so the resolver never
+   * sees which name is looked up, or when.
+   *
    * @param options.network - Network preset, selects the default endpoint
    *   (defaults to "testnet" — fail safe)
    * @param options.url - Explicit resolver JSON-RPC endpoint; always wins
@@ -514,6 +556,11 @@ export class ZNS {
       options.url != null ? [options.url] : ZNS_NETWORKS[this.network].urls;
     this.url = this.urls[0];
     this.timeoutMs = options.timeout;
+
+    this.sync();
+    const timer = setInterval(() => this.sync(), SYNC_INTERVAL_MS);
+    // The timer never keeps a Node process alive on its own.
+    (timer as { unref?: () => void }).unref?.();
   }
 
   /** Fetch current server status. */
@@ -547,12 +594,36 @@ export class ZNS {
 
   /** Resolve a ZNS name to its registration. Returns null if not registered.
    *
-   *  The name is trimmed and lowercased before querying, so `Alice` and
-   *  `alice` resolve the same name.
-   *  Returns null without hitting the server if the name is invalid after
-   *  normalization. Note the returned registration's `name` field is the
-   *  normalized form, not the raw input. */
+   *  Answers from the client's list of every registered name, so no request
+   *  carries the name. A lookup made before the first download finishes
+   *  waits for it.
+   *
+   *  The name is trimmed and lowercased first, so `Alice` and `alice`
+   *  resolve the same name. Returns null at once if the name is invalid
+   *  after normalization. Note the returned registration's `name` field is
+   *  the normalized form, not the raw input.
+   *
+   *  @throws Error when the latest download of the list failed. It never
+   *    asks the resolver for the name instead. */
   async resolveName(
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<Registration | null> {
+    const normalized = normalizeName(name);
+    if (!isValidName(normalized)) return null;
+    if (!this.names) await this.syncing;
+    if (!this.names) throw new Error("ZNS: the name list could not be downloaded");
+    const reg = this.names.get(normalized);
+    return reg ? { ...reg } : null;
+  }
+
+  /** Resolve a ZNS name by sending it to the resolver, so the resolver sees
+   *  which name is looked up. For servers and explorers where no user's
+   *  privacy is at stake; wallets use {@link resolveName}.
+   *
+   *  The name is normalized like {@link resolveName}. Returns null if not
+   *  registered. */
+  async resolveNameOnServer(
     name: string,
     signal?: AbortSignal,
   ): Promise<Registration | null> {
@@ -627,11 +698,16 @@ export class ZNS {
     return registrationPage(raw);
   }
 
-  /** Check if a name is available for registration.
+  /** Check if a name is available for registration. Answers from the
+   *  client's name list like {@link resolveName}, so no request carries the
+   *  name.
    *  The name is normalized like {@link resolveName} first, so
    *  `isAvailable("Alice")` checks "alice". Returns false immediately
    *  for names that are invalid after normalization, without hitting the
-   *  server. */
+   *  server.
+   *
+   *  @throws Error when the latest download of the list failed, like
+   *    {@link resolveName}. */
   async isAvailable(name: string, signal?: AbortSignal): Promise<boolean> {
     const normalized = normalizeName(name);
     if (!isValidName(normalized)) return false;
@@ -666,37 +742,28 @@ export class ZNS {
     return eventsResult(raw);
   }
 
-  /** Parse a ZIP-321 URI into its components. */
-  parseZip321Uri(uri: string): {
-    address: string;
-    amount: string;
-    memoRaw: string;
-    memoDecoded: string;
-  } {
-    const withoutScheme = String(uri ?? "").replace(/^zcash:/i, "");
-    const [addressPart, queryPart = ""] = withoutScheme.split("?");
-    const address = addressPart.trim();
-    const params = new URLSearchParams(queryPart);
-    const amount = String(params.get("amount") ?? "").trim();
-    const memoRaw = String(params.get("memo") ?? "").trim();
-    const memoDecoded = memoRaw ? this.decodeBase64Url(memoRaw) : "";
-    return { address, amount, memoRaw, memoDecoded };
-  }
-
   // ── Private helpers ────────────────────────────────────────────────────────
 
-  private decodeBase64Url(value: string): string {
-    try {
-      const normalized = String(value).replace(/-/g, "+").replace(/_/g, "/");
-      const padLen =
-        normalized.length % 4 === 0 ? 0 : 4 - (normalized.length % 4);
-      const padded = normalized + "=".repeat(padLen);
-      const binary = atob(padded);
-      const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-      return new TextDecoder().decode(bytes);
-    } catch {
-      return "";
-    }
+  /**
+   * Downloads every registered name: `resolve` with no params, the same
+   * request from every client. Runs at construction and every 30 seconds;
+   * a failed download clears the list, so lookups throw until the next one
+   * succeeds.
+   */
+  private sync(): void {
+    this.syncing ??= this.rpc<Record<string, unknown>[]>("resolve", {})
+      .then((raw) => {
+        this.names = new Map(raw.map((r) => {
+          const reg = registration(r);
+          return [reg.name, reg];
+        }));
+      })
+      .catch(() => {
+        this.names = undefined;
+      })
+      .finally(() => {
+        this.syncing = undefined;
+      });
   }
 
   private async rpc<T>(
@@ -704,8 +771,9 @@ export class ZNS {
     params: Record<string, unknown> = {},
     signal?: AbortSignal,
   ): Promise<T> {
-    const id = ++this.rpcId;
-    const body = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    // A fixed id: each POST carries one request, and a counter would tell
+    // the resolver how many calls this client has made.
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
 
     // Endpoints are tried in preset order. Only a failure to get an answer
     // moves on to the next one; a resolver's own reply, even an error, is final.

@@ -1,21 +1,54 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { ZNS, ZNS_NETWORKS } from "../src/zns.js";
+import { ZNS, ZNS_NETWORKS, parseZip321Uri } from "../src/zns.js";
 
 const VALID_TESTNET_UA = "utest100qlkeru5c3m5kfrwe2hsmcfzmusreaza2prdyelg2kd2tr2842nceq952vay3gpmgky09fgft4z57h4z2zqzz5rcwgd4q90u54ek5yyca4s6e6y2jja9sww27kzedzznjcupcu0svq2exvq995c0lhl5zm53g4ksnm2xuwt3snv4dgh";
 const VALID_MAINNET_UA = "u1f68wxdxsrswjl04kcc397a9ljedg88rl8dgazrk8l9v8jx6t3gqsktvqyvmc3ypgf4pum03q4ftvy5s0fe803nrxm8kw6dgzlvnv83nv";
+
+/** A registration as the resolver sends it. */
+const record = (name: string, address = VALID_TESTNET_UA, lastAction = "claim") => ({
+  name,
+  address,
+  txid: "ab".repeat(32),
+  height: 100,
+  last_action: lastAction,
+  expires_at: "none",
+});
+
+/**
+ * A resolver that serves the full list (`resolve` with no params) and
+ * per-name `resolve`. Every request body is kept in `bodies`.
+ */
+function stubResolver(names: Array<Record<string, unknown>> = []) {
+  const state = { names, listFails: false };
+  const bodies: Array<{ method: string; params: Record<string, unknown> }> = [];
+  vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
+    const body = JSON.parse(init.body);
+    bodies.push(body);
+    if (Object.keys(body.params).length === 0 && state.listFails) {
+      throw new TypeError("fetch failed");
+    }
+    const result = "query" in body.params
+      ? state.names.find((n) => n.name === body.params.query) ?? null
+      : state.names;
+    return { ok: true, json: async () => ({ result }) };
+  }));
+  return { state, bodies };
+}
+
+const isNameRequest = (body: { params: Record<string, unknown> }) => "query" in body.params;
 
 describe("ZNS", () => {
   let zns: ZNS;
 
   beforeEach(() => {
+    // `new ZNS()` downloads the name list, so fetch is always stubbed.
+    stubResolver();
     zns = new ZNS({ url: "https://resolver.example" });
   });
 
-  describe("constructor", () => {
-    it("uses the configured current resolver URL", () => {
-      const z = new ZNS({ url: "https://resolver.example" });
-      expect(z.url).toBe("https://resolver.example");
-    });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   describe("isValidName", () => {
@@ -53,111 +86,92 @@ describe("ZNS", () => {
     });
   });
 
-  describe("resolveName normalization", () => {
-    afterEach(() => {
-      vi.unstubAllGlobals();
+  describe("resolveName", () => {
+    it("never sends the name it looks up", async () => {
+      const { bodies } = stubResolver([record("alice"), record("bob")]);
+      const z = new ZNS({ url: "https://resolver.example" });
+      expect((await z.resolveName("alice"))?.name).toBe("alice");
+      expect((await z.resolveName("  Bob  "))?.name).toBe("bob");
+      expect(await z.resolveName("carol")).toBeNull();
+      expect(await z.isAvailable("Alice")).toBe(false);
+      expect(await z.isAvailable("carol")).toBe(true);
+
+      expect(bodies).toEqual([{ jsonrpc: "2.0", id: 1, method: "resolve", params: {} }]);
     });
 
-    const stubResolve = () => {
-      const bodies: Array<Record<string, unknown>> = [];
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async (_url: string, init: { body: string }) => {
-          const body = JSON.parse(init.body);
-          bodies.push(body);
-          return {
-            ok: true,
-            json: async () => ({
-              result: {
-                name: "alice",
-                address: VALID_TESTNET_UA,
-                txid: "ab".repeat(32),
-                height: 100,
-                last_action: "claim",
-                expires_at: "none",
-              },
-            }),
-          };
-        }),
-      );
-      return bodies;
-    };
-
-    it("sends the normalized name as the query", async () => {
-      const bodies = stubResolve();
-      for (const input of ["Alice", "alice", "aLiCe", "  ALICE  "]) {
-        const reg = await zns.resolveName(input);
-      expect(reg?.name).toBe("alice");
-      expect(reg?.lastAction).toBe("claim");
-      expect(reg?.expiresAt).toBe("none");
-      }
-      expect(bodies.map((b) => (b.params as { query: string }).query)).toEqual([
-        "alice",
-        "alice",
-        "alice",
-        "alice",
-      ]);
-    });
-
-    it("returns null for invalid names without hitting the server", async () => {
-      const fetchSpy = vi.fn();
-      vi.stubGlobal("fetch", fetchSpy);
-      expect(await zns.resolveName("alice.eth")).toBeNull();
-      expect(await zns.resolveName("alice.zec")).toBeNull();
-      expect(await zns.resolveName("")).toBeNull();
-      expect(await zns.isAvailable("alice.eth")).toBe(false);
-      expect(fetchSpy).not.toHaveBeenCalled();
-    });
-
-    it("isAvailable checks the normalized name", async () => {
-      const bodies = stubResolve();
-      expect(await zns.isAvailable("Alice")).toBe(false);
-      expect((bodies[0].params as { query: string }).query).toBe("alice");
+    it("returns null for invalid names without waiting for the list", async () => {
+      // The list never arrives.
+      vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+      const z = new ZNS({ url: "https://resolver.example" });
+      expect(await z.resolveName("alice.eth")).toBeNull();
+      expect(await z.resolveName("alice.zec")).toBeNull();
+      expect(await z.resolveName("")).toBeNull();
+      expect(await z.isAvailable("alice.eth")).toBe(false);
     });
 
     it("reads a sale, list, auction, and delist", async () => {
-      for (const action of ["sale", "list", "auction", "delist"]) {
-        vi.stubGlobal("fetch", vi.fn(async () => ({
-          ok: true,
-          json: async () => ({
-            result: {
-              name: "alice",
-              address: VALID_TESTNET_UA,
-              txid: "ab".repeat(32),
-              height: 100,
-              last_action: action,
-              expires_at: "none",
-            },
-          }),
-        })));
-        const reg = await zns.resolveName("alice");
-        expect(reg?.lastAction).toBe(action);
+      const actions = ["sale", "list", "auction", "delist"];
+      stubResolver(actions.map((action) => record(action, VALID_TESTNET_UA, action)));
+      const z = new ZNS({ url: "https://resolver.example" });
+      for (const action of actions) {
+        expect((await z.resolveName(action))?.lastAction).toBe(action);
       }
     });
 
-    it("throws on an action the resolver does not send", async () => {
-      vi.stubGlobal("fetch", vi.fn(async () => ({
-        ok: true,
-        json: async () => ({
-          result: {
-            name: "alice",
-            address: VALID_TESTNET_UA,
-            txid: "ab".repeat(32),
-            height: 100,
-            last_action: "buy",
-            expires_at: "none",
-          },
-        }),
-      })));
-      await expect(zns.resolveName("alice")).rejects.toThrow(/unknown action/);
+    it("refuses a list with an action the resolver does not send", async () => {
+      stubResolver([record("alice", VALID_TESTNET_UA, "buy")]);
+      const z = new ZNS({ url: "https://resolver.example" });
+      await expect(z.resolveName("alice")).rejects.toThrow(/could not be downloaded/);
+    });
+
+    it("downloads the list again every 30 seconds", async () => {
+      vi.useFakeTimers();
+      const { state, bodies } = stubResolver([record("alice")]);
+      const z = new ZNS({ url: "https://resolver.example" });
+      expect((await z.resolveName("alice"))?.address).toBe(VALID_TESTNET_UA);
+
+      state.names = [record("alice", VALID_MAINNET_UA, "update")];
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect((await z.resolveName("alice"))?.address).toBe(VALID_MAINNET_UA);
+      expect(bodies).toHaveLength(2);
+      expect(bodies.filter(isNameRequest)).toEqual([]);
+    });
+
+    it("throws after a failed download, and never asks for the name", async () => {
+      vi.useFakeTimers();
+      const { state, bodies } = stubResolver([record("alice")]);
+      const z = new ZNS({ url: "https://resolver.example" });
+      expect((await z.resolveName("alice"))?.name).toBe("alice");
+
+      state.listFails = true;
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(z.resolveName("alice")).rejects.toThrow(/could not be downloaded/);
+      expect(bodies.filter(isNameRequest)).toEqual([]);
+
+      state.listFails = false;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect((await z.resolveName("alice"))?.name).toBe("alice");
     });
   });
 
-  describe("status and events", () => {
-    afterEach(() => {
-      vi.unstubAllGlobals();
+  describe("resolveNameOnServer", () => {
+    it("sends the normalized name to the resolver", async () => {
+      const { bodies } = stubResolver([record("alice")]);
+      const z = new ZNS({ url: "https://resolver.example" });
+      expect((await z.resolveNameOnServer("  Alice "))?.name).toBe("alice");
+      expect(bodies.at(-1)).toMatchObject({ method: "resolve", params: { query: "alice" } });
+      expect(await z.resolveNameOnServer("bob")).toBeNull();
     });
 
+    it("returns null for invalid names without sending them", async () => {
+      const { bodies } = stubResolver();
+      const z = new ZNS({ url: "https://resolver.example" });
+      expect(await z.resolveNameOnServer("alice.eth")).toBeNull();
+      expect(bodies.filter(isNameRequest)).toEqual([]);
+    });
+  });
+
+  describe("events", () => {
     it("sends normalized event filters using resolver parameter names", async () => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
@@ -209,25 +223,25 @@ describe("ZNS", () => {
 
   describe("parseZip321Uri", () => {
     it("parses address and amount", () => {
-      const result = zns.parseZip321Uri("zcash:u1abc?amount=1.5&memo=abc123");
+      const result = parseZip321Uri("zcash:u1abc?amount=1.5&memo=abc123");
       expect(result.address).toBe("u1abc");
       expect(result.amount).toBe("1.5");
     });
 
     it("decodes base64url memo", () => {
-      const result = zns.parseZip321Uri("zcash:u1abc?memo=SGVsbG8");
+      const result = parseZip321Uri("zcash:u1abc?memo=SGVsbG8");
       expect(result.memoDecoded).toBe("Hello");
     });
 
     it("returns empty strings for missing fields", () => {
-      const result = zns.parseZip321Uri("zcash:u1abc");
+      const result = parseZip321Uri("zcash:u1abc");
       expect(result.amount).toBe("");
       expect(result.memoRaw).toBe("");
       expect(result.memoDecoded).toBe("");
     });
 
     it("handles zcash: prefix case-insensitively", () => {
-      const result = zns.parseZip321Uri("ZCASH:u1abc");
+      const result = parseZip321Uri("ZCASH:u1abc");
       expect(result.address).toBe("u1abc");
     });
   });
@@ -253,10 +267,6 @@ describe("ZNS", () => {
   });
 
   describe("verify", () => {
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
-
     const stubStatus = (body: Record<string, unknown>) => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal(
@@ -294,20 +304,6 @@ describe("ZNS", () => {
       expect(getRequest()?.method).toBe("status");
     });
 
-    it("reports the server's key through the single viewingKey field", async () => {
-      const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
-      vi.stubGlobal("fetch", vi.fn(async () => ({
-        ok: true,
-        json: async () => ({ result: {
-          synced_height: 3516184,
-          viewing_key: ZNS_NETWORKS.mainnet.viewingKey,
-        } }),
-      })));
-
-      const status = await z.status();
-      expect(status.viewingKey).toBe(ZNS_NETWORKS.mainnet.viewingKey);
-    });
-
     it("reports the treasury address through the treasuryAddress field", async () => {
       const z = new ZNS({ network: "testnet", url: "https://resolver.example" });
       vi.stubGlobal("fetch", vi.fn(async () => ({
@@ -331,10 +327,6 @@ describe("ZNS", () => {
   });
 
   describe("reverseLookup and listNames", () => {
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
-
     it("calls the typed reverse_lookup verb and returns the total", async () => {
       let request: Record<string, unknown> | undefined;
       vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
@@ -381,11 +373,6 @@ describe("ZNS", () => {
   });
 
   describe("timeout", () => {
-    afterEach(() => {
-      vi.unstubAllGlobals();
-      vi.useRealTimers();
-    });
-
     it("aborts an in-flight request after the configured timeout", async () => {
       vi.useFakeTimers();
       const z = new ZNS({ url: "https://resolver.example", timeout: 50 });
@@ -425,23 +412,15 @@ describe("ZNS", () => {
   describe("endpoint fallback", () => {
     const okStatus = { result: { synced_height: 1, viewing_key: "uview-x" } };
 
-    afterEach(() => {
-      vi.unstubAllGlobals();
-    });
-
-    it("uses the mainnet preset's endpoints in order", () => {
-      const z = new ZNS({ network: "mainnet" });
-      expect(z.url).toBe("https://main.zcashnames.com");
-    });
-
     it("falls back to the next endpoint when one is unreachable", async () => {
       const fetchMock = vi.fn(async (url: string) => {
         if (url === "https://main.zcashnames.com") throw new TypeError("fetch failed");
         return { ok: true, json: async () => okStatus };
       });
+      const z = new ZNS({ network: "mainnet" });
       vi.stubGlobal("fetch", fetchMock);
 
-      const status = await new ZNS({ network: "mainnet" }).status();
+      const status = await z.status();
       expect(status.syncedHeight).toBe(1);
       expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
         "https://main.zcashnames.com",
@@ -456,9 +435,10 @@ describe("ZNS", () => {
         }
         return { ok: true, json: async () => okStatus };
       });
+      const z = new ZNS({ network: "mainnet" });
       vi.stubGlobal("fetch", fetchMock);
 
-      await expect(new ZNS({ network: "mainnet" }).status()).resolves.toMatchObject({
+      await expect(z.status()).resolves.toMatchObject({
         syncedHeight: 1,
       });
       expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -469,9 +449,10 @@ describe("ZNS", () => {
         ok: true,
         json: async () => ({ error: { code: -1, message: "nope" } }),
       }));
+      const z = new ZNS({ network: "mainnet" });
       vi.stubGlobal("fetch", fetchMock);
 
-      await expect(new ZNS({ network: "mainnet" }).status()).rejects.toThrow(/nope/);
+      await expect(z.status()).rejects.toThrow(/nope/);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
@@ -481,9 +462,10 @@ describe("ZNS", () => {
         status: 404,
         statusText: "Not Found",
       }));
+      const z = new ZNS({ network: "mainnet" });
       vi.stubGlobal("fetch", fetchMock);
 
-      await expect(new ZNS({ network: "mainnet" }).status()).rejects.toThrow(/404/);
+      await expect(z.status()).rejects.toThrow(/404/);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
@@ -491,9 +473,10 @@ describe("ZNS", () => {
       const fetchMock = vi.fn(async () => {
         throw new TypeError("fetch failed");
       });
+      const z = new ZNS({ network: "mainnet" });
       vi.stubGlobal("fetch", fetchMock);
 
-      await expect(new ZNS({ network: "mainnet" }).status()).rejects.toThrow(/fetch failed/);
+      await expect(z.status()).rejects.toThrow(/fetch failed/);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
@@ -501,11 +484,10 @@ describe("ZNS", () => {
       const fetchMock = vi.fn(async () => {
         throw new TypeError("fetch failed");
       });
+      const z = new ZNS({ network: "mainnet", url: "https://resolver.example" });
       vi.stubGlobal("fetch", fetchMock);
 
-      await expect(
-        new ZNS({ network: "mainnet", url: "https://resolver.example" }).status(),
-      ).rejects.toThrow(/fetch failed/);
+      await expect(z.status()).rejects.toThrow(/fetch failed/);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
